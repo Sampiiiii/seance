@@ -5,4 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+dirs = "6.0"
 seance-ui = { path = "../seance-ui" }
+seance-vault = { path = "../seance-vault" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
