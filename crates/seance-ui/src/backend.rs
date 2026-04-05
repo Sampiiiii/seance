@@ -64,9 +64,15 @@ impl UiBackend {
         Ok(self.vault.delete_host_profile(id)?)
     }
 
-    #[allow(dead_code)]
     pub fn list_password_credentials(&self) -> Result<Vec<CredentialSummary>> {
         Ok(self.vault.list_password_credentials()?)
+    }
+
+    pub fn load_password_credential(
+        &self,
+        id: &str,
+    ) -> Result<Option<VaultPasswordCredential>> {
+        Ok(self.vault.load_password_credential(id)?)
     }
 
     pub fn save_password_credential(
@@ -76,7 +82,10 @@ impl UiBackend {
         Ok(self.vault.store_password_credential(credential)?)
     }
 
-    #[allow(dead_code)]
+    pub fn delete_password_credential(&mut self, id: &str) -> Result<bool> {
+        Ok(self.vault.delete_password_credential(id)?)
+    }
+
     pub fn list_private_keys(&self) -> Result<Vec<KeySummary>> {
         Ok(self.vault.list_private_keys()?)
     }
@@ -84,6 +93,10 @@ impl UiBackend {
     #[allow(dead_code)]
     pub fn import_private_key(&mut self, request: ImportKeyRequest) -> Result<KeySummary> {
         Ok(self.vault.import_private_key(request)?)
+    }
+
+    pub fn delete_private_key(&mut self, id: &str) -> Result<bool> {
+        Ok(self.vault.delete_private_key(id)?)
     }
 
     pub fn generate_private_key(&mut self, request: GenerateKeyRequest) -> Result<KeySummary> {

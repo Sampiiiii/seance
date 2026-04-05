@@ -2,7 +2,7 @@ use crate::theme::ThemeId;
 use std::{collections::HashMap, sync::Arc};
 
 use seance_terminal::TerminalSession;
-use seance_vault::HostSummary;
+use seance_vault::{CredentialSummary, HostSummary, KeySummary, PrivateKeyAlgorithm};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaletteGroup {
@@ -31,11 +31,16 @@ pub enum PaletteAction {
     SwitchTheme(ThemeId),
     UnlockVault,
     LockVault,
+    OpenVaultPanel,
     AddSavedHost,
     AddPasswordCredential,
+    EditPasswordCredential(String),
+    DeletePasswordCredential(String),
+    #[allow(dead_code)]
     ImportPrivateKey,
     GenerateEd25519Key,
     GenerateRsaKey,
+    DeletePrivateKey(String),
     EditSavedHost(String),
     DeleteSavedHost(String),
     ConnectSavedHost(String),
@@ -120,6 +125,8 @@ pub fn build_items(
     sessions: &[Arc<dyn TerminalSession>],
     session_labels: &HashMap<u64, String>,
     saved_hosts: &[HostSummary],
+    credentials: &[CredentialSummary],
+    keys: &[KeySummary],
     active_id: u64,
     active_theme: ThemeId,
     query: &str,
@@ -217,7 +224,16 @@ pub fn build_items(
 
     if vault_unlocked {
         items.push(PaletteItem {
-            glyph: "•",
+            glyph: "◈",
+            label: "Open Vault Panel".into(),
+            hint: "Manage credentials and SSH keys".into(),
+            action: PaletteAction::OpenVaultPanel,
+            group: PaletteGroup::Vault,
+            shortcut: Some("\u{2318},"),
+            match_indices: Vec::new(),
+        });
+        items.push(PaletteItem {
+            glyph: "+",
             label: "Add Password Credential".into(),
             hint: "Store an encrypted password".into(),
             action: PaletteAction::AddPasswordCredential,
@@ -226,16 +242,7 @@ pub fn build_items(
             match_indices: Vec::new(),
         });
         items.push(PaletteItem {
-            glyph: "•",
-            label: "Import Private Key".into(),
-            hint: "Store an encrypted private key".into(),
-            action: PaletteAction::ImportPrivateKey,
-            group: PaletteGroup::Vault,
-            shortcut: None,
-            match_indices: Vec::new(),
-        });
-        items.push(PaletteItem {
-            glyph: "•",
+            glyph: "+",
             label: "Generate Ed25519 Key".into(),
             hint: "Create a new vault-backed Ed25519 key".into(),
             action: PaletteAction::GenerateEd25519Key,
@@ -244,7 +251,7 @@ pub fn build_items(
             match_indices: Vec::new(),
         });
         items.push(PaletteItem {
-            glyph: "•",
+            glyph: "+",
             label: "Generate RSA Key".into(),
             hint: "Create a new vault-backed RSA key".into(),
             action: PaletteAction::GenerateRsaKey,
@@ -252,6 +259,50 @@ pub fn build_items(
             shortcut: None,
             match_indices: Vec::new(),
         });
+
+        for cred in credentials {
+            let hint_str = cred
+                .username_hint
+                .as_deref()
+                .unwrap_or("password credential");
+            items.push(PaletteItem {
+                glyph: "✎",
+                label: format!("Edit: {}", cred.label),
+                hint: hint_str.to_string(),
+                action: PaletteAction::EditPasswordCredential(cred.id.clone()),
+                group: PaletteGroup::Vault,
+                shortcut: None,
+                match_indices: Vec::new(),
+            });
+            items.push(PaletteItem {
+                glyph: "×",
+                label: format!("Delete: {}", cred.label),
+                hint: "Remove this credential".into(),
+                action: PaletteAction::DeletePasswordCredential(cred.id.clone()),
+                group: PaletteGroup::Vault,
+                shortcut: None,
+                match_indices: Vec::new(),
+            });
+        }
+
+        for key in keys {
+            let algo = match &key.algorithm {
+                PrivateKeyAlgorithm::Ed25519 => "Ed25519",
+                PrivateKeyAlgorithm::Rsa { bits } => {
+                    if *bits == 4096 { "RSA-4096" } else { "RSA" }
+                }
+            };
+            items.push(PaletteItem {
+                glyph: "×",
+                label: format!("Delete Key: {}", key.label),
+                hint: algo.to_string(),
+                action: PaletteAction::DeletePrivateKey(key.id.clone()),
+                group: PaletteGroup::Vault,
+                shortcut: None,
+                match_indices: Vec::new(),
+            });
+        }
+
         items.push(PaletteItem {
             glyph: "◆",
             label: "Lock Vault".into(),
@@ -393,6 +444,8 @@ mod tests {
         let items = build_items(
             &sessions,
             &session_labels,
+            &[],
+            &[],
             &[],
             999,
             ThemeId::ObsidianSmoke,

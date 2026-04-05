@@ -20,7 +20,8 @@ use seance_terminal::{
     TerminalRow, TerminalSession,
 };
 use seance_vault::{
-    HostAuthRef, HostSummary, SecretString, VaultHostProfile, VaultPasswordCredential, VaultStore,
+    CredentialSummary, HostAuthRef, HostSummary, KeySummary, PrivateKeyAlgorithm,
+    PrivateKeySource, SecretString, VaultHostProfile, VaultPasswordCredential, VaultStore,
 };
 use tracing::trace;
 use zeroize::Zeroizing;
@@ -49,6 +50,16 @@ pub fn run(vault: VaultStore) -> Result<()> {
     let unlocked = backend.vault_status().unlocked;
     let initial_saved_hosts = if unlocked {
         backend.list_hosts().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let initial_credentials = if unlocked {
+        backend.list_password_credentials().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let initial_keys = if unlocked {
+        backend.list_private_keys().unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -90,6 +101,10 @@ pub fn run(vault: VaultStore) -> Result<()> {
                             device_unlock_attempted,
                         ),
                         host_editor: None,
+                        credential_editor: None,
+                        vault_panel_open: false,
+                        cached_credentials: initial_credentials,
+                        cached_keys: initial_keys,
                         status_message: None,
                         active_theme: ThemeId::ObsidianSmoke,
                         palette_open: false,
@@ -139,6 +154,10 @@ struct SeanceWorkspace {
     selected_host_id: Option<String>,
     unlock_form: UnlockFormState,
     host_editor: Option<HostEditorState>,
+    credential_editor: Option<CredentialEditorState>,
+    vault_panel_open: bool,
+    cached_credentials: Vec<CredentialSummary>,
+    cached_keys: Vec<KeySummary>,
     status_message: Option<String>,
     active_theme: ThemeId,
     palette_open: bool,
@@ -337,7 +356,7 @@ enum HostField {
     Username,
     Port,
     Notes,
-    AuthOrder,
+    Auth,
 }
 
 impl HostField {
@@ -347,7 +366,7 @@ impl HostField {
         Self::Username,
         Self::Port,
         Self::Notes,
-        Self::AuthOrder,
+        Self::Auth,
     ];
 
     fn title(self) -> &'static str {
@@ -357,7 +376,7 @@ impl HostField {
             Self::Username => "Username",
             Self::Port => "Port",
             Self::Notes => "Notes",
-            Self::AuthOrder => "Auth Order",
+            Self::Auth => "Authentication",
         }
     }
 }
@@ -370,7 +389,8 @@ struct HostEditorState {
     username: String,
     port: String,
     notes: String,
-    auth_order: String,
+    auth_items: Vec<HostAuthRef>,
+    auth_cursor: usize,
     selected_field: usize,
     message: Option<String>,
 }
@@ -384,10 +404,11 @@ impl HostEditorState {
             username: String::new(),
             port: "22".into(),
             notes: String::new(),
-            auth_order: String::new(),
+            auth_items: Vec::new(),
+            auth_cursor: 0,
             selected_field: 0,
             message: Some(
-                "Create an encrypted SSH config. Auth order uses password:<id> or key:<id>[:passphrase_id]."
+                "Create an encrypted SSH host. Use the Auth section to select credentials."
                     .into(),
             ),
         }
@@ -401,14 +422,72 @@ impl HostEditorState {
             username: host.username,
             port: host.port.to_string(),
             notes: host.notes.unwrap_or_default(),
-            auth_order: format_auth_order(&host.auth_order),
+            auth_items: host.auth_order,
+            auth_cursor: 0,
             selected_field: 0,
-            message: Some("Edit the encrypted record and press Enter on Notes to save.".into()),
+            message: Some("Edit the host record. Tab to Auth and toggle credentials.".into()),
         }
     }
 
     fn field(&self) -> HostField {
         HostField::ALL[self.selected_field.min(HostField::ALL.len() - 1)]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CredentialField {
+    Label,
+    UsernameHint,
+    Secret,
+}
+
+impl CredentialField {
+    const ALL: [Self; 3] = [Self::Label, Self::UsernameHint, Self::Secret];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Label => "Label",
+            Self::UsernameHint => "Username Hint",
+            Self::Secret => "Password",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CredentialEditorState {
+    credential_id: Option<String>,
+    label: String,
+    username_hint: String,
+    secret: String,
+    selected_field: usize,
+    message: Option<String>,
+}
+
+impl CredentialEditorState {
+    fn blank() -> Self {
+        Self {
+            credential_id: None,
+            label: String::new(),
+            username_hint: String::new(),
+            secret: String::new(),
+            selected_field: 0,
+            message: Some("Store an encrypted password credential in the vault.".into()),
+        }
+    }
+
+    fn from_credential(cred: VaultPasswordCredential) -> Self {
+        Self {
+            credential_id: Some(cred.id),
+            label: cred.label,
+            username_hint: cred.username_hint.unwrap_or_default(),
+            secret: cred.secret,
+            selected_field: 0,
+            message: Some("Edit the credential. Tab to move, Enter on Password to save.".into()),
+        }
+    }
+
+    fn field(&self) -> CredentialField {
+        CredentialField::ALL[self.selected_field.min(CredentialField::ALL.len() - 1)]
     }
 }
 
@@ -1113,6 +1192,7 @@ impl SeanceWorkspace {
                                 "Encrypted vault created. Device unlock is now enrolled.".into(),
                             );
                             self.refresh_saved_hosts();
+                            self.refresh_vault_cache();
                         }
                         Err(err) => {
                             self.unlock_form.message = Some(err.to_string());
@@ -1131,6 +1211,7 @@ impl SeanceWorkspace {
                         self.status_message =
                             Some("Vault unlocked from the recovery passphrase.".into());
                         self.refresh_saved_hosts();
+                        self.refresh_vault_cache();
                     }
                     Err(err) => {
                         self.unlock_form.message = Some(err.to_string());
@@ -1146,8 +1227,12 @@ impl SeanceWorkspace {
     fn lock_vault(&mut self, cx: &mut Context<Self>) {
         self.backend.lock_vault();
         self.saved_hosts.clear();
+        self.cached_credentials.clear();
+        self.cached_keys.clear();
         self.selected_host_id = None;
         self.host_editor = None;
+        self.credential_editor = None;
+        self.vault_panel_open = false;
         self.unlock_form.reset_for_unlock();
         self.unlock_form.message =
             Some("Vault locked. Decrypted records were cleared from memory.".into());
@@ -1163,6 +1248,7 @@ impl SeanceWorkspace {
             self.unlock_form.reset_for_unlock();
             self.unlock_form.message = Some("Unlock the vault before adding a saved host.".into());
         } else {
+            self.refresh_vault_cache();
             self.host_editor = Some(HostEditorState::blank());
         }
         self.palette_open = false;
@@ -1171,6 +1257,7 @@ impl SeanceWorkspace {
     }
 
     fn begin_edit_host(&mut self, host_id: &str, cx: &mut Context<Self>) {
+        self.refresh_vault_cache();
         match self.backend.load_host(host_id) {
             Ok(Some(host)) => {
                 self.host_editor = Some(HostEditorState::from_host(host));
@@ -1220,6 +1307,7 @@ impl SeanceWorkspace {
                     Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
                 }
                 self.sessions.push(session);
+                self.vault_panel_open = false;
                 self.status_message = Some("SSH session connected.".into());
                 self.invalidate_terminal_surface();
             }
@@ -1244,7 +1332,7 @@ impl SeanceWorkspace {
             username: editor.username.trim().into(),
             port,
             notes: (!editor.notes.trim().is_empty()).then(|| editor.notes.trim().to_string()),
-            auth_order: parse_auth_order(&editor.auth_order),
+            auth_order: editor.auth_items.clone(),
         };
 
         match self.backend.save_host(draft) {
@@ -1265,6 +1353,101 @@ impl SeanceWorkspace {
         }
 
         self.perf_overlay.mark_input(RedrawReason::Input);
+        cx.notify();
+    }
+
+    fn refresh_vault_cache(&mut self) {
+        self.cached_credentials = self.backend.list_password_credentials().unwrap_or_default();
+        self.cached_keys = self.backend.list_private_keys().unwrap_or_default();
+    }
+
+    fn open_vault_panel(&mut self, cx: &mut Context<Self>) {
+        if !self.vault_unlocked() {
+            self.unlock_form.reset_for_unlock();
+            self.unlock_form.message =
+                Some("Unlock the vault to manage credentials and keys.".into());
+            cx.notify();
+            return;
+        }
+        self.refresh_vault_cache();
+        self.vault_panel_open = true;
+        self.palette_open = false;
+        cx.notify();
+    }
+
+    fn begin_edit_credential(&mut self, id: &str, cx: &mut Context<Self>) {
+        match self.backend.load_password_credential(id) {
+            Ok(Some(cred)) => {
+                self.credential_editor = Some(CredentialEditorState::from_credential(cred));
+            }
+            Ok(None) => {
+                self.status_message = Some("Credential not found.".into());
+                self.refresh_vault_cache();
+            }
+            Err(err) => {
+                self.status_message = Some(err.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn save_credential_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.credential_editor.as_ref() else {
+            return;
+        };
+        let draft = VaultPasswordCredential {
+            id: editor.credential_id.clone().unwrap_or_default(),
+            label: editor.label.trim().to_string(),
+            username_hint: (!editor.username_hint.trim().is_empty())
+                .then(|| editor.username_hint.trim().to_string()),
+            secret: editor.secret.clone(),
+        };
+        match self.backend.save_password_credential(draft) {
+            Ok(summary) => {
+                self.status_message =
+                    Some(format!("Saved credential '{}'.", summary.label));
+                self.credential_editor = None;
+                self.refresh_vault_cache();
+            }
+            Err(err) => {
+                if let Some(editor) = self.credential_editor.as_mut() {
+                    editor.message = Some(err.to_string());
+                }
+            }
+        }
+        self.perf_overlay.mark_input(RedrawReason::Input);
+        cx.notify();
+    }
+
+    fn delete_credential(&mut self, id: &str, cx: &mut Context<Self>) {
+        match self.backend.delete_password_credential(id) {
+            Ok(true) => {
+                self.status_message = Some("Credential deleted.".into());
+                self.refresh_vault_cache();
+            }
+            Ok(false) => {
+                self.status_message = Some("Credential already removed.".into());
+            }
+            Err(err) => {
+                self.status_message = Some(err.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn delete_private_key(&mut self, id: &str, cx: &mut Context<Self>) {
+        match self.backend.delete_private_key(id) {
+            Ok(true) => {
+                self.status_message = Some("Key deleted.".into());
+                self.refresh_vault_cache();
+            }
+            Ok(false) => {
+                self.status_message = Some("Key already removed.".into());
+            }
+            Err(err) => {
+                self.status_message = Some(err.to_string());
+            }
+        }
         cx.notify();
     }
 
@@ -1361,23 +1544,20 @@ impl SeanceWorkspace {
                 self.begin_add_host(cx);
                 return;
             }
+            PaletteAction::OpenVaultPanel => {
+                self.open_vault_panel(cx);
+                return;
+            }
             PaletteAction::AddPasswordCredential => {
-                match self
-                    .backend
-                    .save_password_credential(VaultPasswordCredential {
-                        id: String::new(),
-                        label: format!("credential-{}", now_ui_suffix()),
-                        username_hint: None,
-                        secret: "change-me".into(),
-                    }) {
-                    Ok(summary) => {
-                        self.status_message = Some(format!(
-                            "Created placeholder password credential '{}'. Edit support lands next.",
-                            summary.label
-                        ));
-                    }
-                    Err(err) => self.status_message = Some(err.to_string()),
-                }
+                self.credential_editor = Some(CredentialEditorState::blank());
+            }
+            PaletteAction::EditPasswordCredential(id) => {
+                self.begin_edit_credential(&id, cx);
+                return;
+            }
+            PaletteAction::DeletePasswordCredential(id) => {
+                self.delete_credential(&id, cx);
+                return;
             }
             PaletteAction::ImportPrivateKey => {
                 self.status_message = Some(
@@ -1392,6 +1572,7 @@ impl SeanceWorkspace {
                     Ok(summary) => {
                         self.status_message =
                             Some(format!("Generated vault-backed key '{}'.", summary.label));
+                        self.refresh_vault_cache();
                     }
                     Err(err) => self.status_message = Some(err.to_string()),
                 }
@@ -1404,9 +1585,14 @@ impl SeanceWorkspace {
                     Ok(summary) => {
                         self.status_message =
                             Some(format!("Generated vault-backed key '{}'.", summary.label));
+                        self.refresh_vault_cache();
                     }
                     Err(err) => self.status_message = Some(err.to_string()),
                 }
+            }
+            PaletteAction::DeletePrivateKey(id) => {
+                self.delete_private_key(&id, cx);
+                return;
             }
             PaletteAction::EditSavedHost(id) => {
                 self.begin_edit_host(&id, cx);
@@ -1445,8 +1631,16 @@ impl SeanceWorkspace {
             self.handle_unlock_key(event, cx);
             return;
         }
+        if self.credential_editor.is_some() {
+            self.handle_credential_editor_key(event, cx);
+            return;
+        }
         if self.host_editor.is_some() {
             self.handle_host_editor_key(event, cx);
+            return;
+        }
+        if mods.platform && key == "," {
+            self.open_vault_panel(cx);
             return;
         }
         if mods.platform && key == "k" {
@@ -1467,6 +1661,13 @@ impl SeanceWorkspace {
 
         if self.palette_open {
             self.handle_palette_key(event, window, cx);
+            return;
+        }
+
+        if self.vault_panel_open && key == "escape" {
+            self.vault_panel_open = false;
+            self.perf_overlay.mark_input(RedrawReason::Input);
+            cx.notify();
             return;
         }
 
@@ -1507,6 +1708,8 @@ impl SeanceWorkspace {
                     &self.sessions,
                     &session_labels,
                     &self.saved_hosts,
+                    &self.cached_credentials,
+                    &self.cached_keys,
                     self.active_session_id,
                     self.active_theme,
                     &self.palette_query,
@@ -1525,6 +1728,8 @@ impl SeanceWorkspace {
                     &self.sessions,
                     &session_labels,
                     &self.saved_hosts,
+                    &self.cached_credentials,
+                    &self.cached_keys,
                     self.active_session_id,
                     self.active_theme,
                     &self.palette_query,
@@ -1609,54 +1814,71 @@ impl SeanceWorkspace {
     }
 
     fn handle_host_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let key_char = event.keystroke.key_char.as_deref();
+        let mods = event.keystroke.modifiers;
+
+        if mods.platform && key == "s" {
+            self.save_host_editor(cx);
+            return;
+        }
+
         let Some(editor) = self.host_editor.as_mut() else {
             return;
         };
-        let key = event.keystroke.key.as_str();
-        let key_char = event.keystroke.key_char.as_deref();
+
+        let in_auth = matches!(editor.field(), HostField::Auth);
 
         match key {
             "escape" => {
                 self.host_editor = None;
             }
-            "tab" | "down" => {
-                editor.selected_field = (editor.selected_field + 1) % HostField::ALL.len();
+            "tab" => {
+                if mods.shift {
+                    editor.selected_field =
+                        (editor.selected_field + HostField::ALL.len() - 1) % HostField::ALL.len();
+                } else {
+                    editor.selected_field = (editor.selected_field + 1) % HostField::ALL.len();
+                }
+                editor.auth_cursor = 0;
+            }
+            "down" => {
+                if in_auth {
+                    let total = self.cached_credentials.len() + self.cached_keys.len();
+                    if total > 0 {
+                        editor.auth_cursor = (editor.auth_cursor + 1).min(total - 1);
+                    }
+                } else {
+                    editor.selected_field = (editor.selected_field + 1) % HostField::ALL.len();
+                    editor.auth_cursor = 0;
+                }
             }
             "up" => {
-                editor.selected_field =
-                    (editor.selected_field + HostField::ALL.len() - 1) % HostField::ALL.len();
+                if in_auth {
+                    editor.auth_cursor = editor.auth_cursor.saturating_sub(1);
+                } else {
+                    editor.selected_field =
+                        (editor.selected_field + HostField::ALL.len() - 1) % HostField::ALL.len();
+                    editor.auth_cursor = 0;
+                }
             }
             "backspace" => match editor.field() {
-                HostField::Label => {
-                    editor.label.pop();
-                }
-                HostField::Hostname => {
-                    editor.hostname.pop();
-                }
-                HostField::Username => {
-                    editor.username.pop();
-                }
-                HostField::Port => {
-                    editor.port.pop();
-                }
-                HostField::Notes => {
-                    editor.notes.pop();
-                }
-                HostField::AuthOrder => {
-                    editor.auth_order.pop();
-                }
+                HostField::Label => { editor.label.pop(); }
+                HostField::Hostname => { editor.hostname.pop(); }
+                HostField::Username => { editor.username.pop(); }
+                HostField::Port => { editor.port.pop(); }
+                HostField::Notes => { editor.notes.pop(); }
+                HostField::Auth => {}
             },
+            "enter" | " " if in_auth => {
+                self.toggle_host_auth_at_cursor();
+            }
             "enter" => {
-                if matches!(editor.field(), HostField::AuthOrder) {
-                    self.save_host_editor(cx);
-                    return;
-                }
                 editor.selected_field = (editor.selected_field + 1) % HostField::ALL.len();
             }
             _ => {
                 if let Some(ch) = key_char {
-                    let m = event.keystroke.modifiers;
-                    if !m.platform && !m.control && !m.function {
+                    if !mods.platform && !mods.control && !mods.function && !in_auth {
                         match editor.field() {
                             HostField::Label => editor.label.push_str(ch),
                             HostField::Hostname => editor.hostname.push_str(ch),
@@ -1667,7 +1889,92 @@ impl SeanceWorkspace {
                                 }
                             }
                             HostField::Notes => editor.notes.push_str(ch),
-                            HostField::AuthOrder => editor.auth_order.push_str(ch),
+                            HostField::Auth => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        self.perf_overlay.mark_input(RedrawReason::Input);
+        cx.notify();
+    }
+
+    fn toggle_host_auth_at_cursor(&mut self) {
+        let Some(editor) = self.host_editor.as_mut() else {
+            return;
+        };
+        let cred_count = self.cached_credentials.len();
+        let cursor = editor.auth_cursor;
+
+        if cursor < cred_count {
+            let cred = &self.cached_credentials[cursor];
+            let auth_ref = HostAuthRef::Password {
+                credential_id: cred.id.clone(),
+            };
+            if let Some(pos) = editor.auth_items.iter().position(|a| *a == auth_ref) {
+                editor.auth_items.remove(pos);
+            } else {
+                editor.auth_items.push(auth_ref);
+            }
+        } else {
+            let key_idx = cursor - cred_count;
+            if key_idx < self.cached_keys.len() {
+                let key = &self.cached_keys[key_idx];
+                let matches_key =
+                    |a: &HostAuthRef| matches!(a, HostAuthRef::PrivateKey { key_id, .. } if *key_id == key.id);
+                if let Some(pos) = editor.auth_items.iter().position(matches_key) {
+                    editor.auth_items.remove(pos);
+                } else {
+                    editor.auth_items.push(HostAuthRef::PrivateKey {
+                        key_id: key.id.clone(),
+                        passphrase_credential_id: None,
+                    });
+                }
+            }
+        }
+    }
+
+    fn handle_credential_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(editor) = self.credential_editor.as_mut() else {
+            return;
+        };
+        let key = event.keystroke.key.as_str();
+        let key_char = event.keystroke.key_char.as_deref();
+        let mods = event.keystroke.modifiers;
+
+        match key {
+            "escape" => {
+                self.credential_editor = None;
+            }
+            "tab" | "down" => {
+                editor.selected_field =
+                    (editor.selected_field + 1) % CredentialField::ALL.len();
+            }
+            "up" => {
+                editor.selected_field = (editor.selected_field + CredentialField::ALL.len() - 1)
+                    % CredentialField::ALL.len();
+            }
+            "backspace" => match editor.field() {
+                CredentialField::Label => { editor.label.pop(); }
+                CredentialField::UsernameHint => { editor.username_hint.pop(); }
+                CredentialField::Secret => { editor.secret.pop(); }
+            },
+            "enter" => {
+                if matches!(editor.field(), CredentialField::Secret) {
+                    self.save_credential_editor(cx);
+                    return;
+                }
+                editor.selected_field =
+                    (editor.selected_field + 1) % CredentialField::ALL.len();
+            }
+            _ => {
+                if let Some(ch) = key_char {
+                    if !mods.platform && !mods.control && !mods.function {
+                        match editor.field() {
+                            CredentialField::Label => editor.label.push_str(ch),
+                            CredentialField::UsernameHint => editor.username_hint.push_str(ch),
+                            CredentialField::Secret => editor.secret.push_str(ch),
                         }
                     }
                 }
@@ -1694,8 +2001,12 @@ impl SeanceWorkspace {
             row.border_l_2()
                 .border_color(t.sidebar_indicator)
                 .bg(t.sidebar_row_active)
+                .rounded_r_md()
+                .shadow_sm()
         } else {
-            row.ml(px(2.0)).hover(|style| style.bg(t.sidebar_row_hover))
+            row.ml(px(2.0))
+                .rounded_r_md()
+                .hover(|style| style.bg(t.sidebar_row_hover))
         }
     }
 
@@ -1712,10 +2023,11 @@ impl SeanceWorkspace {
                 div()
                     .font_family(SIDEBAR_FONT_MONO)
                     .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(t.sidebar_section_label)
                     .child(format!("-- {label}")),
             )
-            .child(div().flex_1().h(px(1.0)).bg(t.sidebar_separator))
+            .child(div().flex_1().h(px(1.0)).bg(t.accent_glow))
             .child(
                 div()
                     .font_family(SIDEBAR_FONT_MONO)
@@ -1888,8 +2200,14 @@ impl SeanceWorkspace {
         let sid = session.id();
         let title = self.session_display_title(session);
         let snapshot = session.snapshot();
-        let preview =
-            session_preview_text(&snapshot.rows).unwrap_or_else(|| "waiting for output…".into());
+        let has_output = snapshot.rows.iter().any(|r| !r.plain_text().trim().is_empty());
+        let preview = session_preview_text(&snapshot.rows).unwrap_or_else(|| {
+            if has_output {
+                "interactive session".into()
+            } else {
+                "waiting for output\u{2026}".into()
+            }
+        });
         let close_sid = sid;
         let badge = self.session_display_badge(session, active);
 
@@ -1929,18 +2247,39 @@ impl SeanceWorkspace {
                             .child(
                                 div()
                                     .font_family(SIDEBAR_FONT_MONO)
-                                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
-                                    .text_color(if active { t.accent } else { t.sidebar_meta })
+                                    .text_size(px(9.0))
+                                    .px(px(5.0))
+                                    .py(px(1.0))
+                                    .rounded(px(3.0))
+                                    .when(active, |el| {
+                                        el.bg(t.accent_glow).text_color(t.accent)
+                                    })
+                                    .when(!active, |el| {
+                                        el.bg(t.glass_hover).text_color(t.sidebar_meta)
+                                    })
                                     .child(badge),
                             ),
                     )
                     .child(
                         div()
-                            .font_family(SIDEBAR_FONT_MONO)
-                            .text_size(px(SIDEBAR_MONO_SIZE_PX))
-                            .text_color(t.sidebar_meta)
-                            .line_clamp(1)
-                            .child(preview),
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .font_family(SIDEBAR_FONT_MONO)
+                                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                                    .text_color(t.text_ghost)
+                                    .child("$"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(SIDEBAR_FONT_MONO)
+                                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                                    .text_color(t.sidebar_meta)
+                                    .line_clamp(1)
+                                    .child(preview),
+                            ),
                     ),
             )
             .child(
@@ -2043,11 +2382,11 @@ impl SeanceWorkspace {
         section
     }
 
-    fn render_recents_section(&self, cx: &mut Context<Self>) -> Div {
+    fn render_sessions_section(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
         let mut section =
             div().flex().flex_col().gap(px(4.0)).child(
-                self.render_sidebar_section_heading("recents", self.sessions.len().to_string()),
+                self.render_sidebar_section_heading("sessions", self.sessions.len().to_string()),
             );
 
         if self.sessions.is_empty() {
@@ -2091,11 +2430,15 @@ impl SeanceWorkspace {
     fn render_vault_section(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
 
+        let cred_count = self.cached_credentials.len();
+        let key_count = self.cached_keys.len();
+        let meta = format!("{} creds  {} keys", cred_count, key_count);
+
         let mut section = div()
             .flex()
             .flex_col()
             .gap(px(4.0))
-            .child(self.render_sidebar_section_heading("vault", String::new()));
+            .child(self.render_sidebar_section_heading("vault", meta));
 
         let vault_action = |label: &'static str| {
             div()
@@ -2113,32 +2456,28 @@ impl SeanceWorkspace {
             div()
                 .flex()
                 .flex_col()
+                .child(
+                    vault_action(if self.vault_panel_open {
+                        "\u{25c9} manage vault"
+                    } else {
+                        "\u{25cb} manage vault"
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            if this.vault_panel_open {
+                                this.vault_panel_open = false;
+                            } else {
+                                this.open_vault_panel(cx);
+                            }
+                            cx.notify();
+                        }),
+                    ),
+                )
                 .child(vault_action("+ add credential").on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
-                        match this
-                            .backend
-                            .save_password_credential(VaultPasswordCredential {
-                                id: String::new(),
-                                label: format!("credential-{}", now_ui_suffix()),
-                                username_hint: None,
-                                secret: "change-me".into(),
-                            }) {
-                            Ok(summary) => {
-                                this.status_message =
-                                    Some(format!("Created credential '{}'.", summary.label));
-                            }
-                            Err(err) => this.status_message = Some(err.to_string()),
-                        }
-                        this.perf_overlay.mark_input(RedrawReason::Input);
-                        cx.notify();
-                    }),
-                ))
-                .child(vault_action("+ import key").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.status_message =
-                            Some("Private key import UI is still pending.".into());
+                        this.credential_editor = Some(CredentialEditorState::blank());
                         this.perf_overlay.mark_input(RedrawReason::Input);
                         cx.notify();
                     }),
@@ -2153,6 +2492,7 @@ impl SeanceWorkspace {
                             Ok(summary) => {
                                 this.status_message =
                                     Some(format!("Generated key '{}'.", summary.label));
+                                this.refresh_vault_cache();
                             }
                             Err(err) => this.status_message = Some(err.to_string()),
                         }
@@ -2170,6 +2510,7 @@ impl SeanceWorkspace {
                             Ok(summary) => {
                                 this.status_message =
                                     Some(format!("Generated key '{}'.", summary.label));
+                                this.refresh_vault_cache();
                             }
                             Err(err) => this.status_message = Some(err.to_string()),
                         }
@@ -2200,7 +2541,7 @@ impl SeanceWorkspace {
             .gap(px(6.0))
             .child(div().h(px(1.0)).bg(t.sidebar_separator))
             .child({
-                let mut theme_row = div().flex().items_center().gap(px(6.0));
+                let mut theme_row = div().flex().items_center().gap(px(5.0)).flex_wrap();
                 let active_theme = self.active_theme;
                 for &tid in ThemeId::ALL {
                     let tid_theme = tid.theme();
@@ -2208,12 +2549,16 @@ impl SeanceWorkspace {
                     let accent_color = tid_theme.accent;
                     theme_row = theme_row.child(
                         div()
-                            .w(px(8.0))
-                            .h(px(8.0))
+                            .w(px(10.0))
+                            .h(px(10.0))
                             .rounded_full()
                             .bg(accent_color)
                             .cursor_pointer()
-                            .when(is_active, |el| el.border_1().border_color(t.text_secondary))
+                            .when(is_active, |el| {
+                                el.border_1()
+                                    .border_color(t.text_secondary)
+                                    .shadow_sm()
+                            })
                             .when(!is_active, |el| {
                                 el.hover(|s| s.border_1().border_color(t.sidebar_edge_bright))
                                     .on_mouse_down(
@@ -2320,6 +2665,7 @@ impl SeanceWorkspace {
             .bg(t.sidebar_bg_elevated)
             .border_r_1()
             .border_color(t.sidebar_edge)
+            .shadow_lg()
             .child({
                 let mut content = div()
                     .flex_1()
@@ -2328,13 +2674,506 @@ impl SeanceWorkspace {
                     .gap(px(16.0))
                     .child(self.render_sidebar_header(cx))
                     .child(self.render_hosts_section(cx))
-                    .child(self.render_recents_section(cx));
+                    .child(self.render_sessions_section(cx));
                 if self.vault_unlocked() {
                     content = content.child(self.render_vault_section(cx));
                 }
                 content
             })
             .child(self.render_sidebar_footer(cx))
+    }
+
+    fn render_vault_panel(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+
+        let shell_divider = div()
+            .w(px(2.0))
+            .h_full()
+            .border_l_1()
+            .border_color(t.sidebar_edge_bright)
+            .bg(t.shell_divider_glow);
+
+        let mut content = div()
+            .flex_1()
+            .h_full()
+            .bg(t.bg_void)
+            .overflow_hidden()
+            .track_focus(&self.focus_handle)
+            .on_mouse_down(MouseButton::Left, {
+                let fh = self.focus_handle.clone();
+                move |_: &gpui::MouseDownEvent, window: &mut Window, _cx: &mut App| {
+                    window.focus(&fh);
+                }
+            })
+            .on_key_down(cx.listener(Self::handle_key_down))
+            .p_6()
+            .flex()
+            .flex_col()
+            .gap_6();
+
+        content = content.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(20.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(t.text_primary)
+                                .child("Vault"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(t.text_muted)
+                                .child("Manage encrypted credentials and SSH keys"),
+                        ),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .py(px(6.0))
+                        .rounded_md()
+                        .bg(t.glass_tint)
+                        .border_1()
+                        .border_color(t.glass_border)
+                        .text_xs()
+                        .text_color(t.text_secondary)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(t.glass_hover).text_color(t.text_primary))
+                        .child("esc  back to terminal")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.vault_panel_open = false;
+                                cx.notify();
+                            }),
+                        ),
+                ),
+        );
+
+        content = content.child(self.render_vault_credentials_card(cx));
+        content = content.child(self.render_vault_keys_card(cx));
+
+        div().flex_1().h_full().flex().child(shell_divider).child(content)
+    }
+
+    fn render_vault_credentials_card(&self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded_xl()
+            .bg(t.glass_tint)
+            .border_1()
+            .border_color(t.glass_border);
+
+        card = card.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(t.text_primary)
+                                .child("Credentials"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(t.text_muted)
+                                .child(format!("{}", self.cached_credentials.len())),
+                        ),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .py(px(5.0))
+                        .rounded_md()
+                        .bg(t.accent_glow)
+                        .text_xs()
+                        .text_color(t.text_primary)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(t.accent))
+                        .child("+ add credential")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.credential_editor = Some(CredentialEditorState::blank());
+                                cx.notify();
+                            }),
+                        ),
+                ),
+        );
+
+        if self.cached_credentials.is_empty() {
+            card = card.child(
+                div()
+                    .py_4()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(t.text_ghost)
+                            .child("No password credentials stored"),
+                    ),
+            );
+        } else {
+            card = card.child(
+                div()
+                    .h(px(1.0))
+                    .bg(t.glass_border),
+            );
+
+            let mut rows = div().flex().flex_col();
+            for cred in &self.cached_credentials {
+                rows = rows.child(self.render_credential_row(cred, cx));
+            }
+            card = card.child(rows);
+        }
+
+        card
+    }
+
+    fn render_credential_row(
+        &self,
+        cred: &CredentialSummary,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let t = self.theme();
+        let cred_id = cred.id.clone();
+        let cred_id_del = cred.id.clone();
+        let hint = cred
+            .username_hint
+            .as_deref()
+            .unwrap_or("--");
+        let truncated_id = if cred.id.len() > 8 {
+            format!("{}...", &cred.id[..8])
+        } else {
+            cred.id.clone()
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .py(px(6.0))
+            .rounded_md()
+            .hover(|s| s.bg(t.sidebar_row_hover))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(t.text_primary)
+                            .child(cred.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(t.text_muted)
+                                    .child(hint.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family(SIDEBAR_FONT_MONO)
+                                    .text_color(t.text_ghost)
+                                    .child(truncated_id),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_2()
+                            .py(px(3.0))
+                            .rounded(px(4.0))
+                            .text_xs()
+                            .text_color(t.text_ghost)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(t.text_secondary).bg(t.glass_hover))
+                            .child("edit")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.begin_edit_credential(&cred_id, cx);
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py(px(3.0))
+                            .rounded(px(4.0))
+                            .text_xs()
+                            .text_color(t.text_ghost)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(t.warning).bg(t.glass_hover))
+                            .child("del")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.delete_credential(&cred_id_del, cx);
+                                }),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_vault_keys_card(&self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded_xl()
+            .bg(t.glass_tint)
+            .border_1()
+            .border_color(t.glass_border);
+
+        card = card.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(t.text_primary)
+                                .child("SSH Keys"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(t.text_muted)
+                                .child(format!("{}", self.cached_keys.len())),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .px_3()
+                                .py(px(5.0))
+                                .rounded_md()
+                                .bg(t.accent_glow)
+                                .text_xs()
+                                .text_color(t.text_primary)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(t.accent))
+                                .child("+ ed25519")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        match this
+                                            .backend
+                                            .generate_ed25519_key(format!("ed25519-{}", now_ui_suffix()))
+                                        {
+                                            Ok(summary) => {
+                                                this.status_message =
+                                                    Some(format!("Generated key '{}'.", summary.label));
+                                                this.refresh_vault_cache();
+                                            }
+                                            Err(err) => this.status_message = Some(err.to_string()),
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .py(px(5.0))
+                                .rounded_md()
+                                .bg(t.accent_glow)
+                                .text_xs()
+                                .text_color(t.text_primary)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(t.accent))
+                                .child("+ rsa-4096")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        match this
+                                            .backend
+                                            .generate_rsa_key(format!("rsa-{}", now_ui_suffix()))
+                                        {
+                                            Ok(summary) => {
+                                                this.status_message =
+                                                    Some(format!("Generated key '{}'.", summary.label));
+                                                this.refresh_vault_cache();
+                                            }
+                                            Err(err) => this.status_message = Some(err.to_string()),
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                        ),
+                ),
+        );
+
+        if self.cached_keys.is_empty() {
+            card = card.child(
+                div()
+                    .py_4()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(t.text_ghost)
+                            .child("No SSH keys stored"),
+                    ),
+            );
+        } else {
+            card = card.child(
+                div()
+                    .h(px(1.0))
+                    .bg(t.glass_border),
+            );
+
+            let mut rows = div().flex().flex_col();
+            for key in &self.cached_keys {
+                rows = rows.child(self.render_key_row(key, cx));
+            }
+            card = card.child(rows);
+        }
+
+        card
+    }
+
+    fn render_key_row(&self, key: &KeySummary, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+        let key_id_del = key.id.clone();
+
+        let algo_label = match &key.algorithm {
+            PrivateKeyAlgorithm::Ed25519 => "ED25519".to_string(),
+            PrivateKeyAlgorithm::Rsa { bits } => format!("RSA-{bits}"),
+        };
+        let source_label = match key.source {
+            PrivateKeySource::Generated => "generated",
+            PrivateKeySource::Imported => "imported",
+        };
+        let truncated_id = if key.id.len() > 8 {
+            format!("{}...", &key.id[..8])
+        } else {
+            key.id.clone()
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .py(px(6.0))
+            .rounded_md()
+            .hover(|s| s.bg(t.sidebar_row_hover))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(t.text_primary)
+                            .child(key.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px(px(5.0))
+                                    .py(px(1.0))
+                                    .rounded(px(3.0))
+                                    .bg(t.accent_glow)
+                                    .text_xs()
+                                    .font_family(SIDEBAR_FONT_MONO)
+                                    .text_color(t.accent)
+                                    .child(algo_label),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(t.text_muted)
+                                    .child(source_label),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family(SIDEBAR_FONT_MONO)
+                                    .text_color(t.text_ghost)
+                                    .child(truncated_id),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_2()
+                            .py(px(3.0))
+                            .rounded(px(4.0))
+                            .text_xs()
+                            .text_color(t.text_ghost)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(t.warning).bg(t.glass_hover))
+                            .child("del")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.delete_private_key(&key_id_del, cx);
+                                }),
+                            ),
+                    ),
+            )
     }
 
     fn render_terminal_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -2480,6 +3319,8 @@ impl SeanceWorkspace {
             &self.sessions,
             &session_labels,
             &self.saved_hosts,
+            &self.cached_credentials,
+            &self.cached_keys,
             self.active_session_id,
             self.active_theme,
             &self.palette_query,
@@ -2841,7 +3682,7 @@ impl SeanceWorkspace {
             .child(panel)
     }
 
-    fn render_host_editor_overlay(&self) -> impl IntoElement {
+    fn render_host_editor_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme();
         let Some(editor) = self.host_editor.as_ref() else {
             return div();
@@ -2853,17 +3694,18 @@ impl SeanceWorkspace {
             "Add Saved Host"
         };
 
-        let fields = [
+        let text_fields: [(HostField, String); 5] = [
             (HostField::Label, editor.label.clone()),
             (HostField::Hostname, editor.hostname.clone()),
             (HostField::Username, editor.username.clone()),
             (HostField::Port, editor.port.clone()),
             (HostField::Notes, editor.notes.clone()),
-            (HostField::AuthOrder, editor.auth_order.clone()),
         ];
 
         let mut panel = div()
             .w(px(620.0))
+            .max_h(px(680.0))
+            .overflow_hidden()
             .bg(t.glass_strong)
             .border_1()
             .border_color(t.glass_border_bright)
@@ -2893,11 +3735,284 @@ impl SeanceWorkspace {
                     ),
             );
 
-        for (idx, (field, value)) in fields.into_iter().enumerate() {
+        for (idx, (field, value)) in text_fields.into_iter().enumerate() {
             panel = panel.child(editor_field_card(
                 field.title(),
                 value,
                 idx == editor.selected_field,
+                &t,
+            ));
+        }
+
+        panel = panel.child(self.render_host_auth_picker(cx));
+
+        panel = panel.child(
+            div()
+                .pt_2()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(t.text_ghost)
+                        .child("tab move  esc cancel  enter/space toggle auth  \u{2318}S save"),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .py(px(6.0))
+                        .rounded_md()
+                        .bg(t.accent_glow)
+                        .text_xs()
+                        .text_color(t.text_primary)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(t.accent))
+                        .child("save encrypted host")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.save_host_editor(cx);
+                            }),
+                        ),
+                ),
+        );
+
+        div()
+            .absolute()
+            .size_full()
+            .bg(t.scrim)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(panel)
+    }
+
+    fn render_host_auth_picker(&self, _cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+        let Some(editor) = self.host_editor.as_ref() else {
+            return div();
+        };
+        let is_auth_field = editor.field() == HostField::Auth;
+
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(if is_auth_field {
+                t.accent
+            } else {
+                t.glass_border
+            })
+            .bg(t.glass_tint);
+
+        section = section.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(if is_auth_field {
+                            t.accent
+                        } else {
+                            t.text_muted
+                        })
+                        .child("Authentication"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(t.text_ghost)
+                        .child(if is_auth_field {
+                            "enter/space to toggle"
+                        } else {
+                            "tab to this section"
+                        }),
+                ),
+        );
+
+        if !editor.auth_items.is_empty() {
+            let mut selected_list = div().flex().flex_col().gap(px(2.0));
+            for (i, auth) in editor.auth_items.iter().enumerate() {
+                let label = match auth {
+                    HostAuthRef::Password { credential_id } => {
+                        let name = self
+                            .cached_credentials
+                            .iter()
+                            .find(|c| c.id == *credential_id)
+                            .map(|c| c.label.as_str())
+                            .unwrap_or("unknown");
+                        format!("{}. password: {}", i + 1, name)
+                    }
+                    HostAuthRef::PrivateKey { key_id, .. } => {
+                        let name = self
+                            .cached_keys
+                            .iter()
+                            .find(|k| k.id == *key_id)
+                            .map(|k| k.label.as_str())
+                            .unwrap_or("unknown");
+                        format!("{}. key: {}", i + 1, name)
+                    }
+                };
+                selected_list = selected_list.child(
+                    div()
+                        .text_xs()
+                        .font_family(SIDEBAR_FONT_MONO)
+                        .text_color(t.accent)
+                        .child(label),
+                );
+            }
+            section = section.child(selected_list);
+
+            section = section.child(div().h(px(1.0)).bg(t.glass_border));
+        }
+
+        let mut all_items: Vec<(String, String, bool)> = Vec::new();
+
+        for cred in &self.cached_credentials {
+            let is_selected = editor
+                .auth_items
+                .iter()
+                .any(|a| matches!(a, HostAuthRef::Password { credential_id } if *credential_id == cred.id));
+            let hint = cred.username_hint.as_deref().unwrap_or("");
+            let label = if hint.is_empty() {
+                format!("password: {}", cred.label)
+            } else {
+                format!("password: {} ({})", cred.label, hint)
+            };
+            all_items.push((format!("cred:{}", cred.id), label, is_selected));
+        }
+
+        for key in &self.cached_keys {
+            let is_selected = editor
+                .auth_items
+                .iter()
+                .any(|a| matches!(a, HostAuthRef::PrivateKey { key_id, .. } if *key_id == key.id));
+            let algo = match &key.algorithm {
+                PrivateKeyAlgorithm::Ed25519 => "ed25519",
+                PrivateKeyAlgorithm::Rsa { .. } => "rsa",
+            };
+            let label = format!("key: {} [{}]", key.label, algo);
+            all_items.push((format!("key:{}", key.id), label, is_selected));
+        }
+
+        if all_items.is_empty() {
+            section = section.child(
+                div()
+                    .py_2()
+                    .text_xs()
+                    .text_color(t.text_ghost)
+                    .child("No credentials or keys in vault. Add some first."),
+            );
+        } else {
+            let mut rows = div().flex().flex_col();
+            for (idx, (_item_id, label, selected)) in all_items.iter().enumerate() {
+                let is_cursor = is_auth_field && idx == editor.auth_cursor;
+                let glyph = if *selected { "\u{25c9}" } else { "\u{25cb}" };
+                rows = rows.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py(px(3.0))
+                        .rounded(px(4.0))
+                        .bg(if is_cursor {
+                            t.accent_glow
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(if *selected { t.accent } else { t.text_ghost })
+                                .child(glyph),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(SIDEBAR_FONT_MONO)
+                                .text_color(if *selected {
+                                    t.text_primary
+                                } else {
+                                    t.text_secondary
+                                })
+                                .child(label.clone()),
+                        ),
+                );
+            }
+            section = section.child(rows);
+        }
+
+        section
+    }
+
+    fn render_credential_editor_overlay(&self) -> impl IntoElement {
+        let t = self.theme();
+        let Some(editor) = self.credential_editor.as_ref() else {
+            return div();
+        };
+
+        let title = if editor.credential_id.is_some() {
+            "Edit Credential"
+        } else {
+            "Add Credential"
+        };
+
+        let fields = [
+            (CredentialField::Label, editor.label.clone(), false),
+            (CredentialField::UsernameHint, editor.username_hint.clone(), false),
+            (CredentialField::Secret, editor.secret.clone(), true),
+        ];
+
+        let mut panel = div()
+            .w(px(520.0))
+            .bg(t.glass_strong)
+            .border_1()
+            .border_color(t.glass_border_bright)
+            .rounded_xl()
+            .shadow_lg()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(t.text_primary)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(t.text_muted)
+                            .child(editor.message.clone().unwrap_or_default()),
+                    ),
+            );
+
+        for (idx, (field, value, is_secret)) in fields.into_iter().enumerate() {
+            let is_selected = idx == editor.selected_field;
+            let display_value = if is_secret && !is_selected {
+                "\u{2022}".repeat(value.len().min(20))
+            } else {
+                value
+            };
+            panel = panel.child(editor_field_card(
+                field.title(),
+                display_value,
+                is_selected,
                 &t,
             ));
         }
@@ -2912,7 +4027,7 @@ impl SeanceWorkspace {
                     div()
                         .text_xs()
                         .text_color(t.text_ghost)
-                        .child("tab move  esc cancel  enter on auth order saves"),
+                        .child("tab move  esc cancel  enter on password saves"),
                 )
                 .child(
                     div()
@@ -2922,7 +4037,7 @@ impl SeanceWorkspace {
                         .bg(t.accent_glow)
                         .text_xs()
                         .text_color(t.text_primary)
-                        .child("save encrypted host"),
+                        .child("save credential"),
                 ),
         );
 
@@ -3114,11 +4229,30 @@ fn compute_terminal_geometry(
     .ok()
 }
 
+fn is_tui_artifact(line: &str) -> bool {
+    let non_ws: Vec<char> = line.chars().filter(|c| !c.is_whitespace()).collect();
+    if non_ws.is_empty() {
+        return false;
+    }
+    let special = non_ws
+        .iter()
+        .filter(|c| {
+            matches!(
+                **c,
+                '\u{2500}'..='\u{257F}'    // Box Drawing
+                | '\u{2580}'..='\u{259F}'  // Block Elements
+                | '\u{2800}'..='\u{28FF}'  // Braille Patterns
+            )
+        })
+        .count();
+    (special as f64 / non_ws.len() as f64) > 0.5
+}
+
 fn session_preview_text(rows: &[TerminalRow]) -> Option<String> {
     rows.iter()
         .rev()
         .map(TerminalRow::plain_text)
-        .find(|line| !line.trim().is_empty())
+        .find(|line| !line.trim().is_empty() && !is_tui_artifact(line))
 }
 
 fn build_terminal_surface_rows(
@@ -3801,6 +4935,87 @@ mod tests {
     }
 
     #[test]
+    fn tui_artifact_detects_box_drawing() {
+        assert!(is_tui_artifact("┌──────────┐"));
+        assert!(is_tui_artifact("│          │"));
+        assert!(is_tui_artifact("└──────────┘"));
+        assert!(is_tui_artifact("╰───────────────"));
+    }
+
+    #[test]
+    fn tui_artifact_detects_braille() {
+        assert!(is_tui_artifact("⣀⣄⣤⣶⣿⣿⣶⣤⣄⣀"));
+    }
+
+    #[test]
+    fn tui_artifact_detects_block_elements() {
+        assert!(is_tui_artifact("▄▄▄▄▄▄▄▄▄▄"));
+        assert!(is_tui_artifact("██████████"));
+    }
+
+    #[test]
+    fn tui_artifact_allows_normal_text() {
+        assert!(!is_tui_artifact("prompt$"));
+        assert!(!is_tui_artifact("~/code $ ls -la"));
+        assert!(!is_tui_artifact("hello world"));
+    }
+
+    #[test]
+    fn tui_artifact_allows_mixed_below_threshold() {
+        assert!(!is_tui_artifact("status │ ok"));
+    }
+
+    #[test]
+    fn tui_artifact_empty_and_whitespace() {
+        assert!(!is_tui_artifact(""));
+        assert!(!is_tui_artifact("   "));
+    }
+
+    #[test]
+    fn preview_text_skips_tui_artifact_rows() {
+        let rows = vec![
+            TerminalRow {
+                cells: vec![TerminalCell {
+                    text: "~/code $".into(),
+                    style: TerminalCellStyle::default(),
+                    width: 1,
+                }],
+            },
+            TerminalRow {
+                cells: vec![TerminalCell {
+                    text: "╰──────────────".into(),
+                    style: TerminalCellStyle::default(),
+                    width: 1,
+                }],
+            },
+        ];
+
+        assert_eq!(session_preview_text(&rows).as_deref(), Some("~/code $"));
+    }
+
+    #[test]
+    fn preview_text_returns_none_when_all_rows_are_artifacts() {
+        let rows = vec![
+            TerminalRow {
+                cells: vec![TerminalCell {
+                    text: "┌──────┐".into(),
+                    style: TerminalCellStyle::default(),
+                    width: 1,
+                }],
+            },
+            TerminalRow {
+                cells: vec![TerminalCell {
+                    text: "└──────┘".into(),
+                    style: TerminalCellStyle::default(),
+                    width: 1,
+                }],
+            },
+        ];
+
+        assert_eq!(session_preview_text(&rows), None);
+    }
+
+    #[test]
     fn clips_wide_cells_at_visible_edge() {
         let row = TerminalRow {
             cells: vec![
@@ -4219,19 +5434,28 @@ impl Render for SeanceWorkspace {
 
         let t = self.theme();
 
+        let main_content = if self.vault_panel_open {
+            self.render_vault_panel(window, cx)
+        } else {
+            self.render_terminal_shell(window, cx)
+        };
+
         let mut root = div()
             .size_full()
             .flex()
             .bg(t.bg_deep)
             .text_color(t.text_primary)
             .child(self.render_sidebar(cx))
-            .child(self.render_terminal_shell(window, cx));
+            .child(main_content);
 
         if self.palette_open {
             root = root.child(deferred(self.render_palette_overlay(cx)).with_priority(1));
         }
         if self.host_editor.is_some() {
-            root = root.child(deferred(self.render_host_editor_overlay()).with_priority(2));
+            root = root.child(deferred(self.render_host_editor_overlay(cx)).with_priority(2));
+        }
+        if self.credential_editor.is_some() {
+            root = root.child(deferred(self.render_credential_editor_overlay()).with_priority(5));
         }
         if self.unlock_form.is_visible() {
             root = root.child(deferred(self.render_unlock_overlay()).with_priority(3));
@@ -4276,50 +5500,6 @@ fn encode_keystroke(event: &KeyDownEvent) -> Option<Vec<u8>> {
         "left" => Some(b"\x1b[D".to_vec()),
         _ => key_char.map(|text| text.as_bytes().to_vec()),
     }
-}
-
-fn format_auth_order(auth_order: &[HostAuthRef]) -> String {
-    auth_order
-        .iter()
-        .map(|auth| match auth {
-            HostAuthRef::Password { credential_id } => format!("password:{credential_id}"),
-            HostAuthRef::PrivateKey {
-                key_id,
-                passphrase_credential_id,
-            } => match passphrase_credential_id {
-                Some(passphrase_id) => format!("key:{key_id}:{passphrase_id}"),
-                None => format!("key:{key_id}"),
-            },
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn parse_auth_order(input: &str) -> Vec<HostAuthRef> {
-    input
-        .split(',')
-        .filter_map(|token| {
-            let trimmed = token.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            let mut parts = trimmed.split(':');
-            match (parts.next(), parts.next(), parts.next()) {
-                (Some("password"), Some(credential_id), None) => Some(HostAuthRef::Password {
-                    credential_id: credential_id.to_string(),
-                }),
-                (Some("key"), Some(key_id), passphrase_credential_id) => {
-                    Some(HostAuthRef::PrivateKey {
-                        key_id: key_id.to_string(),
-                        passphrase_credential_id: passphrase_credential_id
-                            .map(|value| value.to_string())
-                            .filter(|value| !value.is_empty()),
-                    })
-                }
-                _ => None,
-            }
-        })
-        .collect()
 }
 
 fn now_ui_suffix() -> i64 {
