@@ -1,5 +1,7 @@
 use crate::theme::ThemeId;
-use seance_terminal::LocalSessionHandle;
+use std::sync::Arc;
+
+use seance_terminal::TerminalSession;
 use seance_vault::HostSummary;
 
 #[derive(Clone)]
@@ -11,6 +13,10 @@ pub enum PaletteAction {
     UnlockVault,
     LockVault,
     AddSavedHost,
+    AddPasswordCredential,
+    ImportPrivateKey,
+    GenerateEd25519Key,
+    GenerateRsaKey,
     EditSavedHost(String),
     DeleteSavedHost(String),
     ConnectSavedHost(String),
@@ -25,7 +31,7 @@ pub struct PaletteItem {
 }
 
 pub fn build_items(
-    sessions: &[LocalSessionHandle],
+    sessions: &[Arc<dyn TerminalSession>],
     saved_hosts: &[HostSummary],
     active_id: u64,
     active_theme: ThemeId,
@@ -46,6 +52,30 @@ pub fn build_items(
             label: "Add Saved Host".into(),
             hint: "Store an encrypted SSH config".into(),
             action: PaletteAction::AddSavedHost,
+        });
+        items.push(PaletteItem {
+            glyph: "•",
+            label: "Add Password Credential".into(),
+            hint: "Store an encrypted password".into(),
+            action: PaletteAction::AddPasswordCredential,
+        });
+        items.push(PaletteItem {
+            glyph: "•",
+            label: "Import Private Key".into(),
+            hint: "Store an encrypted private key".into(),
+            action: PaletteAction::ImportPrivateKey,
+        });
+        items.push(PaletteItem {
+            glyph: "•",
+            label: "Generate Ed25519 Key".into(),
+            hint: "Create a new vault-backed Ed25519 key".into(),
+            action: PaletteAction::GenerateEd25519Key,
+        });
+        items.push(PaletteItem {
+            glyph: "•",
+            label: "Generate RSA Key".into(),
+            hint: "Create a new vault-backed RSA key".into(),
+            action: PaletteAction::GenerateRsaKey,
         });
 
         items.push(PaletteItem {

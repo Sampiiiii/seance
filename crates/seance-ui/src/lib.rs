@@ -1,9 +1,11 @@
+mod backend;
 mod palette;
 mod theme;
 
 use std::{
     collections::VecDeque,
     env,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -15,13 +17,16 @@ use gpui::{
     size,
 };
 use seance_terminal::{
-    LocalSessionFactory, LocalSessionHandle, SessionPerfSnapshot, TerminalCellStyle, TerminalColor,
-    TerminalGeometry, TerminalLine,
+    SessionPerfSnapshot, TerminalCellStyle, TerminalColor, TerminalGeometry, TerminalLine,
+    TerminalSession,
 };
-use seance_vault::{HostConfig, HostSummary, SecretString, VaultStore};
+use seance_vault::{
+    HostAuthRef, HostSummary, SecretString, VaultHostProfile, VaultPasswordCredential, VaultStore,
+};
 use tracing::trace;
 use zeroize::Zeroizing;
 
+use backend::UiBackend;
 use palette::{PaletteAction, build_items};
 use theme::{Theme, ThemeId};
 
@@ -33,18 +38,22 @@ const TERMINAL_FONT_SIZE_PX: f32 = 13.0;
 const TERMINAL_LINE_HEIGHT_PX: f32 = 19.0;
 const TERMINAL_PANE_PADDING_PX: f32 = 16.0;
 
-pub fn run(mut vault: VaultStore) -> Result<()> {
-    let vault_status = vault.status();
+pub fn run(vault: VaultStore) -> Result<()> {
+    let mut backend = UiBackend::new(vault)?;
+    let vault_status = backend.vault_status();
     let device_unlock_attempted = vault_status.initialized;
     if vault_status.initialized {
-        let _ = vault.try_unlock_with_device();
+        let _ = backend.try_unlock_with_device();
     }
-    let unlocked = vault.status().unlocked;
+    let unlocked = backend.vault_status().unlocked;
     let initial_saved_hosts = if unlocked {
-        vault.list_hosts().unwrap_or_default()
+        backend.list_hosts().unwrap_or_default()
     } else {
         Vec::new()
     };
+    let initial = backend
+        .spawn_local_session()
+        .expect("failed to create initial local session");
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
@@ -65,17 +74,11 @@ pub fn run(mut vault: VaultStore) -> Result<()> {
                     let focus_handle = cx.focus_handle();
                     focus_handle.focus(window);
 
-                    let factory = LocalSessionFactory::default();
-                    let initial = factory
-                        .spawn()
-                        .expect("failed to create initial local session");
-
                     let mut ws = SeanceWorkspace {
                         focus_handle,
-                        session_factory: factory,
                         sessions: vec![initial],
                         active_session_id: 1,
-                        vault,
+                        backend,
                         saved_hosts: initial_saved_hosts,
                         selected_host_id: None,
                         unlock_form: UnlockFormState::new(
@@ -114,10 +117,9 @@ pub fn run(mut vault: VaultStore) -> Result<()> {
 
 struct SeanceWorkspace {
     focus_handle: FocusHandle,
-    session_factory: LocalSessionFactory,
-    sessions: Vec<LocalSessionHandle>,
+    sessions: Vec<Arc<dyn TerminalSession>>,
     active_session_id: u64,
-    vault: VaultStore,
+    backend: UiBackend,
     saved_hosts: Vec<HostSummary>,
     selected_host_id: Option<String>,
     unlock_form: UnlockFormState,
@@ -203,15 +205,17 @@ enum HostField {
     Username,
     Port,
     Notes,
+    AuthOrder,
 }
 
 impl HostField {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Label,
         Self::Hostname,
         Self::Username,
         Self::Port,
         Self::Notes,
+        Self::AuthOrder,
     ];
 
     fn title(self) -> &'static str {
@@ -221,6 +225,7 @@ impl HostField {
             Self::Username => "Username",
             Self::Port => "Port",
             Self::Notes => "Notes",
+            Self::AuthOrder => "Auth Order",
         }
     }
 }
@@ -233,6 +238,7 @@ struct HostEditorState {
     username: String,
     port: String,
     notes: String,
+    auth_order: String,
     selected_field: usize,
     message: Option<String>,
 }
@@ -246,12 +252,16 @@ impl HostEditorState {
             username: String::new(),
             port: "22".into(),
             notes: String::new(),
+            auth_order: String::new(),
             selected_field: 0,
-            message: Some("Create an encrypted SSH config. Tab moves between fields.".into()),
+            message: Some(
+                "Create an encrypted SSH config. Auth order uses password:<id> or key:<id>[:passphrase_id]."
+                    .into(),
+            ),
         }
     }
 
-    fn from_host(host: HostConfig) -> Self {
+    fn from_host(host: VaultHostProfile) -> Self {
         Self {
             host_id: Some(host.id),
             label: host.label,
@@ -259,6 +269,7 @@ impl HostEditorState {
             username: host.username,
             port: host.port.to_string(),
             notes: host.notes.unwrap_or_default(),
+            auth_order: format_auth_order(&host.auth_order),
             selected_field: 0,
             message: Some("Edit the encrypted record and press Enter on Notes to save.".into()),
         }
@@ -696,7 +707,7 @@ impl SeanceWorkspace {
                     let _ = cx.update(|window, cx| {
                         let _ = entity.update(cx, |this, _| {
                             let session_perf =
-                                this.active_session().map(LocalSessionHandle::perf_snapshot);
+                                this.active_session().map(|session| session.perf_snapshot());
                             let reason = this.classify_refresh_reason(session_perf.as_ref());
                             this.perf_overlay.mark_refresh_request(
                                 Instant::now(),
@@ -759,12 +770,12 @@ impl SeanceWorkspace {
     }
 
     fn vault_unlocked(&self) -> bool {
-        self.vault.status().unlocked
+        self.backend.vault_status().unlocked
     }
 
     fn refresh_saved_hosts(&mut self) {
         self.saved_hosts = if self.vault_unlocked() {
-            self.vault.list_hosts().unwrap_or_default()
+            self.backend.list_hosts().unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -788,7 +799,7 @@ impl SeanceWorkspace {
                     self.unlock_form.message = Some("Passphrases do not match yet.".into());
                 } else {
                     let passphrase = SecretString::from(self.unlock_form.passphrase.to_string());
-                    let result = self.vault.create_vault(&passphrase, "This Device");
+                    let result = self.backend.create_vault(&passphrase, "This Device");
                     self.unlock_form.passphrase.clear();
                     self.unlock_form.confirm_passphrase.clear();
                     match result {
@@ -807,9 +818,7 @@ impl SeanceWorkspace {
             }
             UnlockMode::Unlock => {
                 let passphrase = SecretString::from(self.unlock_form.passphrase.to_string());
-                let result = self
-                    .vault
-                    .unlock_with_passphrase(&passphrase, "This Device");
+                let result = self.backend.unlock_vault(&passphrase, "This Device");
                 self.unlock_form.passphrase.clear();
                 self.unlock_form.confirm_passphrase.clear();
                 match result {
@@ -831,7 +840,7 @@ impl SeanceWorkspace {
     }
 
     fn lock_vault(&mut self, cx: &mut Context<Self>) {
-        self.vault.lock();
+        self.backend.lock_vault();
         self.saved_hosts.clear();
         self.selected_host_id = None;
         self.host_editor = None;
@@ -857,7 +866,7 @@ impl SeanceWorkspace {
     }
 
     fn begin_edit_host(&mut self, host_id: &str, cx: &mut Context<Self>) {
-        match self.vault.load_host(host_id) {
+        match self.backend.load_host(host_id) {
             Ok(Some(host)) => {
                 self.host_editor = Some(HostEditorState::from_host(host));
                 self.selected_host_id = Some(host_id.into());
@@ -876,7 +885,7 @@ impl SeanceWorkspace {
     }
 
     fn delete_saved_host(&mut self, host_id: &str, cx: &mut Context<Self>) {
-        match self.vault.delete_host(host_id) {
+        match self.backend.delete_host(host_id) {
             Ok(true) => {
                 self.status_message = Some("Saved host tombstoned for future sync.".into());
                 self.refresh_saved_hosts();
@@ -895,10 +904,19 @@ impl SeanceWorkspace {
 
     fn connect_saved_host(&mut self, host_id: &str, cx: &mut Context<Self>) {
         self.selected_host_id = Some(host_id.into());
-        self.status_message = Some(
-            "Saved host decrypted successfully. SSH session wiring lands next in seance-ssh."
-                .into(),
-        );
+        match self.backend.connect_host(host_id) {
+            Ok(session) => {
+                if let Some(geometry) = self.last_applied_geometry {
+                    let _ = session.resize(geometry);
+                }
+                self.active_session_id = session.id();
+                self.sessions.push(session);
+                self.status_message = Some("SSH session connected.".into());
+            }
+            Err(err) => {
+                self.status_message = Some(err.to_string());
+            }
+        }
         self.palette_open = false;
         self.perf_overlay.mark_input(RedrawReason::Palette);
         cx.notify();
@@ -909,16 +927,17 @@ impl SeanceWorkspace {
             return;
         };
         let port = editor.port.trim().parse::<u16>().unwrap_or(22);
-        let draft = HostConfig {
+        let draft = VaultHostProfile {
             id: editor.host_id.clone().unwrap_or_default(),
             label: editor.label.trim().into(),
             hostname: editor.hostname.trim().into(),
             username: editor.username.trim().into(),
             port,
             notes: (!editor.notes.trim().is_empty()).then(|| editor.notes.trim().to_string()),
+            auth_order: parse_auth_order(&editor.auth_order),
         };
 
-        match self.vault.store_host(draft) {
+        match self.backend.save_host(draft) {
             Ok(summary) => {
                 self.status_message = Some(format!(
                     "Saved host '{}' encrypted into the vault.",
@@ -939,14 +958,14 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
-    fn active_session(&self) -> Option<&LocalSessionHandle> {
+    fn active_session(&self) -> Option<&Arc<dyn TerminalSession>> {
         self.sessions
             .iter()
             .find(|s| s.id() == self.active_session_id)
     }
 
     fn spawn_session(&mut self, cx: &mut Context<Self>) {
-        if let Ok(session) = self.session_factory.spawn() {
+        if let Ok(session) = self.backend.spawn_local_session() {
             if let Some(geometry) = self.last_applied_geometry {
                 let _ = session.resize(geometry);
             }
@@ -1017,6 +1036,53 @@ impl SeanceWorkspace {
             PaletteAction::AddSavedHost => {
                 self.begin_add_host(cx);
                 return;
+            }
+            PaletteAction::AddPasswordCredential => {
+                match self.backend.save_password_credential(VaultPasswordCredential {
+                    id: String::new(),
+                    label: format!("credential-{}", now_ui_suffix()),
+                    username_hint: None,
+                    secret: "change-me".into(),
+                }) {
+                    Ok(summary) => {
+                        self.status_message = Some(format!(
+                            "Created placeholder password credential '{}'. Edit support lands next.",
+                            summary.label
+                        ));
+                    }
+                    Err(err) => self.status_message = Some(err.to_string()),
+                }
+            }
+            PaletteAction::ImportPrivateKey => {
+                self.status_message = Some(
+                    "Private key import backend is ready; UI import form is still pending."
+                        .into(),
+                );
+            }
+            PaletteAction::GenerateEd25519Key => {
+                match self
+                    .backend
+                    .generate_ed25519_key(format!("ed25519-{}", now_ui_suffix()))
+                {
+                    Ok(summary) => {
+                        self.status_message = Some(format!(
+                            "Generated vault-backed key '{}'.",
+                            summary.label
+                        ));
+                    }
+                    Err(err) => self.status_message = Some(err.to_string()),
+                }
+            }
+            PaletteAction::GenerateRsaKey => {
+                match self.backend.generate_rsa_key(format!("rsa-{}", now_ui_suffix())) {
+                    Ok(summary) => {
+                        self.status_message = Some(format!(
+                            "Generated vault-backed key '{}'.",
+                            summary.label
+                        ));
+                    }
+                    Err(err) => self.status_message = Some(err.to_string()),
+                }
             }
             PaletteAction::EditSavedHost(id) => {
                 self.begin_edit_host(&id, cx);
@@ -1243,9 +1309,12 @@ impl SeanceWorkspace {
                 HostField::Notes => {
                     editor.notes.pop();
                 }
+                HostField::AuthOrder => {
+                    editor.auth_order.pop();
+                }
             },
             "enter" => {
-                if matches!(editor.field(), HostField::Notes) {
+                if matches!(editor.field(), HostField::AuthOrder) {
                     self.save_host_editor(cx);
                     return;
                 }
@@ -1265,6 +1334,7 @@ impl SeanceWorkspace {
                                 }
                             }
                             HostField::Notes => editor.notes.push_str(ch),
+                            HostField::AuthOrder => editor.auth_order.push_str(ch),
                         }
                     }
                 }
@@ -1279,7 +1349,7 @@ impl SeanceWorkspace {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme();
-        let vault_status = self.vault.status();
+        let vault_status = self.backend.vault_status();
 
         let mut session_list = div().flex().flex_col().gap_1().px_2();
         for session in &self.sessions {
@@ -2081,6 +2151,7 @@ impl SeanceWorkspace {
             (HostField::Username, editor.username.clone()),
             (HostField::Port, editor.port.clone()),
             (HostField::Notes, editor.notes.clone()),
+            (HostField::AuthOrder, editor.auth_order.clone()),
         ];
 
         let mut panel = div()
@@ -2129,11 +2200,11 @@ impl SeanceWorkspace {
                 .flex()
                 .items_center()
                 .justify_between()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(t.text_ghost)
-                        .child("tab move  esc cancel  enter on notes saves"),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(t.text_ghost)
+                        .child("tab move  esc cancel  enter on auth order saves"),
                 )
                 .child(
                     div()
@@ -2644,4 +2715,52 @@ fn encode_keystroke(event: &KeyDownEvent) -> Option<Vec<u8>> {
         "left" => Some(b"\x1b[D".to_vec()),
         _ => key_char.map(|text| text.as_bytes().to_vec()),
     }
+}
+
+fn format_auth_order(auth_order: &[HostAuthRef]) -> String {
+    auth_order
+        .iter()
+        .map(|auth| match auth {
+            HostAuthRef::Password { credential_id } => format!("password:{credential_id}"),
+            HostAuthRef::PrivateKey {
+                key_id,
+                passphrase_credential_id,
+            } => match passphrase_credential_id {
+                Some(passphrase_id) => format!("key:{key_id}:{passphrase_id}"),
+                None => format!("key:{key_id}"),
+            },
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_auth_order(input: &str) -> Vec<HostAuthRef> {
+    input
+        .split(',')
+        .filter_map(|token| {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let mut parts = trimmed.split(':');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some("password"), Some(credential_id), None) => Some(HostAuthRef::Password {
+                    credential_id: credential_id.to_string(),
+                }),
+                (Some("key"), Some(key_id), passphrase_credential_id) => {
+                    Some(HostAuthRef::PrivateKey {
+                        key_id: key_id.to_string(),
+                        passphrase_credential_id: passphrase_credential_id
+                            .map(|value| value.to_string())
+                            .filter(|value| !value.is_empty()),
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn now_ui_suffix() -> i64 {
+    seance_vault::now_ts()
 }

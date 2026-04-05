@@ -122,6 +122,15 @@ pub struct SessionPerfSnapshot {
     pub dirty_since_last_ui_frame: bool,
 }
 
+pub trait TerminalSession: Send + Sync {
+    fn id(&self) -> u64;
+    fn title(&self) -> &str;
+    fn snapshot(&self) -> SessionSnapshot;
+    fn send_input(&self, bytes: Vec<u8>) -> Result<()>;
+    fn resize(&self, geometry: TerminalGeometry) -> Result<()>;
+    fn perf_snapshot(&self) -> SessionPerfSnapshot;
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TerminalCellStyle {
     pub foreground: Option<TerminalColor>,
@@ -188,21 +197,25 @@ impl From<RgbColor> for TerminalColor {
 }
 
 #[derive(Clone)]
-pub struct LocalSessionHandle {
-    id: u64,
-    title: Arc<str>,
+pub struct SharedSessionState {
     snapshot: Arc<Mutex<SessionSnapshot>>,
     perf_snapshot: Arc<Mutex<SessionPerfState>>,
-    command_tx: mpsc::Sender<SessionCommand>,
 }
 
-impl LocalSessionHandle {
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    pub fn title(&self) -> &str {
-        &self.title
+impl SharedSessionState {
+    pub fn new(initial_message: impl Into<String>) -> Self {
+        Self {
+            snapshot: Arc::new(Mutex::new(SessionSnapshot {
+                lines: vec![TerminalLine {
+                    spans: vec![TerminalSpan {
+                        text: initial_message.into(),
+                        style: TerminalCellStyle::default(),
+                    }],
+                }],
+                exit_status: None,
+            })),
+            perf_snapshot: Arc::new(Mutex::new(SessionPerfState::default())),
+        }
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
@@ -212,24 +225,207 @@ impl LocalSessionHandle {
             .clone()
     }
 
-    pub fn send_input(&self, bytes: Vec<u8>) -> Result<()> {
+    pub fn perf_snapshot(&self) -> SessionPerfSnapshot {
+        let mut perf = self.perf_snapshot.lock().expect("session perf poisoned");
+        let snapshot = perf.snapshot.clone();
+        perf.snapshot.dirty_since_last_ui_frame = false;
+        snapshot
+    }
+
+    pub(crate) fn publish_render(
+        &self,
+        rendered_snapshot: RenderedSnapshot,
+        duration: Duration,
+        vt_bytes_processed_since_last_snapshot: usize,
+        exit_status: Option<String>,
+    ) {
+        let mut state = self.snapshot.lock().expect("session snapshot poisoned");
+        state.lines = rendered_snapshot.lines.clone();
+        if let Some(exit_status) = exit_status {
+            state.exit_status = Some(exit_status);
+        }
+
+        let mut perf = self.perf_snapshot.lock().expect("session perf poisoned");
+        perf.snapshot_samples = perf.snapshot_samples.saturating_add(1);
+        perf.total_snapshot_duration_ns = perf
+            .total_snapshot_duration_ns
+            .saturating_add(duration.as_nanos());
+        let snapshot_samples = perf.snapshot_samples;
+        let avg_snapshot_duration =
+            duration_from_nanos(perf.total_snapshot_duration_ns / u128::from(snapshot_samples));
+
+        {
+            let metrics = &mut perf.snapshot.terminal;
+            metrics.snapshot_seq = snapshot_samples;
+            metrics.last_snapshot_duration = duration;
+            metrics.avg_snapshot_duration = avg_snapshot_duration;
+            metrics.max_snapshot_duration = metrics.max_snapshot_duration.max(duration);
+            metrics.rendered_line_count = rendered_snapshot.lines.len();
+            metrics.rendered_span_count = rendered_snapshot.rendered_span_count;
+            metrics.truncated_line_count = rendered_snapshot.truncated_line_count;
+            metrics.vt_bytes_processed_since_last_snapshot = vt_bytes_processed_since_last_snapshot;
+            metrics.total_vt_bytes_processed = metrics
+                .total_vt_bytes_processed
+                .saturating_add(vt_bytes_processed_since_last_snapshot as u64);
+        }
+        perf.snapshot.dirty_since_last_ui_frame = true;
+
+        let metrics = &perf.snapshot.terminal;
+
+        trace!(
+            snapshot_seq = metrics.snapshot_seq,
+            snapshot_ms = duration.as_secs_f64() * 1_000.0,
+            rendered_line_count = metrics.rendered_line_count,
+            rendered_span_count = metrics.rendered_span_count,
+            truncated_line_count = metrics.truncated_line_count,
+            vt_bytes_processed_since_last_snapshot,
+            "published terminal snapshot"
+        );
+    }
+
+    pub fn set_error(&self, error: &anyhow::Error) {
+        let mut state = self.snapshot.lock().expect("session snapshot poisoned");
+        state.lines = vec![TerminalLine {
+            spans: vec![TerminalSpan {
+                text: format!("Failed to start session: {error:#}"),
+                style: TerminalCellStyle::default(),
+            }],
+        }];
+        state.exit_status = Some("startup error".to_string());
+    }
+
+    fn snapshot_arc(&self) -> Arc<Mutex<SessionSnapshot>> {
+        Arc::clone(&self.snapshot)
+    }
+
+    fn perf_snapshot_arc(&self) -> Arc<Mutex<SessionPerfState>> {
+        Arc::clone(&self.perf_snapshot)
+    }
+}
+
+pub struct TerminalEmulator {
+    terminal: Terminal<'static, 'static>,
+    render_state: RenderState<'static>,
+    row_iterator: RowIterator<'static>,
+    cell_iterator: CellIterator<'static>,
+    pending_vt_bytes: usize,
+}
+
+impl TerminalEmulator {
+    pub fn new(geometry: TerminalGeometry) -> Result<Self> {
+        Ok(Self {
+            terminal: Terminal::new(TerminalOptions {
+                cols: geometry.size.cols,
+                rows: geometry.size.rows,
+                max_scrollback: 10_000,
+            })
+            .context("failed to initialize Ghostty terminal")?,
+            render_state: RenderState::new().context("failed to initialize Ghostty render state")?,
+            row_iterator: RowIterator::new().context("failed to create Ghostty row iterator")?,
+            cell_iterator: CellIterator::new().context("failed to create Ghostty cell iterator")?,
+            pending_vt_bytes: 0,
+        })
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) {
+        self.pending_vt_bytes += bytes.len();
+        self.terminal.vt_write(bytes);
+    }
+
+    pub fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
+        self.terminal
+            .resize(
+                geometry.size.cols,
+                geometry.size.rows,
+                u32::from(geometry.cell_width_px),
+                u32::from(geometry.cell_height_px),
+            )
+            .context("failed to resize Ghostty terminal")
+    }
+
+    pub fn publish(&mut self, state: &SharedSessionState, exit_status: Option<String>) {
+        let started_at = Instant::now();
+        let rendered_snapshot = render_styled_lines(
+            &mut self.terminal,
+            &mut self.render_state,
+            &mut self.row_iterator,
+            &mut self.cell_iterator,
+        )
+        .unwrap_or_else(|error| RenderedSnapshot {
+            lines: vec![TerminalLine {
+                spans: vec![TerminalSpan {
+                    text: format!("Render error: {error:#}"),
+                    style: TerminalCellStyle::default(),
+                }],
+            }],
+            rendered_span_count: 1,
+            truncated_line_count: 0,
+        });
+        let duration = started_at.elapsed();
+        let vt_bytes_processed_since_last_snapshot =
+            std::mem::replace(&mut self.pending_vt_bytes, 0);
+
+        state.publish_render(
+            rendered_snapshot,
+            duration,
+            vt_bytes_processed_since_last_snapshot,
+            exit_status,
+        );
+    }
+}
+
+#[derive(Clone)]
+pub struct LocalSessionHandle {
+    id: u64,
+    title: Arc<str>,
+    state: SharedSessionState,
+    command_tx: mpsc::Sender<SessionCommand>,
+}
+
+impl LocalSessionHandle {
+    pub(crate) fn new(
+        id: u64,
+        title: Arc<str>,
+        state: SharedSessionState,
+        command_tx: mpsc::Sender<SessionCommand>,
+    ) -> Self {
+        Self {
+            id,
+            title,
+            state,
+            command_tx,
+        }
+    }
+}
+
+impl TerminalSession for LocalSessionHandle {
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn snapshot(&self) -> SessionSnapshot {
+        self.state.snapshot()
+    }
+
+    fn send_input(&self, bytes: Vec<u8>) -> Result<()> {
         self.command_tx
             .send(SessionCommand::Input(bytes))
             .context("failed to forward input to local shell")
     }
 
-    pub fn resize(&self, geometry: TerminalGeometry) -> Result<()> {
+    fn resize(&self, geometry: TerminalGeometry) -> Result<()> {
         trace!(?geometry, session_id = self.id, "queueing terminal resize");
         self.command_tx
             .send(SessionCommand::Resize(geometry))
             .context("failed to forward resize to local shell")
     }
 
-    pub fn perf_snapshot(&self) -> SessionPerfSnapshot {
-        let mut perf = self.perf_snapshot.lock().expect("session perf poisoned");
-        let snapshot = perf.snapshot.clone();
-        perf.snapshot.dirty_since_last_ui_frame = false;
-        snapshot
+    fn perf_snapshot(&self) -> SessionPerfSnapshot {
+        self.state.perf_snapshot()
     }
 }
 
@@ -273,21 +469,12 @@ struct RenderedSnapshot {
 }
 
 fn spawn_local_session(id: u64, title: Arc<str>) -> Result<LocalSessionHandle> {
-    let snapshot = Arc::new(Mutex::new(SessionSnapshot {
-        lines: vec![TerminalLine {
-            spans: vec![TerminalSpan {
-                text: "Launching local shell...".to_string(),
-                style: TerminalCellStyle::default(),
-            }],
-        }],
-        exit_status: None,
-    }));
-    let perf_snapshot = Arc::new(Mutex::new(SessionPerfState::default()));
+    let state = SharedSessionState::new("Launching local shell...");
     let (command_tx, command_rx) = mpsc::channel();
 
-    let session_snapshot = Arc::clone(&snapshot);
-    let session_perf_snapshot = Arc::clone(&perf_snapshot);
-    let error_snapshot = Arc::clone(&snapshot);
+    let session_snapshot = state.snapshot_arc();
+    let session_perf_snapshot = state.perf_snapshot_arc();
+    let error_state = state.clone();
     let session_title = Arc::clone(&title);
     thread::Builder::new()
         .name(format!("seance-local-session-{id}"))
@@ -295,25 +482,12 @@ fn spawn_local_session(id: u64, title: Arc<str>) -> Result<LocalSessionHandle> {
             if let Err(error) =
                 run_local_session(session_snapshot, session_perf_snapshot, command_rx)
             {
-                let mut state = error_snapshot.lock().expect("session snapshot poisoned");
-                state.lines = vec![TerminalLine {
-                    spans: vec![TerminalSpan {
-                        text: format!("Failed to start session: {error:#}"),
-                        style: TerminalCellStyle::default(),
-                    }],
-                }];
-                state.exit_status = Some("startup error".to_string());
+                error_state.set_error(&error);
             }
         })
         .context("failed to spawn local terminal worker")?;
 
-    Ok(LocalSessionHandle {
-        id,
-        title: session_title,
-        snapshot,
-        perf_snapshot,
-        command_tx,
-    })
+    Ok(LocalSessionHandle::new(id, session_title, state, command_tx))
 }
 
 fn run_local_session(
@@ -369,37 +543,19 @@ fn run_local_session(
         })
         .context("failed to spawn PTY reader")?;
 
-    let mut terminal = Terminal::new(TerminalOptions {
-        cols: current_geometry.size.cols,
-        rows: current_geometry.size.rows,
-        max_scrollback: 10_000,
-    })
-    .context("failed to initialize Ghostty terminal")?;
-    let mut render_state =
-        RenderState::new().context("failed to initialize Ghostty render state")?;
-    let mut row_iterator = RowIterator::new().context("failed to create Ghostty row iterator")?;
-    let mut cell_iterator =
-        CellIterator::new().context("failed to create Ghostty cell iterator")?;
-    let mut pending_vt_bytes = 0_usize;
+    let mut terminal = TerminalEmulator::new(current_geometry)?;
+    let state = SharedSessionState {
+        snapshot,
+        perf_snapshot,
+    };
 
-    publish_snapshot(
-        &snapshot,
-        &perf_snapshot,
-        &mut terminal,
-        &mut render_state,
-        &mut row_iterator,
-        &mut cell_iterator,
-        pending_vt_bytes,
-        None,
-    );
-    pending_vt_bytes = 0;
+    terminal.publish(&state, None);
 
     loop {
         let mut changed = false;
 
         while let Ok(bytes) = output_rx.try_recv() {
-            pending_vt_bytes += bytes.len();
-            terminal.vt_write(&bytes);
+            terminal.write(&bytes);
             changed = true;
         }
 
@@ -427,138 +583,31 @@ fn run_local_session(
                     .context("failed to resize PTY")?;
                 trace!(?new_geometry, "applied PTY resize");
 
-                terminal
-                    .resize(
-                        new_geometry.size.cols,
-                        new_geometry.size.rows,
-                        u32::from(new_geometry.cell_width_px),
-                        u32::from(new_geometry.cell_height_px),
-                    )
-                    .context("failed to resize Ghostty terminal")?;
+                terminal.resize(new_geometry)?;
                 trace!(?new_geometry, "applied Ghostty resize");
 
                 current_geometry = new_geometry;
-                publish_snapshot(
-                    &snapshot,
-                    &perf_snapshot,
-                    &mut terminal,
-                    &mut render_state,
-                    &mut row_iterator,
-                    &mut cell_iterator,
-                    pending_vt_bytes,
-                    None,
-                );
-                pending_vt_bytes = 0;
+                terminal.publish(&state, None);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
         if changed {
-            publish_snapshot(
-                &snapshot,
-                &perf_snapshot,
-                &mut terminal,
-                &mut render_state,
-                &mut row_iterator,
-                &mut cell_iterator,
-                pending_vt_bytes,
-                None,
-            );
-            pending_vt_bytes = 0;
+            terminal.publish(&state, None);
         }
 
         if let Some(status) = child.try_wait().context("failed to poll shell process")? {
             while let Ok(bytes) = output_rx.try_recv() {
-                pending_vt_bytes += bytes.len();
-                terminal.vt_write(&bytes);
+                terminal.write(&bytes);
             }
 
-            publish_snapshot(
-                &snapshot,
-                &perf_snapshot,
-                &mut terminal,
-                &mut render_state,
-                &mut row_iterator,
-                &mut cell_iterator,
-                pending_vt_bytes,
-                Some(status.to_string()),
-            );
+            terminal.publish(&state, Some(status.to_string()));
             break;
         }
     }
 
     Ok(())
-}
-
-fn publish_snapshot(
-    snapshot: &Arc<Mutex<SessionSnapshot>>,
-    perf_snapshot: &Arc<Mutex<SessionPerfState>>,
-    terminal: &mut Terminal<'static, 'static>,
-    render_state: &mut RenderState<'static>,
-    row_iterator: &mut RowIterator<'static>,
-    cell_iterator: &mut CellIterator<'static>,
-    vt_bytes_processed_since_last_snapshot: usize,
-    exit_status: Option<String>,
-) {
-    let started_at = Instant::now();
-    let rendered_snapshot =
-        render_styled_lines(terminal, render_state, row_iterator, cell_iterator).unwrap_or_else(
-            |error| RenderedSnapshot {
-                lines: vec![TerminalLine {
-                    spans: vec![TerminalSpan {
-                        text: format!("Render error: {error:#}"),
-                        style: TerminalCellStyle::default(),
-                    }],
-                }],
-                rendered_span_count: 1,
-                truncated_line_count: 0,
-            },
-        );
-    let duration = started_at.elapsed();
-
-    let mut state = snapshot.lock().expect("session snapshot poisoned");
-    state.lines = rendered_snapshot.lines.clone();
-    if let Some(exit_status) = exit_status {
-        state.exit_status = Some(exit_status);
-    }
-
-    let mut perf = perf_snapshot.lock().expect("session perf poisoned");
-    perf.snapshot_samples = perf.snapshot_samples.saturating_add(1);
-    perf.total_snapshot_duration_ns = perf
-        .total_snapshot_duration_ns
-        .saturating_add(duration.as_nanos());
-    let snapshot_samples = perf.snapshot_samples;
-    let avg_snapshot_duration =
-        duration_from_nanos(perf.total_snapshot_duration_ns / u128::from(snapshot_samples));
-
-    {
-        let metrics = &mut perf.snapshot.terminal;
-        metrics.snapshot_seq = snapshot_samples;
-        metrics.last_snapshot_duration = duration;
-        metrics.avg_snapshot_duration = avg_snapshot_duration;
-        metrics.max_snapshot_duration = metrics.max_snapshot_duration.max(duration);
-        metrics.rendered_line_count = rendered_snapshot.lines.len();
-        metrics.rendered_span_count = rendered_snapshot.rendered_span_count;
-        metrics.truncated_line_count = rendered_snapshot.truncated_line_count;
-        metrics.vt_bytes_processed_since_last_snapshot = vt_bytes_processed_since_last_snapshot;
-        metrics.total_vt_bytes_processed = metrics
-            .total_vt_bytes_processed
-            .saturating_add(vt_bytes_processed_since_last_snapshot as u64);
-    }
-    perf.snapshot.dirty_since_last_ui_frame = true;
-
-    let metrics = &perf.snapshot.terminal;
-
-    trace!(
-        snapshot_seq = metrics.snapshot_seq,
-        snapshot_ms = duration.as_secs_f64() * 1_000.0,
-        rendered_line_count = metrics.rendered_line_count,
-        rendered_span_count = metrics.rendered_span_count,
-        truncated_line_count = metrics.truncated_line_count,
-        vt_bytes_processed_since_last_snapshot,
-        "published terminal snapshot"
-    );
 }
 
 fn render_styled_lines(
@@ -870,14 +919,12 @@ mod tests {
         let mut perf = SessionPerfState::default();
         perf.snapshot.dirty_since_last_ui_frame = true;
         perf.snapshot.terminal.snapshot_seq = 3;
-
-        let handle = LocalSessionHandle {
-            id: 1,
-            title: Arc::<str>::from("test"),
+        let state = SharedSessionState {
             snapshot: Arc::new(Mutex::new(SessionSnapshot::default())),
             perf_snapshot: Arc::new(Mutex::new(perf)),
-            command_tx: mpsc::channel().0,
         };
+
+        let handle = LocalSessionHandle::new(1, Arc::<str>::from("test"), state, mpsc::channel().0);
 
         let first = handle.perf_snapshot();
         let second = handle.perf_snapshot();
@@ -893,5 +940,20 @@ mod tests {
             duration_from_nanos(1_500_000),
             Duration::from_nanos(1_500_000)
         );
+    }
+
+    #[test]
+    fn local_sessions_fit_terminal_session_trait_objects() {
+        let state = SharedSessionState::new("hello");
+        let handle = Arc::new(LocalSessionHandle::new(
+            7,
+            Arc::<str>::from("local-7"),
+            state,
+            mpsc::channel().0,
+        )) as Arc<dyn TerminalSession>;
+
+        assert_eq!(handle.id(), 7);
+        assert_eq!(handle.title(), "local-7");
+        assert_eq!(handle.snapshot().lines[0].plain_text(), "hello");
     }
 }

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 gpui = "0.2.2"
+seance-ssh = { path = "../seance-ssh" }
 seance-terminal = { path = "../seance-terminal" }
 seance-vault = { path = "../seance-vault" }
 tracing = "0.1"

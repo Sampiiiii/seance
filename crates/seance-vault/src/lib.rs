@@ -11,9 +11,14 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use rand_core::{Infallible, TryCryptoRng, TryRng};
 use keyring::Entry;
 use rusqlite::Connection;
 use secrecy::ExposeSecret;
+use ssh_key::{
+    Algorithm as SshAlgorithm, LineEnding, PrivateKey as SshPrivateKey, PublicKey,
+    private::RsaKeypair,
+};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -21,14 +26,44 @@ use zeroize::Zeroizing;
 use crypto::{SecretKey, decrypt, encrypt};
 use kdf::KdfParams;
 pub use model::{
-    DeviceEnrollment, HostConfig, HostSummary, RecordKind, RecoveryBundle, UnlockMethod,
-    VaultHeader, VaultStatus,
+    CredentialSummary, DeviceEnrollment, GenerateKeyAlgorithm, GenerateKeyRequest, HostAuthRef,
+    HostSummary, ImportKeyRequest, KeySummary, PrivateKeyAlgorithm, PrivateKeySource, RecordKind,
+    RecoveryBundle, UnlockMethod, VaultHeader, VaultHostProfile, VaultPasswordCredential,
+    VaultPrivateKey, VaultStatus,
 };
+
 use model::{EncryptedRecord, RECORD_SCHEMA_VERSION, VAULT_SCHEMA_VERSION};
 pub use secrecy::SecretString;
 
 const DEVICE_STATE_KEY: &str = "local_device_id";
 const KEYRING_SERVICE_NAME: &str = "com.seance.vault";
+const DEFAULT_RSA_BITS: u32 = 4096;
+
+#[derive(Default)]
+struct SystemRng;
+
+impl TryRng for SystemRng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut bytes = [0_u8; 4];
+        getrandom::fill(&mut bytes).expect("OS random generator unavailable");
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut bytes = [0_u8; 8];
+        getrandom::fill(&mut bytes).expect("OS random generator unavailable");
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        getrandom::fill(dst).expect("OS random generator unavailable");
+        Ok(())
+    }
+}
+
+impl TryCryptoRng for SystemRng {}
 
 pub type VaultResult<T> = Result<T, VaultError>;
 
@@ -42,6 +77,8 @@ pub enum VaultError {
     Serialization(#[from] serde_json::Error),
     #[error("device key store error: {0}")]
     DeviceSecret(#[from] DeviceSecretError),
+    #[error("SSH key error: {0}")]
+    SshKey(#[from] ssh_key::Error),
     #[error("failed to derive passphrase key: {message}")]
     PassphraseDerivationFailed { message: String },
     #[error("invalid KDF configuration: {message}")]
@@ -78,6 +115,20 @@ pub enum VaultError {
     EmptyHostName,
     #[error("host username cannot be empty")]
     EmptyHostUser,
+    #[error("credential label cannot be empty")]
+    EmptyCredentialLabel,
+    #[error("credential secret cannot be empty")]
+    EmptyCredentialSecret,
+    #[error("private key label cannot be empty")]
+    EmptyPrivateKeyLabel,
+    #[error("private key contents cannot be empty")]
+    EmptyPrivateKey,
+    #[error("host auth order references missing credential {0}")]
+    MissingCredentialReference(String),
+    #[error("host auth order references missing private key {0}")]
+    MissingPrivateKeyReference(String),
+    #[error("unsupported private key algorithm")]
+    UnsupportedPrivateKeyAlgorithm,
 }
 
 #[derive(Debug, Error)]
@@ -180,11 +231,7 @@ impl VaultStore {
         self.last_unlock_method
     }
 
-    pub fn create_vault(
-        &mut self,
-        passphrase: &SecretString,
-        device_name: &str,
-    ) -> VaultResult<()> {
+    pub fn create_vault(&mut self, passphrase: &SecretString, device_name: &str) -> VaultResult<()> {
         if self.header.is_some() {
             return Err(VaultError::VaultAlreadyInitialized);
         }
@@ -332,35 +379,191 @@ impl VaultStore {
         self.last_unlock_method = None;
     }
 
-    pub fn store_host(&mut self, mut host: HostConfig) -> VaultResult<HostSummary> {
+    pub fn store_host_profile(&mut self, mut host: VaultHostProfile) -> VaultResult<HostSummary> {
         self.validate_host(&host)?;
-        let master_key = self.master_key()?;
-        let header = self.header.clone().ok_or(VaultError::VaultNotInitialized)?;
-
+        self.validate_host_auth_refs(&host)?;
         if host.id.is_empty() {
             host.id = Uuid::new_v4().to_string();
+        }
+        self.store_record(&mut host, RecordKind::Host)?;
+        let modified_at = self.record_modified_at(&host.id, RecordKind::Host)?;
+        Ok(host.summary(modified_at))
+    }
+
+    pub fn list_host_profiles(&self) -> VaultResult<Vec<HostSummary>> {
+        let records = storage::list_records_by_kind(&self.conn, RecordKind::Host)?;
+        records
+            .into_iter()
+            .map(|record| {
+                let host: VaultHostProfile = self.decrypt_record(&record)?;
+                Ok(host.summary(record.modified_at))
+            })
+            .collect()
+    }
+
+    pub fn load_host_profile(&self, host_id: &str) -> VaultResult<Option<VaultHostProfile>> {
+        self.load_record_payload(host_id, RecordKind::Host)
+    }
+
+    pub fn delete_host_profile(&mut self, host_id: &str) -> VaultResult<bool> {
+        self.delete_record(host_id, RecordKind::Host)
+    }
+
+    pub fn store_password_credential(
+        &mut self,
+        mut credential: VaultPasswordCredential,
+    ) -> VaultResult<CredentialSummary> {
+        self.validate_password_credential(&credential)?;
+        if credential.id.is_empty() {
+            credential.id = Uuid::new_v4().to_string();
+        }
+        self.store_record(&mut credential, RecordKind::PasswordCredential)?;
+        let modified_at =
+            self.record_modified_at(&credential.id, RecordKind::PasswordCredential)?;
+        Ok(credential.summary(modified_at))
+    }
+
+    pub fn list_password_credentials(&self) -> VaultResult<Vec<CredentialSummary>> {
+        let records = storage::list_records_by_kind(&self.conn, RecordKind::PasswordCredential)?;
+        records
+            .into_iter()
+            .map(|record| {
+                let credential: VaultPasswordCredential = self.decrypt_record(&record)?;
+                Ok(credential.summary(record.modified_at))
+            })
+            .collect()
+    }
+
+    pub fn load_password_credential(
+        &self,
+        id: &str,
+    ) -> VaultResult<Option<VaultPasswordCredential>> {
+        self.load_record_payload(id, RecordKind::PasswordCredential)
+    }
+
+    pub fn delete_password_credential(&mut self, id: &str) -> VaultResult<bool> {
+        self.delete_record(id, RecordKind::PasswordCredential)
+    }
+
+    pub fn store_private_key(&mut self, mut key: VaultPrivateKey) -> VaultResult<KeySummary> {
+        self.validate_private_key(&key)?;
+        if key.id.is_empty() {
+            key.id = Uuid::new_v4().to_string();
+        }
+        self.store_record(&mut key, RecordKind::PrivateKey)?;
+        let modified_at = self.record_modified_at(&key.id, RecordKind::PrivateKey)?;
+        Ok(key.summary(modified_at))
+    }
+
+    pub fn list_private_keys(&self) -> VaultResult<Vec<KeySummary>> {
+        let records = storage::list_records_by_kind(&self.conn, RecordKind::PrivateKey)?;
+        records
+            .into_iter()
+            .map(|record| {
+                let key: VaultPrivateKey = self.decrypt_record(&record)?;
+                Ok(key.summary(record.modified_at))
+            })
+            .collect()
+    }
+
+    pub fn load_private_key(&self, id: &str) -> VaultResult<Option<VaultPrivateKey>> {
+        self.load_record_payload(id, RecordKind::PrivateKey)
+    }
+
+    pub fn delete_private_key(&mut self, id: &str) -> VaultResult<bool> {
+        self.delete_record(id, RecordKind::PrivateKey)
+    }
+
+    pub fn generate_private_key(&mut self, request: GenerateKeyRequest) -> VaultResult<KeySummary> {
+        if request.label.trim().is_empty() {
+            return Err(VaultError::EmptyPrivateKeyLabel);
+        }
+
+        let (private_key, algorithm) = match request.algorithm {
+            GenerateKeyAlgorithm::Ed25519 => (
+                SshPrivateKey::random(&mut SystemRng, SshAlgorithm::Ed25519)?,
+                PrivateKeyAlgorithm::Ed25519,
+            ),
+            GenerateKeyAlgorithm::Rsa { bits } => {
+                let bits = if bits == 0 { DEFAULT_RSA_BITS } else { bits };
+                let keypair = RsaKeypair::random(&mut SystemRng, bits as usize)?;
+                (SshPrivateKey::from(keypair), PrivateKeyAlgorithm::Rsa { bits })
+            }
+        };
+
+        let key = VaultPrivateKey {
+            id: String::new(),
+            label: request.label,
+            algorithm,
+            public_key_openssh: private_key.public_key().to_openssh()?,
+            private_key_pem: private_key.to_openssh(LineEnding::LF)?.to_string(),
+            encrypted_at_rest: private_key.is_encrypted(),
+            source: PrivateKeySource::Generated,
+        };
+        self.store_private_key(key)
+    }
+
+    pub fn import_private_key(&mut self, request: ImportKeyRequest) -> VaultResult<KeySummary> {
+        let private_key = SshPrivateKey::from_openssh(&request.private_key_pem)?;
+        let algorithm = private_key_algorithm(private_key.public_key())?;
+        let key = VaultPrivateKey {
+            id: String::new(),
+            label: request.label,
+            algorithm,
+            public_key_openssh: private_key.public_key().to_openssh()?,
+            private_key_pem: request.private_key_pem,
+            encrypted_at_rest: private_key.is_encrypted(),
+            source: PrivateKeySource::Imported,
+        };
+        self.store_private_key(key)
+    }
+
+    fn record_modified_at(&self, id: &str, kind: RecordKind) -> VaultResult<i64> {
+        let record = storage::load_record(&self.conn, id, kind)?
+            .ok_or_else(|| VaultError::CorruptVault(format!("missing {kind:?} record {id}")))?;
+        Ok(record.modified_at)
+    }
+
+    fn load_record_payload<T: serde::de::DeserializeOwned>(
+        &self,
+        record_id: &str,
+        kind: RecordKind,
+    ) -> VaultResult<Option<T>> {
+        let Some(record) = storage::load_record(&self.conn, record_id, kind)? else {
+            return Ok(None);
+        };
+        if record.deleted_at.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(self.decrypt_record(&record)?))
+    }
+
+    fn store_record<T: serde::Serialize + RecordIdentity>(
+        &mut self,
+        value: &mut T,
+        kind: RecordKind,
+    ) -> VaultResult<()> {
+        let master_key = self.master_key()?;
+        let header = self.header.clone().ok_or(VaultError::VaultNotInitialized)?;
+        if value.record_id().is_empty() {
+            value.set_record_id(Uuid::new_v4().to_string());
         }
 
         let logical_clock = storage::bump_logical_clock(&self.conn)?;
         let modified_at = now_ts();
         let record_key = SecretKey::generate();
-        let payload = Zeroizing::new(serde_json::to_vec(&host)?);
-        let aad = record_aad(
-            &header.vault_id,
-            &host.id,
-            RecordKind::Host,
-            RECORD_SCHEMA_VERSION,
-        );
+        let payload = Zeroizing::new(serde_json::to_vec(value)?);
+        let aad = record_aad(&header.vault_id, value.record_id(), kind, RECORD_SCHEMA_VERSION);
         let payload_envelope = encrypt(&record_key, payload.as_ref(), aad.as_bytes())?;
         let wrapped_record_key = encrypt(
             &master_key,
             record_key.as_bytes(),
-            record_key_aad(&header.vault_id, &host.id).as_bytes(),
+            record_key_aad(&header.vault_id, value.record_id()).as_bytes(),
         )?;
 
         let record = EncryptedRecord {
-            record_id: host.id.clone(),
-            kind: RecordKind::Host,
+            record_id: value.record_id().to_string(),
+            kind,
             version: RECORD_SCHEMA_VERSION,
             logical_clock,
             modified_at,
@@ -371,47 +574,10 @@ impl VaultStore {
             payload_ciphertext: payload_envelope.ciphertext,
         };
         storage::upsert_record(&self.conn, &record)?;
-        Ok(host.summary(modified_at))
+        Ok(())
     }
 
-    pub fn list_hosts(&self) -> VaultResult<Vec<HostSummary>> {
-        let records = storage::list_records_by_kind(&self.conn, RecordKind::Host)?;
-        let hosts = records
-            .into_iter()
-            .map(|record| {
-                let host = self.decrypt_host_record(&record)?;
-                Ok(host.summary(record.modified_at))
-            })
-            .collect::<VaultResult<Vec<_>>>()?;
-        Ok(hosts)
-    }
-
-    pub fn load_host(&self, host_id: &str) -> VaultResult<Option<HostConfig>> {
-        let Some(record) = storage::load_record(&self.conn, host_id, RecordKind::Host)? else {
-            return Ok(None);
-        };
-        if record.deleted_at.is_some() {
-            return Ok(None);
-        }
-        Ok(Some(self.decrypt_host_record(&record)?))
-    }
-
-    pub fn delete_host(&mut self, host_id: &str) -> VaultResult<bool> {
-        let Some(mut record) = storage::load_record(&self.conn, host_id, RecordKind::Host)? else {
-            return Ok(false);
-        };
-        if record.deleted_at.is_some() {
-            return Ok(false);
-        }
-
-        record.logical_clock = storage::bump_logical_clock(&self.conn)?;
-        record.modified_at = now_ts();
-        record.deleted_at = Some(record.modified_at);
-        storage::upsert_record(&self.conn, &record)?;
-        Ok(true)
-    }
-
-    fn decrypt_host_record(&self, record: &EncryptedRecord) -> VaultResult<HostConfig> {
+    fn decrypt_record<T: serde::de::DeserializeOwned>(&self, record: &EncryptedRecord) -> VaultResult<T> {
         let master_key = self.master_key()?;
         let header = self.header.clone().ok_or(VaultError::VaultNotInitialized)?;
         let wrapped_record_key = decrypt(
@@ -436,7 +602,22 @@ impl VaultStore {
         Ok(serde_json::from_slice(payload.as_ref())?)
     }
 
-    fn validate_host(&self, host: &HostConfig) -> VaultResult<()> {
+    fn delete_record(&mut self, record_id: &str, kind: RecordKind) -> VaultResult<bool> {
+        let Some(mut record) = storage::load_record(&self.conn, record_id, kind)? else {
+            return Ok(false);
+        };
+        if record.deleted_at.is_some() {
+            return Ok(false);
+        }
+
+        record.logical_clock = storage::bump_logical_clock(&self.conn)?;
+        record.modified_at = now_ts();
+        record.deleted_at = Some(record.modified_at);
+        storage::upsert_record(&self.conn, &record)?;
+        Ok(true)
+    }
+
+    fn validate_host(&self, host: &VaultHostProfile) -> VaultResult<()> {
         if host.label.trim().is_empty() {
             return Err(VaultError::EmptyHostLabel);
         }
@@ -445,6 +626,74 @@ impl VaultStore {
         }
         if host.username.trim().is_empty() {
             return Err(VaultError::EmptyHostUser);
+        }
+        Ok(())
+    }
+
+    fn validate_host_auth_refs(&self, host: &VaultHostProfile) -> VaultResult<()> {
+        for auth in &host.auth_order {
+            match auth {
+                HostAuthRef::Password { credential_id } => {
+                    if self
+                        .load_record_payload::<VaultPasswordCredential>(
+                            credential_id,
+                            RecordKind::PasswordCredential,
+                        )?
+                        .is_none()
+                    {
+                        return Err(VaultError::MissingCredentialReference(credential_id.clone()));
+                    }
+                }
+                HostAuthRef::PrivateKey {
+                    key_id,
+                    passphrase_credential_id,
+                } => {
+                    if self
+                        .load_record_payload::<VaultPrivateKey>(key_id, RecordKind::PrivateKey)?
+                        .is_none()
+                    {
+                        return Err(VaultError::MissingPrivateKeyReference(key_id.clone()));
+                    }
+                    if let Some(passphrase_id) = passphrase_credential_id
+                        && self
+                            .load_record_payload::<VaultPasswordCredential>(
+                                passphrase_id,
+                                RecordKind::PasswordCredential,
+                            )?
+                            .is_none()
+                    {
+                        return Err(VaultError::MissingCredentialReference(passphrase_id.clone()));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_password_credential(&self, credential: &VaultPasswordCredential) -> VaultResult<()> {
+        if credential.label.trim().is_empty() {
+            return Err(VaultError::EmptyCredentialLabel);
+        }
+        if credential.secret.trim().is_empty() {
+            return Err(VaultError::EmptyCredentialSecret);
+        }
+        Ok(())
+    }
+
+    fn validate_private_key(&self, key: &VaultPrivateKey) -> VaultResult<()> {
+        if key.label.trim().is_empty() {
+            return Err(VaultError::EmptyPrivateKeyLabel);
+        }
+        if key.private_key_pem.trim().is_empty() {
+            return Err(VaultError::EmptyPrivateKey);
+        }
+
+        let private_key = SshPrivateKey::from_openssh(&key.private_key_pem)?;
+        let parsed_algorithm = private_key_algorithm(private_key.public_key())?;
+        if parsed_algorithm != key.algorithm {
+            return Err(VaultError::CorruptVault(
+                "private key algorithm metadata does not match the encoded key".into(),
+            ));
         }
         Ok(())
     }
@@ -501,6 +750,63 @@ impl VaultStore {
         storage::upsert_device_enrollment(&self.conn, &enrollment)?;
         Ok(())
     }
+}
+
+trait RecordIdentity {
+    fn record_id(&self) -> &str;
+    fn set_record_id(&mut self, id: String);
+}
+
+impl RecordIdentity for VaultHostProfile {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+
+    fn set_record_id(&mut self, id: String) {
+        self.id = id;
+    }
+}
+
+impl RecordIdentity for VaultPasswordCredential {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+
+    fn set_record_id(&mut self, id: String) {
+        self.id = id;
+    }
+}
+
+impl RecordIdentity for VaultPrivateKey {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+
+    fn set_record_id(&mut self, id: String) {
+        self.id = id;
+    }
+}
+
+fn private_key_algorithm(public_key: &PublicKey) -> VaultResult<PrivateKeyAlgorithm> {
+    match public_key.algorithm() {
+        SshAlgorithm::Ed25519 => Ok(PrivateKeyAlgorithm::Ed25519),
+        SshAlgorithm::Rsa { .. } => {
+            let bits = public_key
+                .key_data()
+                .rsa()
+                .map(|rsa| mpint_bit_length(rsa.n().as_positive_bytes().unwrap_or_default()))
+                .unwrap_or(DEFAULT_RSA_BITS);
+            Ok(PrivateKeyAlgorithm::Rsa { bits })
+        }
+        _ => Err(VaultError::UnsupportedPrivateKeyAlgorithm),
+    }
+}
+
+fn mpint_bit_length(bytes: &[u8]) -> u32 {
+    let Some(&first) = bytes.first() else {
+        return 0;
+    };
+    ((bytes.len() - 1) as u32 * 8) + (8 - first.leading_zeros())
 }
 
 fn recovery_aad(vault_id: &str, params: &KdfParams) -> String {
@@ -603,30 +909,42 @@ mod tests {
     }
 
     #[test]
-    fn creates_unlocks_and_stores_hosts() {
+    fn creates_unlocks_and_stores_host_profiles() {
         let (_dir, mut vault) = make_vault();
         vault
             .create_vault(&secret("correct horse battery staple"), "test-device")
             .unwrap();
 
+        let password = vault
+            .store_password_credential(VaultPasswordCredential {
+                id: String::new(),
+                label: "prod password".into(),
+                username_hint: Some("root".into()),
+                secret: "hunter2".into(),
+            })
+            .unwrap();
+
         let summary = vault
-            .store_host(HostConfig {
+            .store_host_profile(VaultHostProfile {
                 id: String::new(),
                 label: "Production".into(),
                 hostname: "prod.example.com".into(),
                 port: 22,
                 username: "root".into(),
                 notes: Some("main cluster".into()),
+                auth_order: vec![HostAuthRef::Password {
+                    credential_id: password.id.clone(),
+                }],
             })
             .unwrap();
 
         assert_eq!(summary.label, "Production");
-        assert_eq!(vault.list_hosts().unwrap().len(), 1);
+        assert_eq!(vault.list_host_profiles().unwrap().len(), 1);
 
         vault.lock();
         assert!(vault.try_unlock_with_device().unwrap());
 
-        let host = vault.load_host(&summary.id).unwrap().unwrap();
+        let host = vault.load_host_profile(&summary.id).unwrap().unwrap();
         assert_eq!(host.hostname, "prod.example.com");
     }
 
@@ -636,14 +954,12 @@ mod tests {
         vault
             .create_vault(&secret("old passphrase"), "test-device")
             .unwrap();
-        let host = vault
-            .store_host(HostConfig {
+        let summary = vault
+            .store_password_credential(VaultPasswordCredential {
                 id: String::new(),
-                label: "Staging".into(),
-                hostname: "staging.example.com".into(),
-                port: 22,
-                username: "deployer".into(),
-                notes: None,
+                label: "demo".into(),
+                username_hint: None,
+                secret: "password".into(),
             })
             .unwrap();
 
@@ -655,8 +971,8 @@ mod tests {
             .unlock_with_passphrase(&secret("new passphrase"), "test-device")
             .unwrap();
 
-        let restored = vault.load_host(&host.id).unwrap().unwrap();
-        assert_eq!(restored.username, "deployer");
+        let restored = vault.load_password_credential(&summary.id).unwrap().unwrap();
+        assert_eq!(restored.secret, "password");
     }
 
     #[test]
@@ -701,24 +1017,88 @@ mod tests {
     }
 
     #[test]
-    fn deletes_hosts_using_tombstones() {
+    fn stores_lists_and_deletes_password_credentials() {
         let (_dir, mut vault) = make_vault();
         vault
             .create_vault(&secret("test passphrase"), "test-device")
             .unwrap();
-        let host = vault
-            .store_host(HostConfig {
+
+        let credential = vault
+            .store_password_credential(VaultPasswordCredential {
                 id: String::new(),
-                label: "Disposable".into(),
-                hostname: "tmp.example.com".into(),
-                port: 22,
-                username: "demo".into(),
-                notes: None,
+                label: "db".into(),
+                username_hint: Some("postgres".into()),
+                secret: "secret".into(),
             })
             .unwrap();
 
-        assert!(vault.delete_host(&host.id).unwrap());
-        assert!(vault.load_host(&host.id).unwrap().is_none());
-        assert!(vault.list_hosts().unwrap().is_empty());
+        assert_eq!(vault.list_password_credentials().unwrap().len(), 1);
+        assert!(vault.delete_password_credential(&credential.id).unwrap());
+        assert!(vault.load_password_credential(&credential.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn imports_and_generates_private_keys() {
+        let (_dir, mut vault) = make_vault();
+        vault
+            .create_vault(&secret("test passphrase"), "test-device")
+            .unwrap();
+
+        let generated = vault
+            .generate_private_key(GenerateKeyRequest {
+                label: "generated-ed25519".into(),
+                algorithm: GenerateKeyAlgorithm::Ed25519,
+            })
+            .unwrap();
+        assert!(matches!(generated.algorithm, PrivateKeyAlgorithm::Ed25519));
+
+        let generated_rsa = vault
+            .generate_private_key(GenerateKeyRequest {
+                label: "generated-rsa".into(),
+                algorithm: GenerateKeyAlgorithm::Rsa { bits: 4096 },
+            })
+            .unwrap();
+        assert!(matches!(
+            generated_rsa.algorithm,
+            PrivateKeyAlgorithm::Rsa { bits: 4096 }
+        ));
+
+        let pem = vault
+            .load_private_key(&generated.id)
+            .unwrap()
+            .unwrap()
+            .private_key_pem;
+
+        let imported = vault
+            .import_private_key(ImportKeyRequest {
+                label: "imported".into(),
+                private_key_pem: pem,
+            })
+            .unwrap();
+        assert_eq!(imported.label, "imported");
+    }
+
+    #[test]
+    fn validates_host_auth_references() {
+        let (_dir, mut vault) = make_vault();
+        vault
+            .create_vault(&secret("test passphrase"), "test-device")
+            .unwrap();
+
+        let err = vault
+            .store_host_profile(VaultHostProfile {
+                id: String::new(),
+                label: "Broken".into(),
+                hostname: "example.com".into(),
+                port: 22,
+                username: "root".into(),
+                notes: None,
+                auth_order: vec![HostAuthRef::Password {
+                    credential_id: "missing".into(),
+                }],
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, VaultError::MissingCredentialReference(_)));
     }
 }
