@@ -99,7 +99,7 @@ impl Default for TerminalGeometry {
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionSnapshot {
-    pub lines: Vec<TerminalLine>,
+    pub rows: Vec<TerminalRow>,
     pub exit_status: Option<String>,
 }
 
@@ -109,9 +109,9 @@ pub struct TerminalRenderMetrics {
     pub last_snapshot_duration: Duration,
     pub avg_snapshot_duration: Duration,
     pub max_snapshot_duration: Duration,
-    pub rendered_line_count: usize,
-    pub rendered_span_count: usize,
-    pub truncated_line_count: usize,
+    pub rendered_row_count: usize,
+    pub rendered_cell_count: usize,
+    pub truncated_row_count: usize,
     pub vt_bytes_processed_since_last_snapshot: usize,
     pub total_vt_bytes_processed: u64,
 }
@@ -129,6 +129,7 @@ pub trait TerminalSession: Send + Sync {
     fn send_input(&self, bytes: Vec<u8>) -> Result<()>;
     fn resize(&self, geometry: TerminalGeometry) -> Result<()>;
     fn perf_snapshot(&self) -> SessionPerfSnapshot;
+    fn take_notify_rx(&self) -> Option<mpsc::Receiver<()>>;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -151,38 +152,27 @@ pub struct TerminalColor {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TerminalSpan {
+pub struct TerminalCell {
     pub text: String,
     pub style: TerminalCellStyle,
+    pub width: u8,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TerminalLine {
-    pub spans: Vec<TerminalSpan>,
+pub struct TerminalRow {
+    pub cells: Vec<TerminalCell>,
 }
 
-impl TerminalLine {
+impl TerminalRow {
     pub fn plain_text(&self) -> String {
-        self.spans
+        self.cells
             .iter()
-            .map(|span| span.text.as_str())
+            .map(|cell| cell.text.as_str())
             .collect::<String>()
     }
 
-    fn trim_trailing_whitespace(&mut self) {
-        while let Some(span) = self.spans.last_mut() {
-            let trimmed_len = span.text.trim_end_matches(' ').len();
-            if trimmed_len == span.text.len() {
-                break;
-            }
-
-            span.text.truncate(trimmed_len);
-            if span.text.is_empty() {
-                self.spans.pop();
-            } else {
-                break;
-            }
-        }
+    pub fn terminal_width(&self) -> usize {
+        self.cells.iter().map(|cell| usize::from(cell.width)).sum()
     }
 }
 
@@ -200,22 +190,27 @@ impl From<RgbColor> for TerminalColor {
 pub struct SharedSessionState {
     snapshot: Arc<Mutex<SessionSnapshot>>,
     perf_snapshot: Arc<Mutex<SessionPerfState>>,
+    notify_tx: mpsc::SyncSender<()>,
 }
 
 impl SharedSessionState {
-    pub fn new(initial_message: impl Into<String>) -> Self {
-        Self {
+    pub fn new(initial_message: impl Into<String>) -> (Self, mpsc::Receiver<()>) {
+        let (notify_tx, notify_rx) = mpsc::sync_channel(1);
+        let state = Self {
             snapshot: Arc::new(Mutex::new(SessionSnapshot {
-                lines: vec![TerminalLine {
-                    spans: vec![TerminalSpan {
+                rows: vec![TerminalRow {
+                    cells: vec![TerminalCell {
                         text: initial_message.into(),
                         style: TerminalCellStyle::default(),
+                        width: 1,
                     }],
                 }],
                 exit_status: None,
             })),
             perf_snapshot: Arc::new(Mutex::new(SessionPerfState::default())),
-        }
+            notify_tx,
+        };
+        (state, notify_rx)
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
@@ -240,7 +235,7 @@ impl SharedSessionState {
         exit_status: Option<String>,
     ) {
         let mut state = self.snapshot.lock().expect("session snapshot poisoned");
-        state.lines = rendered_snapshot.lines.clone();
+        state.rows = rendered_snapshot.rows.clone();
         if let Some(exit_status) = exit_status {
             state.exit_status = Some(exit_status);
         }
@@ -260,9 +255,9 @@ impl SharedSessionState {
             metrics.last_snapshot_duration = duration;
             metrics.avg_snapshot_duration = avg_snapshot_duration;
             metrics.max_snapshot_duration = metrics.max_snapshot_duration.max(duration);
-            metrics.rendered_line_count = rendered_snapshot.lines.len();
-            metrics.rendered_span_count = rendered_snapshot.rendered_span_count;
-            metrics.truncated_line_count = rendered_snapshot.truncated_line_count;
+            metrics.rendered_row_count = rendered_snapshot.rows.len();
+            metrics.rendered_cell_count = rendered_snapshot.rendered_cell_count;
+            metrics.truncated_row_count = rendered_snapshot.truncated_row_count;
             metrics.vt_bytes_processed_since_last_snapshot = vt_bytes_processed_since_last_snapshot;
             metrics.total_vt_bytes_processed = metrics
                 .total_vt_bytes_processed
@@ -275,32 +270,29 @@ impl SharedSessionState {
         trace!(
             snapshot_seq = metrics.snapshot_seq,
             snapshot_ms = duration.as_secs_f64() * 1_000.0,
-            rendered_line_count = metrics.rendered_line_count,
-            rendered_span_count = metrics.rendered_span_count,
-            truncated_line_count = metrics.truncated_line_count,
+            rendered_row_count = metrics.rendered_row_count,
+            rendered_cell_count = metrics.rendered_cell_count,
+            truncated_row_count = metrics.truncated_row_count,
             vt_bytes_processed_since_last_snapshot,
             "published terminal snapshot"
         );
+
+        let _ = self.notify_tx.try_send(());
     }
 
     pub fn set_error(&self, error: &anyhow::Error) {
         let mut state = self.snapshot.lock().expect("session snapshot poisoned");
-        state.lines = vec![TerminalLine {
-            spans: vec![TerminalSpan {
+        state.rows = vec![TerminalRow {
+            cells: vec![TerminalCell {
                 text: format!("Failed to start session: {error:#}"),
                 style: TerminalCellStyle::default(),
+                width: 1,
             }],
         }];
         state.exit_status = Some("startup error".to_string());
+        let _ = self.notify_tx.try_send(());
     }
 
-    fn snapshot_arc(&self) -> Arc<Mutex<SessionSnapshot>> {
-        Arc::clone(&self.snapshot)
-    }
-
-    fn perf_snapshot_arc(&self) -> Arc<Mutex<SessionPerfState>> {
-        Arc::clone(&self.perf_snapshot)
-    }
 }
 
 pub struct TerminalEmulator {
@@ -352,14 +344,15 @@ impl TerminalEmulator {
             &mut self.cell_iterator,
         )
         .unwrap_or_else(|error| RenderedSnapshot {
-            lines: vec![TerminalLine {
-                spans: vec![TerminalSpan {
+            rows: vec![TerminalRow {
+                cells: vec![TerminalCell {
                     text: format!("Render error: {error:#}"),
                     style: TerminalCellStyle::default(),
+                    width: 1,
                 }],
             }],
-            rendered_span_count: 1,
-            truncated_line_count: 0,
+            rendered_cell_count: 1,
+            truncated_row_count: 0,
         });
         let duration = started_at.elapsed();
         let vt_bytes_processed_since_last_snapshot =
@@ -374,12 +367,12 @@ impl TerminalEmulator {
     }
 }
 
-#[derive(Clone)]
 pub struct LocalSessionHandle {
     id: u64,
     title: Arc<str>,
     state: SharedSessionState,
     command_tx: mpsc::Sender<SessionCommand>,
+    notify_rx: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl LocalSessionHandle {
@@ -388,12 +381,14 @@ impl LocalSessionHandle {
         title: Arc<str>,
         state: SharedSessionState,
         command_tx: mpsc::Sender<SessionCommand>,
+        notify_rx: mpsc::Receiver<()>,
     ) -> Self {
         Self {
             id,
             title,
             state,
             command_tx,
+            notify_rx: Mutex::new(Some(notify_rx)),
         }
     }
 }
@@ -426,6 +421,10 @@ impl TerminalSession for LocalSessionHandle {
 
     fn perf_snapshot(&self) -> SessionPerfSnapshot {
         self.state.perf_snapshot()
+    }
+
+    fn take_notify_rx(&self) -> Option<mpsc::Receiver<()>> {
+        self.notify_rx.lock().expect("notify_rx poisoned").take()
     }
 }
 
@@ -463,36 +462,37 @@ struct SessionPerfState {
 
 #[derive(Debug)]
 struct RenderedSnapshot {
-    lines: Vec<TerminalLine>,
-    rendered_span_count: usize,
-    truncated_line_count: usize,
+    rows: Vec<TerminalRow>,
+    rendered_cell_count: usize,
+    truncated_row_count: usize,
 }
 
 fn spawn_local_session(id: u64, title: Arc<str>) -> Result<LocalSessionHandle> {
-    let state = SharedSessionState::new("Launching local shell...");
+    let (state, notify_rx) = SharedSessionState::new("Launching local shell...");
     let (command_tx, command_rx) = mpsc::channel();
 
-    let session_snapshot = state.snapshot_arc();
-    let session_perf_snapshot = state.perf_snapshot_arc();
-    let error_state = state.clone();
+    let thread_state = state.clone();
     let session_title = Arc::clone(&title);
     thread::Builder::new()
         .name(format!("seance-local-session-{id}"))
         .spawn(move || {
-            if let Err(error) =
-                run_local_session(session_snapshot, session_perf_snapshot, command_rx)
-            {
-                error_state.set_error(&error);
+            if let Err(error) = run_local_session(thread_state.clone(), command_rx) {
+                thread_state.set_error(&error);
             }
         })
         .context("failed to spawn local terminal worker")?;
 
-    Ok(LocalSessionHandle::new(id, session_title, state, command_tx))
+    Ok(LocalSessionHandle::new(
+        id,
+        session_title,
+        state,
+        command_tx,
+        notify_rx,
+    ))
 }
 
 fn run_local_session(
-    snapshot: Arc<Mutex<SessionSnapshot>>,
-    perf_snapshot: Arc<Mutex<SessionPerfState>>,
+    state: SharedSessionState,
     command_rx: mpsc::Receiver<SessionCommand>,
 ) -> Result<()> {
     let mut current_geometry = TerminalGeometry::default();
@@ -544,11 +544,6 @@ fn run_local_session(
         .context("failed to spawn PTY reader")?;
 
     let mut terminal = TerminalEmulator::new(current_geometry)?;
-    let state = SharedSessionState {
-        snapshot,
-        perf_snapshot,
-    };
-
     terminal.publish(&state, None);
 
     loop {
@@ -619,19 +614,21 @@ fn render_styled_lines(
     let snapshot = render_state.update(terminal)?;
     let colors = snapshot.colors()?;
     let mut rows = row_iterator.update(&snapshot)?;
-    let mut lines = Vec::new();
-    let mut rendered_span_count = 0;
+    let mut rendered_rows = Vec::new();
+    let mut rendered_cell_count = 0;
 
     while let Some(row) = rows.next() {
         let mut cells = cell_iterator.update(row)?;
-        let mut line = TerminalLine::default();
+        let mut rendered_row = TerminalRow::default();
 
         while let Some(cell) = cells.next() {
             let raw_cell = cell.raw_cell()?;
-            if matches!(
-                raw_cell.wide()?,
-                CellWide::SpacerTail | CellWide::SpacerHead
-            ) {
+            let width = match raw_cell.wide()? {
+                CellWide::Narrow => 1,
+                CellWide::Wide => 2,
+                CellWide::SpacerTail | CellWide::SpacerHead => 0,
+            };
+            if width == 0 {
                 continue;
             }
 
@@ -653,20 +650,19 @@ fn render_styled_lines(
                 graphemes.into_iter().collect()
             };
 
-            push_span(&mut line.spans, text, style);
+            rendered_row.cells.push(TerminalCell { text, style, width });
         }
 
-        line.trim_trailing_whitespace();
-        rendered_span_count += line.spans.len();
-        lines.push(line);
+        rendered_cell_count += rendered_row.cells.len();
+        rendered_rows.push(rendered_row);
     }
 
-    let truncated_line_count = truncate_rendered_lines(&mut lines);
+    let truncated_row_count = truncate_rendered_rows(&mut rendered_rows);
 
     Ok(RenderedSnapshot {
-        lines,
-        rendered_span_count,
-        truncated_line_count,
+        rows: rendered_rows,
+        rendered_cell_count,
+        truncated_row_count,
     })
 }
 
@@ -675,28 +671,13 @@ fn duration_from_nanos(nanos: u128) -> Duration {
     Duration::from_nanos(nanos)
 }
 
-fn truncate_rendered_lines(lines: &mut Vec<TerminalLine>) -> usize {
-    let truncated_line_count = lines.len().saturating_sub(MAX_RENDERED_LINES);
-    if truncated_line_count > 0 {
-        let start = lines.len().saturating_sub(MAX_RENDERED_LINES);
-        lines.drain(0..start);
+fn truncate_rendered_rows(rows: &mut Vec<TerminalRow>) -> usize {
+    let truncated_row_count = rows.len().saturating_sub(MAX_RENDERED_LINES);
+    if truncated_row_count > 0 {
+        let start = rows.len().saturating_sub(MAX_RENDERED_LINES);
+        rows.drain(0..start);
     }
-    truncated_line_count
-}
-
-fn push_span(spans: &mut Vec<TerminalSpan>, text: String, style: TerminalCellStyle) {
-    if text.is_empty() {
-        return;
-    }
-
-    if let Some(previous) = spans.last_mut()
-        && previous.style == style
-    {
-        previous.text.push_str(&text);
-        return;
-    }
-
-    spans.push(TerminalSpan { text, style });
+    truncated_row_count
 }
 
 fn normalize_cell_style(
@@ -752,7 +733,7 @@ mod tests {
         assert!(TerminalGeometry::new(80, 24, 100, 100, 8, 0).is_err());
     }
 
-    fn render_lines_from_vt(vt: &[u8]) -> Vec<TerminalLine> {
+    fn render_rows_from_vt(vt: &[u8]) -> Vec<TerminalRow> {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
@@ -772,7 +753,7 @@ mod tests {
             &mut cell_iterator,
         )
         .expect("styled lines")
-        .lines
+        .rows
     }
 
     fn render_snapshot_from_vt(vt: &[u8]) -> RenderedSnapshot {
@@ -797,134 +778,156 @@ mod tests {
         .expect("styled lines")
     }
 
-    fn last_non_empty_line(lines: &[TerminalLine]) -> &TerminalLine {
-        lines
+    fn last_non_empty_row(rows: &[TerminalRow]) -> &TerminalRow {
+        rows
             .iter()
             .rev()
-            .find(|line| !line.plain_text().is_empty())
+            .find(|row| !row.plain_text().trim().is_empty())
             .expect("non-empty line")
     }
 
     #[test]
-    fn renders_foreground_colors_as_distinct_spans() {
-        let lines = render_lines_from_vt(b"\x1b[31mred\x1b[32mgreen\x1b[0m\r\n");
-        let line = last_non_empty_line(&lines);
+    fn preserves_foreground_colors_per_cell() {
+        let rows = render_rows_from_vt(b"\x1b[31mred\x1b[32mgreen\x1b[0m\r\n");
+        let row = last_non_empty_row(&rows);
 
-        assert_eq!(line.spans.len(), 2);
-        assert_eq!(line.spans[0].text, "red");
-        assert!(line.spans[0].style.foreground.is_some());
-        assert_eq!(line.spans[1].text, "green");
-        assert!(line.spans[1].style.foreground.is_some());
-        assert_ne!(
-            line.spans[0].style.foreground,
-            line.spans[1].style.foreground
-        );
+        assert_eq!(row.plain_text().trim_end(), "redgreen");
+        assert!(row.cells[0].style.foreground.is_some());
+        assert!(row.cells[3].style.foreground.is_some());
+        assert_ne!(row.cells[0].style.foreground, row.cells[3].style.foreground);
     }
 
     #[test]
     fn renders_background_colors_and_preserves_spaces() {
-        let lines = render_lines_from_vt(b"\x1b[42m \x1b[0mX\r\n");
-        let line = last_non_empty_line(&lines);
+        let rows = render_rows_from_vt(b"\x1b[42m \x1b[0mX\r\n");
+        let row = last_non_empty_row(&rows);
 
-        assert_eq!(line.plain_text(), " X");
-        assert_eq!(line.spans.len(), 2);
-        assert!(line.spans[0].style.background.is_some());
+        assert_eq!(&row.plain_text()[..2], " X");
+        assert!(row.cells[0].style.background.is_some());
     }
 
     #[test]
     fn captures_bold_italic_and_underline_flags() {
-        let lines = render_lines_from_vt(b"\x1b[1mb\x1b[0m\x1b[3mi\x1b[0m\x1b[4mu\x1b[0m\r\n");
-        let line = last_non_empty_line(&lines);
+        let rows = render_rows_from_vt(b"\x1b[1mb\x1b[0m\x1b[3mi\x1b[0m\x1b[4mu\x1b[0m\r\n");
+        let row = last_non_empty_row(&rows);
 
-        assert_eq!(line.spans.len(), 3);
-        assert!(line.spans[0].style.bold);
-        assert!(line.spans[1].style.italic);
-        assert!(line.spans[2].style.underline);
+        assert!(row.cells[0].style.bold);
+        assert!(row.cells[1].style.italic);
+        assert!(row.cells[2].style.underline);
     }
 
     #[test]
     fn preserves_faint_text_for_shell_ghost_text_rendering() {
-        let lines = render_lines_from_vt(b"\x1b[2mghost\x1b[0m\r\n");
-        let line = last_non_empty_line(&lines);
+        let rows = render_rows_from_vt(b"\x1b[2mghost\x1b[0m\r\n");
+        let row = last_non_empty_row(&rows);
 
-        assert_eq!(line.spans.len(), 1);
-        assert_eq!(line.spans[0].text, "ghost");
-        assert!(line.spans[0].style.faint);
+        assert_eq!(row.plain_text().trim_end(), "ghost");
+        assert!(row.cells[..5].iter().all(|cell| cell.style.faint));
     }
 
     #[test]
     fn normalizes_inverse_colors_for_ui_rendering() {
-        let lines = render_lines_from_vt(b"\x1b[31;47mX\x1b[7mY\x1b[0m\r\n");
-        let line = last_non_empty_line(&lines);
+        let rows = render_rows_from_vt(b"\x1b[31;47mX\x1b[7mY\x1b[0m\r\n");
+        let row = last_non_empty_row(&rows);
 
-        assert_eq!(line.spans.len(), 2);
-        assert_eq!(line.spans[0].text, "X");
-        assert_eq!(line.spans[1].text, "Y");
+        assert_eq!(row.cells[0].text, "X");
+        assert_eq!(row.cells[1].text, "Y");
         assert_eq!(
-            line.spans[0].style.foreground,
-            line.spans[1].style.background
+            row.cells[0].style.foreground,
+            row.cells[1].style.background
         );
         assert_eq!(
-            line.spans[0].style.background,
-            line.spans[1].style.foreground
+            row.cells[0].style.background,
+            row.cells[1].style.foreground
         );
-        assert!(line.spans[1].style.inverse);
-    }
-
-    #[test]
-    fn merges_adjacent_cells_with_identical_style() {
-        let lines = render_lines_from_vt(b"\x1b[31mhello world\x1b[0m\r\n");
-        let line = last_non_empty_line(&lines);
-
-        assert_eq!(line.spans.len(), 1);
-        assert_eq!(line.spans[0].text, "hello world");
+        assert!(row.cells[1].style.inverse);
     }
 
     #[test]
     fn preserves_utf8_graphemes() {
-        let lines = render_lines_from_vt("hi 👋 café\r\n".as_bytes());
-        let line = last_non_empty_line(&lines);
+        let rows = render_rows_from_vt("hi 👋 café\r\n".as_bytes());
+        let row = last_non_empty_row(&rows);
 
-        assert_eq!(line.plain_text(), "hi 👋 café");
-        assert_eq!(line.spans[0].text.len(), "hi 👋 café".len());
+        assert_eq!(row.plain_text().trim_end(), "hi 👋 café");
+        assert!(row.cells.iter().any(|cell| cell.text == "👋" && cell.width == 2));
     }
 
     #[test]
-    fn trims_trailing_blank_cells() {
-        let lines = render_lines_from_vt(b"hi   ");
-        let line = last_non_empty_line(&lines);
+    fn preserves_box_drawing_cells() {
+        let rows = render_rows_from_vt("┌─┐\r\n│ │\r\n└─┘\r\n".as_bytes());
+        let row = rows
+            .iter()
+            .find(|row| row.plain_text().starts_with("┌─┐"))
+            .expect("box drawing row");
 
-        assert_eq!(line.plain_text(), "hi");
+        assert_eq!(row.cells[0].text, "┌");
+        assert_eq!(row.cells[1].text, "─");
+        assert_eq!(row.cells[2].text, "┐");
+        assert!(row.cells.iter().all(|cell| cell.width == 1));
     }
 
     #[test]
-    fn reports_rendered_span_count() {
+    fn preserves_braille_cells() {
+        let rows = render_rows_from_vt("⣀⣄⣤⣶\r\n".as_bytes());
+        let row = last_non_empty_row(&rows);
+
+        assert_eq!(&row.plain_text()[..("⣀⣄⣤⣶".len())], "⣀⣄⣤⣶");
+        assert!(row.cells.iter().all(|cell| cell.width == 1));
+    }
+
+    #[test]
+    fn preserves_wide_cell_widths() {
+        let rows = render_rows_from_vt("A界B\r\n".as_bytes());
+        let row = last_non_empty_row(&rows);
+
+        assert_eq!(row.cells[0].text, "A");
+        assert_eq!(row.cells[1].text, "界");
+        assert_eq!(row.cells[1].width, 2);
+        assert_eq!(row.cells[2].text, "B");
+        assert_eq!(row.terminal_width(), DEFAULT_COLS as usize);
+    }
+
+    #[test]
+    fn preserves_trailing_blank_cells_and_right_edge_border() {
+        let rows = render_rows_from_vt("│  │".as_bytes());
+        let row = last_non_empty_row(&rows);
+
+        assert_eq!(row.cells[0].text, "│");
+        assert_eq!(row.cells[3].text, "│");
+        assert_eq!(&row.plain_text()[..("│  │".len())], "│  │");
+    }
+
+    #[test]
+    fn reports_rendered_cell_count() {
         let snapshot = render_snapshot_from_vt(b"\x1b[31mred\x1b[32mgreen\x1b[0m\r\n");
 
-        assert_eq!(snapshot.rendered_span_count, 2);
+        assert_eq!(
+            snapshot.rendered_cell_count,
+            usize::from(DEFAULT_COLS) * usize::from(DEFAULT_ROWS)
+        );
     }
 
     #[test]
-    fn reports_truncated_line_count() {
-        let mut lines = vec![TerminalLine::default(); MAX_RENDERED_LINES + 7];
+    fn reports_truncated_row_count() {
+        let mut rows = vec![TerminalRow::default(); MAX_RENDERED_LINES + 7];
 
-        let truncated_line_count = truncate_rendered_lines(&mut lines);
+        let truncated_row_count = truncate_rendered_rows(&mut rows);
 
-        assert_eq!(lines.len(), MAX_RENDERED_LINES);
-        assert_eq!(truncated_line_count, 7);
+        assert_eq!(rows.len(), MAX_RENDERED_LINES);
+        assert_eq!(truncated_row_count, 7);
     }
 
     #[test]
     fn perf_snapshot_acknowledges_dirty_state() {
-        let mut perf = SessionPerfState::default();
-        perf.snapshot.dirty_since_last_ui_frame = true;
-        perf.snapshot.terminal.snapshot_seq = 3;
-        let state = SharedSessionState {
-            snapshot: Arc::new(Mutex::new(SessionSnapshot::default())),
-            perf_snapshot: Arc::new(Mutex::new(perf)),
-        };
+        let (state, _notify_rx) = SharedSessionState::new("test");
+        {
+            let mut perf = state.perf_snapshot.lock().unwrap();
+            perf.snapshot.dirty_since_last_ui_frame = true;
+            perf.snapshot.terminal.snapshot_seq = 3;
+        }
 
-        let handle = LocalSessionHandle::new(1, Arc::<str>::from("test"), state, mpsc::channel().0);
+        let handle =
+            LocalSessionHandle::new(1, Arc::<str>::from("test"), state, mpsc::channel().0, _notify_rx);
 
         let first = handle.perf_snapshot();
         let second = handle.perf_snapshot();
@@ -944,16 +947,17 @@ mod tests {
 
     #[test]
     fn local_sessions_fit_terminal_session_trait_objects() {
-        let state = SharedSessionState::new("hello");
+        let (state, notify_rx) = SharedSessionState::new("hello");
         let handle = Arc::new(LocalSessionHandle::new(
             7,
             Arc::<str>::from("local-7"),
             state,
             mpsc::channel().0,
+            notify_rx,
         )) as Arc<dyn TerminalSession>;
 
         assert_eq!(handle.id(), 7);
         assert_eq!(handle.title(), "local-7");
-        assert_eq!(handle.snapshot().lines[0].plain_text(), "hello");
+        assert_eq!(handle.snapshot().rows[0].plain_text(), "hello");
     }
 }

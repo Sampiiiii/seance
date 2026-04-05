@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use seance_ssh::{
-    ResolvedAuthMethod, SshConnectRequest, SshConnectionConfig, SshSessionManager,
-};
+use seance_ssh::{ResolvedAuthMethod, SshConnectRequest, SshConnectionConfig, SshSessionManager};
 use seance_terminal::{LocalSessionFactory, TerminalSession};
 use seance_vault::{
     CredentialSummary, GenerateKeyAlgorithm, GenerateKeyRequest, HostAuthRef, HostSummary,

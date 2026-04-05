@@ -96,6 +96,7 @@ pub struct SshSessionHandle {
     title: Arc<str>,
     state: SharedSessionState,
     command_tx: mpsc::UnboundedSender<SessionCommand>,
+    notify_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl std::fmt::Debug for SshSessionHandle {
@@ -134,6 +135,10 @@ impl TerminalSession for SshSessionHandle {
 
     fn perf_snapshot(&self) -> seance_terminal::SessionPerfSnapshot {
         self.state.perf_snapshot()
+    }
+
+    fn take_notify_rx(&self) -> Option<std::sync::mpsc::Receiver<()>> {
+        self.notify_rx.lock().expect("notify_rx poisoned").take()
     }
 }
 
@@ -209,7 +214,7 @@ impl SshSessionManager {
 
         let sftp = self.bootstrap_sftp(session_id, &session).await?;
 
-        let state = SharedSessionState::new(format!(
+        let (state, notify_rx) = SharedSessionState::new(format!(
             "Connected to {}@{}:{}",
             request.connection.username, request.connection.hostname, request.connection.port
         ));
@@ -219,6 +224,7 @@ impl SshSessionManager {
             title: Arc::<str>::from(request.connection.label.clone()),
             state: state.clone(),
             command_tx,
+            notify_rx: Mutex::new(Some(notify_rx)),
         });
 
         std::thread::Builder::new()

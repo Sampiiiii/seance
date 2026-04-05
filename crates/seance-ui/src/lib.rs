@@ -3,7 +3,7 @@ mod palette;
 mod theme;
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     env,
     sync::Arc,
     time::{Duration, Instant},
@@ -11,14 +11,13 @@ use std::{
 
 use anyhow::Result;
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, Focusable, FontWeight, KeyDownEvent,
-    MouseButton, Pixels, SharedString, StyledText, TextRun, UnderlineStyle, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, deferred, div, font, prelude::*, px,
-    size,
+    App, Application, Bounds, Context, Div, FocusHandle, Focusable, FontWeight, KeyDownEvent,
+    MouseButton, Pixels, ShapedLine, SharedString, TextRun, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, canvas, deferred, div, fill, font, point, prelude::*, px, size,
 };
 use seance_terminal::{
-    SessionPerfSnapshot, TerminalCellStyle, TerminalColor, TerminalGeometry, TerminalLine,
-    TerminalSession,
+    SessionPerfSnapshot, TerminalCell, TerminalCellStyle, TerminalColor, TerminalGeometry,
+    TerminalRow, TerminalSession,
 };
 use seance_vault::{
     HostAuthRef, HostSummary, SecretString, VaultHostProfile, VaultPasswordCredential, VaultStore,
@@ -30,7 +29,7 @@ use backend::UiBackend;
 use palette::{PaletteAction, build_items};
 use theme::{Theme, ThemeId};
 
-const SIDEBAR_WIDTH: f32 = 260.0;
+const SIDEBAR_WIDTH: f32 = 272.0;
 const PERF_HISTORY_LIMIT: usize = 120;
 const PERF_WINDOW: Duration = Duration::from_secs(1);
 const TERMINAL_FONT_FAMILY: &str = "Menlo";
@@ -95,17 +94,28 @@ pub fn run(vault: VaultStore) -> Result<()> {
                         terminal_metrics: None,
                         last_applied_geometry: None,
                         active_terminal_rows: TerminalGeometry::default().size.rows as usize,
+                        terminal_surface: TerminalSurfaceState {
+                            theme_id: ThemeId::ObsidianSmoke,
+                            ..Default::default()
+                        },
                         perf_overlay: PerfOverlayState::new(perf_mode_from_env()),
                     };
                     cx.observe_window_bounds(window, |this: &mut SeanceWorkspace, window, cx| {
                         this.apply_active_terminal_geometry(window);
+                        this.invalidate_terminal_surface();
                         this.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
                         cx.notify();
                     })
                     .detach();
                     ws.apply_active_terminal_geometry(window);
-                    ws.schedule_refresh(window, cx, entity.clone());
-                    ws.schedule_perf_sampling(window, entity);
+                    if let Some(notify_rx) = ws.active_session().and_then(|s| s.take_notify_rx()) {
+                        SeanceWorkspace::schedule_session_watcher(
+                            window,
+                            cx,
+                            entity.clone(),
+                            notify_rx,
+                        );
+                    }
                     ws
                 })
             },
@@ -132,6 +142,7 @@ struct SeanceWorkspace {
     terminal_metrics: Option<TerminalMetrics>,
     last_applied_geometry: Option<TerminalGeometry>,
     active_terminal_rows: usize,
+    terminal_surface: TerminalSurfaceState,
     perf_overlay: PerfOverlayState,
 }
 
@@ -139,6 +150,116 @@ struct SeanceWorkspace {
 struct TerminalMetrics {
     cell_width_px: f32,
     cell_height_px: f32,
+    line_height_px: f32,
+    font_size_px: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalGlyphPolicy {
+    GroupableAscii,
+    PerCellSpecial,
+    WideCell,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalPaintFragment {
+    x: Pixels,
+    line: ShapedLine,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TerminalPaintQuad {
+    x: Pixels,
+    width: Pixels,
+    color: gpui::Hsla,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TerminalPaintRow {
+    y: Pixels,
+    backgrounds: Vec<TerminalPaintQuad>,
+    underlines: Vec<TerminalPaintQuad>,
+    fragments: Vec<TerminalPaintFragment>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TerminalRendererMetrics {
+    visible_rows: usize,
+    visible_cells: usize,
+    fragments: usize,
+    background_quads: usize,
+    special_glyph_cells: usize,
+    wide_cells: usize,
+    shape_hits: usize,
+    shape_misses: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalSurfaceState {
+    active_session_id: u64,
+    snapshot_seq: u64,
+    geometry: Option<TerminalGeometry>,
+    theme_id: ThemeId,
+    rows: Vec<TerminalPaintRow>,
+    metrics: TerminalRendererMetrics,
+    shape_cache: ShapeCache,
+}
+
+impl Default for TerminalSurfaceState {
+    fn default() -> Self {
+        Self {
+            active_session_id: 0,
+            snapshot_seq: 0,
+            geometry: None,
+            theme_id: ThemeId::ObsidianSmoke,
+            rows: Vec::new(),
+            metrics: TerminalRendererMetrics::default(),
+            shape_cache: ShapeCache::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ShapeCache {
+    entries: HashMap<ShapeCacheKey, CachedShapeLine>,
+    generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedShapeLine {
+    line: ShapedLine,
+    last_used: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShapeCacheKey {
+    text: String,
+    font_size_bits: u32,
+    bold: bool,
+    italic: bool,
+    color: HslaKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct HslaKey {
+    h: u32,
+    s: u32,
+    l: u32,
+    a: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalFragmentPlan {
+    text: String,
+    style: TerminalCellStyle,
+    glyph_policy: TerminalGlyphPolicy,
+    start_col: usize,
+    cell_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedTerminalSurface {
+    rows: Vec<TerminalPaintRow>,
     line_height_px: f32,
 }
 
@@ -304,10 +425,10 @@ impl UiPerfMode {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RedrawReason {
-    IdleTick,
     Input,
     TerminalUpdate,
     Palette,
+    UiRefresh,
     #[default]
     Unknown,
 }
@@ -315,10 +436,10 @@ enum RedrawReason {
 impl RedrawReason {
     fn label(self) -> &'static str {
         match self {
-            Self::IdleTick => "idle",
             Self::Input => "input",
             Self::TerminalUpdate => "terminal",
             Self::Palette => "palette",
+            Self::UiRefresh => "ui",
             Self::Unknown => "unknown",
         }
     }
@@ -331,21 +452,23 @@ struct FrameStats {
     frame_time_last_ms: f32,
     frame_time_avg_ms: f32,
     frame_time_p95_ms: f32,
+    present_interval_last_ms: f32,
+    present_interval_avg_ms: f32,
+    present_interval_p95_ms: f32,
     redraw_reason: RedrawReason,
 }
 
 #[derive(Debug)]
 struct PerfOverlayState {
     mode: UiPerfMode,
-    sampler_running: bool,
-    last_frame_timestamp: Option<Instant>,
-    frame_timestamps: VecDeque<Instant>,
-    frame_durations: VecDeque<Duration>,
-    refresh_timestamps: VecDeque<Instant>,
+    last_present_timestamp: Option<Instant>,
+    present_timestamps: VecDeque<Instant>,
+    present_intervals: VecDeque<(Instant, Duration)>,
+    render_cost_samples: VecDeque<(Instant, Duration)>,
+    ui_refresh_timestamps: VecDeque<Instant>,
+    terminal_refresh_timestamps: VecDeque<Instant>,
     active_session_perf_snapshot: Option<SessionPerfSnapshot>,
     frame_stats: FrameStats,
-    refresh_requests_total: u64,
-    idle_refreshes_total: u64,
     visible_line_count: usize,
     pending_redraw_reason: RedrawReason,
 }
@@ -354,53 +477,70 @@ impl PerfOverlayState {
     fn new(mode: UiPerfMode) -> Self {
         Self {
             mode,
-            sampler_running: false,
-            last_frame_timestamp: None,
-            frame_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
-            frame_durations: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
-            refresh_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
+            last_present_timestamp: None,
+            present_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
+            present_intervals: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
+            render_cost_samples: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
+            ui_refresh_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
+            terminal_refresh_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
             active_session_perf_snapshot: None,
             frame_stats: FrameStats::default(),
-            refresh_requests_total: 0,
-            idle_refreshes_total: 0,
             visible_line_count: 0,
             pending_redraw_reason: RedrawReason::Unknown,
         }
     }
 
-    fn mark_refresh_request(
+    fn reset_sampling_window(&mut self) {
+        self.last_present_timestamp = None;
+        self.present_timestamps.clear();
+        self.present_intervals.clear();
+        self.render_cost_samples.clear();
+        self.ui_refresh_timestamps.clear();
+        self.terminal_refresh_timestamps.clear();
+        self.frame_stats = FrameStats::default();
+        self.pending_redraw_reason = RedrawReason::Unknown;
+    }
+
+    fn mark_terminal_refresh_request(
         &mut self,
         now: Instant,
         reason: RedrawReason,
         session_perf: Option<SessionPerfSnapshot>,
     ) {
-        self.refresh_requests_total = self.refresh_requests_total.saturating_add(1);
-        if matches!(reason, RedrawReason::IdleTick) {
-            self.idle_refreshes_total = self.idle_refreshes_total.saturating_add(1);
-        }
         self.pending_redraw_reason = reason;
         self.active_session_perf_snapshot = session_perf;
-        self.refresh_timestamps.push_back(now);
-        trim_instants(&mut self.refresh_timestamps, now, PERF_WINDOW);
+        self.terminal_refresh_timestamps.push_back(now);
+        trim_instants(&mut self.terminal_refresh_timestamps, now, PERF_WINDOW);
+        self.ui_refresh_timestamps.push_back(now);
+        trim_instants(&mut self.ui_refresh_timestamps, now, PERF_WINDOW);
+    }
+
+    fn mark_ui_refresh_request(&mut self, now: Instant, reason: RedrawReason) {
+        self.pending_redraw_reason = reason;
+        self.ui_refresh_timestamps.push_back(now);
+        trim_instants(&mut self.ui_refresh_timestamps, now, PERF_WINDOW);
     }
 
     fn mark_input(&mut self, reason: RedrawReason) {
         self.pending_redraw_reason = reason;
     }
 
-    fn mark_frame_presented(&mut self, now: Instant) {
-        if let Some(previous) = self.last_frame_timestamp.replace(now) {
-            push_bounded(
-                &mut self.frame_durations,
-                now.saturating_duration_since(previous),
-            );
+    fn finish_render(&mut self, started_at: Instant, ended_at: Instant) {
+        self.render_cost_samples
+            .push_back((ended_at, ended_at.saturating_duration_since(started_at)));
+        trim_timed_durations(&mut self.render_cost_samples, ended_at, PERF_WINDOW);
+        if let Some(previous) = self.last_present_timestamp.replace(ended_at) {
+            self.present_intervals
+                .push_back((ended_at, ended_at.saturating_duration_since(previous)));
+            trim_timed_durations(&mut self.present_intervals, ended_at, PERF_WINDOW);
         }
-        self.frame_timestamps.push_back(now);
-        trim_instants(&mut self.frame_timestamps, now, PERF_WINDOW);
+        self.present_timestamps.push_back(ended_at);
+        trim_instants(&mut self.present_timestamps, ended_at, PERF_WINDOW);
         self.frame_stats = build_frame_stats(
             self.frame_stats.frame_count_total.saturating_add(1),
-            &self.frame_durations,
-            &self.frame_timestamps,
+            &self.render_cost_samples,
+            &self.present_intervals,
+            &self.present_timestamps,
             self.pending_redraw_reason,
         );
         self.pending_redraw_reason = RedrawReason::Unknown;
@@ -410,24 +550,20 @@ impl PerfOverlayState {
             fps_1s = self.frame_stats.fps_1s,
             frame_time_last_ms = self.frame_stats.frame_time_last_ms,
             redraw_reason = self.frame_stats.redraw_reason.label(),
-            "perf frame sampled"
+            "perf render sampled"
         );
     }
 
-    fn refreshes_last_second(&self) -> usize {
-        self.refresh_timestamps.len()
+    fn ui_refreshes_last_second(&self) -> usize {
+        self.ui_refresh_timestamps.len()
+    }
+
+    fn terminal_refreshes_last_second(&self) -> usize {
+        self.terminal_refresh_timestamps.len()
     }
 
     fn frames_presented_last_second(&self) -> usize {
-        self.frame_timestamps.len()
-    }
-
-    fn idle_refresh_percentage(&self) -> f32 {
-        if self.refresh_requests_total == 0 {
-            return 0.0;
-        }
-
-        (self.idle_refreshes_total as f32 / self.refresh_requests_total as f32) * 100.0
+        self.present_timestamps.len()
     }
 
     fn active_session_dirty(&self) -> bool {
@@ -467,48 +603,77 @@ fn trim_instants(samples: &mut VecDeque<Instant>, now: Instant, window: Duration
     }
 }
 
-fn push_bounded(samples: &mut VecDeque<Duration>, sample: Duration) {
-    if samples.len() == PERF_HISTORY_LIMIT {
+fn trim_timed_durations(
+    samples: &mut VecDeque<(Instant, Duration)>,
+    now: Instant,
+    window: Duration,
+) {
+    while let Some((timestamp, _)) = samples.front().copied() {
+        if now.saturating_duration_since(timestamp) <= window {
+            break;
+        }
         samples.pop_front();
     }
-    samples.push_back(sample);
 }
 
 fn build_frame_stats(
     frame_count_total: u64,
-    samples: &VecDeque<Duration>,
-    frame_timestamps: &VecDeque<Instant>,
+    render_cost_samples: &VecDeque<(Instant, Duration)>,
+    present_intervals: &VecDeque<(Instant, Duration)>,
+    present_timestamps: &VecDeque<Instant>,
     redraw_reason: RedrawReason,
 ) -> FrameStats {
-    let frame_time_last_ms = samples
+    let frame_time_last_ms = render_cost_samples
         .back()
-        .map(|duration| duration.as_secs_f32() * 1_000.0)
+        .map(|(_, duration)| duration.as_secs_f32() * 1_000.0)
         .unwrap_or_default();
-    let frame_time_avg_ms = if samples.is_empty() {
-        0.0
-    } else {
-        samples.iter().map(Duration::as_secs_f32).sum::<f32>() * 1_000.0 / samples.len() as f32
-    };
-    let frame_time_p95_ms = percentile_duration_ms(samples, 0.95);
+    let frame_time_avg_ms = average_duration_ms(render_cost_samples);
+    let frame_time_p95_ms = percentile_duration_ms(render_cost_samples, 0.95);
+    let present_interval_last_ms = present_intervals
+        .back()
+        .map(|(_, duration)| duration.as_secs_f32() * 1_000.0)
+        .unwrap_or_default();
+    let present_interval_avg_ms = average_duration_ms(present_intervals);
+    let present_interval_p95_ms = percentile_duration_ms(present_intervals, 0.95);
 
     FrameStats {
         frame_count_total,
-        fps_1s: frame_timestamps.len() as f32,
+        fps_1s: normalized_fps_1s(present_timestamps),
         frame_time_last_ms,
         frame_time_avg_ms,
         frame_time_p95_ms,
+        present_interval_last_ms,
+        present_interval_avg_ms,
+        present_interval_p95_ms,
         redraw_reason,
     }
 }
 
-fn percentile_duration_ms(samples: &VecDeque<Duration>, percentile: f32) -> f32 {
+fn average_duration_ms(samples: &VecDeque<(Instant, Duration)>) -> f32 {
+    if samples.is_empty() {
+        0.0
+    } else {
+        samples
+            .iter()
+            .map(|(_, duration)| duration.as_secs_f32())
+            .sum::<f32>()
+            * 1_000.0
+            / samples.len() as f32
+    }
+}
+
+fn normalized_fps_1s(present_timestamps: &VecDeque<Instant>) -> f32 {
+    present_timestamps.len() as f32
+}
+
+fn percentile_duration_ms(samples: &VecDeque<(Instant, Duration)>, percentile: f32) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
 
     let mut millis = samples
         .iter()
-        .map(|sample| sample.as_secs_f32() * 1_000.0)
+        .map(|(_, sample)| sample.as_secs_f32() * 1_000.0)
         .collect::<Vec<_>>();
     millis.sort_by(f32::total_cmp);
     let index = ((millis.len() - 1) as f32 * percentile).round() as usize;
@@ -563,15 +728,15 @@ fn compact_perf_strings(state: &PerfOverlayState) -> Vec<(&'static str, String)>
             ),
         ),
         (
-            "lines",
+            "rows",
             terminal
-                .map(|metrics| metrics.rendered_line_count.to_string())
+                .map(|metrics| metrics.rendered_row_count.to_string())
                 .unwrap_or_else(|| "0".into()),
         ),
         (
-            "spans",
+            "cells",
             terminal
-                .map(|metrics| metrics.rendered_span_count.to_string())
+                .map(|metrics| metrics.rendered_cell_count.to_string())
                 .unwrap_or_else(|| "0".into()),
         ),
     ]
@@ -581,18 +746,39 @@ fn expanded_perf_strings(
     state: &PerfOverlayState,
     active_session_id: u64,
     palette_open: bool,
+    renderer: TerminalRendererMetrics,
 ) -> Vec<(&'static str, String)> {
     let terminal = state
         .active_session_perf_snapshot
         .as_ref()
         .map(|snapshot| &snapshot.terminal);
     vec![
-        ("refresh", state.refreshes_last_second().to_string()),
+        ("ui refresh", state.ui_refreshes_last_second().to_string()),
+        (
+            "terminal refresh",
+            state.terminal_refreshes_last_second().to_string(),
+        ),
         (
             "presented",
             state.frames_presented_last_second().to_string(),
         ),
-        ("idle", format!("{:.0}%", state.idle_refresh_percentage())),
+        (
+            "present/ui",
+            format!(
+                "{}/{}",
+                state.frames_presented_last_second(),
+                state.ui_refreshes_last_second()
+            ),
+        ),
+        (
+            "cadence",
+            format!(
+                "{:.1}/{:.1}/{:.1} ms",
+                state.frame_stats.present_interval_last_ms,
+                state.frame_stats.present_interval_avg_ms,
+                state.frame_stats.present_interval_p95_ms
+            ),
+        ),
         (
             "dirty",
             if state.active_session_dirty() {
@@ -605,7 +791,7 @@ fn expanded_perf_strings(
         (
             "truncated",
             terminal
-                .map(|metrics| metrics.truncated_line_count.to_string())
+                .map(|metrics| metrics.truncated_row_count.to_string())
                 .unwrap_or_else(|| "0".into()),
         ),
         ("session", active_session_id.to_string()),
@@ -622,6 +808,11 @@ fn expanded_perf_strings(
             "reason",
             state.frame_stats.redraw_reason.label().to_string(),
         ),
+        ("plan rows", renderer.visible_rows.to_string()),
+        ("fragments", renderer.fragments.to_string()),
+        ("bg quads", renderer.background_quads.to_string()),
+        ("shape hits", renderer.shape_hits.to_string()),
+        ("shape misses", renderer.shape_misses.to_string()),
     ]
 }
 
@@ -651,6 +842,7 @@ impl SeanceWorkspace {
             cell_width_px,
             cell_height_px: line_height_px,
             line_height_px,
+            font_size_px: TERMINAL_FONT_SIZE_PX,
         };
         trace!(?metrics, "measured terminal metrics");
         self.terminal_metrics = Some(metrics);
@@ -690,30 +882,31 @@ impl SeanceWorkspace {
         }
 
         self.last_applied_geometry = Some(geometry);
+        self.invalidate_terminal_surface();
     }
 
-    fn schedule_refresh(
-        &self,
+    fn schedule_session_watcher(
         window: &mut Window,
         cx: &mut Context<Self>,
         entity: gpui::Entity<Self>,
+        notify_rx: std::sync::mpsc::Receiver<()>,
     ) {
+        let notify_rx = Arc::new(std::sync::Mutex::new(notify_rx));
         window
             .spawn(cx, async move |cx| {
                 loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(33))
+                    let rx = Arc::clone(&notify_rx);
+                    let recv_ok = cx
+                        .background_executor()
+                        .spawn(async move { rx.lock().unwrap().recv().is_ok() })
                         .await;
+                    if !recv_ok {
+                        break;
+                    }
+                    while notify_rx.lock().unwrap().try_recv().is_ok() {}
                     let _ = cx.update(|window, cx| {
-                        let _ = entity.update(cx, |this, _| {
-                            let session_perf =
-                                this.active_session().map(|session| session.perf_snapshot());
-                            let reason = this.classify_refresh_reason(session_perf.as_ref());
-                            this.perf_overlay.mark_refresh_request(
-                                Instant::now(),
-                                reason,
-                                session_perf,
-                            );
+                        entity.update(cx, |this, _| {
+                            this.take_terminal_refresh_request();
                         });
                         window.refresh();
                     });
@@ -722,50 +915,87 @@ impl SeanceWorkspace {
             .detach();
     }
 
-    fn schedule_perf_sampling(&self, window: &mut Window, entity: gpui::Entity<Self>) {
-        if !self.perf_overlay.mode.is_enabled() || self.perf_overlay.sampler_running {
+    fn take_terminal_refresh_request(&mut self) -> bool {
+        let Some(session) = self.active_session() else {
+            return false;
+        };
+
+        let session_perf = session.perf_snapshot();
+        self.perf_overlay.active_session_perf_snapshot = Some(session_perf.clone());
+        if !session_perf.dirty_since_last_ui_frame {
+            return false;
+        }
+
+        self.perf_overlay.mark_terminal_refresh_request(
+            Instant::now(),
+            RedrawReason::TerminalUpdate,
+            Some(session_perf),
+        );
+        true
+    }
+
+    fn invalidate_terminal_surface(&mut self) {
+        self.terminal_surface.snapshot_seq = 0;
+        self.terminal_surface.geometry = None;
+    }
+
+    fn sync_terminal_surface(&mut self, window: &mut Window) {
+        let Some(session) = self.active_session().cloned() else {
+            self.terminal_surface.rows.clear();
+            self.terminal_surface.metrics = TerminalRendererMetrics::default();
+            self.terminal_surface.active_session_id = 0;
+            self.terminal_surface.geometry = None;
+            return;
+        };
+
+        let metrics = self.terminal_metrics(window);
+        let geometry = self
+            .last_applied_geometry
+            .unwrap_or_else(TerminalGeometry::default);
+        let snapshot_seq = self
+            .perf_overlay
+            .active_session_perf_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.terminal.snapshot_seq)
+            .unwrap_or(0);
+        let needs_rebuild = self.terminal_surface.active_session_id != session.id()
+            || self.terminal_surface.snapshot_seq != snapshot_seq
+            || self.terminal_surface.geometry != Some(geometry)
+            || self.terminal_surface.theme_id != self.active_theme
+            || self.terminal_surface.rows.is_empty();
+
+        if !needs_rebuild {
             return;
         }
 
-        Self::schedule_perf_sampling_for(window, entity);
-    }
+        let snapshot = session.snapshot();
+        let (rows, metrics_report) = build_terminal_surface_rows(
+            &snapshot.rows,
+            geometry,
+            metrics,
+            self.active_theme,
+            &self.theme(),
+            &mut self.terminal_surface.shape_cache,
+            window,
+        );
 
-    fn schedule_perf_sampling_for(window: &Window, entity: gpui::Entity<Self>) {
-        window.on_next_frame(move |window, cx| {
-            let should_continue = entity.update(cx, |this, _| {
-                this.perf_overlay.sampler_running = true;
-                this.perf_overlay.mark_frame_presented(Instant::now());
-                this.perf_overlay.mode.is_enabled()
-            });
-            if should_continue {
-                Self::schedule_perf_sampling_for(window, entity.clone());
-            } else {
-                let _ = entity.update(cx, |this, _| {
-                    this.perf_overlay.sampler_running = false;
-                });
-            }
-        });
-    }
-
-    fn classify_refresh_reason(&self, session_perf: Option<&SessionPerfSnapshot>) -> RedrawReason {
-        if self.palette_open {
-            RedrawReason::Palette
-        } else if session_perf.is_some_and(|snapshot| snapshot.dirty_since_last_ui_frame) {
-            RedrawReason::TerminalUpdate
-        } else {
-            RedrawReason::IdleTick
-        }
+        self.terminal_surface.rows = rows;
+        self.terminal_surface.metrics = metrics_report;
+        self.terminal_surface.active_session_id = session.id();
+        self.terminal_surface.snapshot_seq = snapshot_seq;
+        self.terminal_surface.geometry = Some(geometry);
+        self.terminal_surface.theme_id = self.active_theme;
     }
 
     fn toggle_perf_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.perf_overlay.mode = self.perf_overlay.mode.next();
-        self.perf_overlay.pending_redraw_reason = RedrawReason::Input;
-        if self.perf_overlay.mode.is_enabled() {
-            self.perf_overlay.sampler_running = false;
-            self.schedule_perf_sampling(window, cx.entity());
-        } else {
-            self.perf_overlay.sampler_running = false;
+        let next_mode = self.perf_overlay.mode.next();
+        if matches!(self.perf_overlay.mode, UiPerfMode::Off) && next_mode.is_enabled() {
+            self.perf_overlay.reset_sampling_window();
         }
+        self.perf_overlay.mode = next_mode;
+        self.perf_overlay
+            .mark_ui_refresh_request(Instant::now(), RedrawReason::UiRefresh);
+        window.refresh();
         cx.notify();
     }
 
@@ -849,6 +1079,7 @@ impl SeanceWorkspace {
             Some("Vault locked. Decrypted records were cleared from memory.".into());
         self.status_message = Some("Vault locked.".into());
         self.palette_open = false;
+        self.invalidate_terminal_surface();
         self.perf_overlay.mark_input(RedrawReason::Input);
         cx.notify();
     }
@@ -902,7 +1133,7 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
-    fn connect_saved_host(&mut self, host_id: &str, cx: &mut Context<Self>) {
+    fn connect_saved_host(&mut self, host_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_host_id = Some(host_id.into());
         match self.backend.connect_host(host_id) {
             Ok(session) => {
@@ -910,8 +1141,12 @@ impl SeanceWorkspace {
                     let _ = session.resize(geometry);
                 }
                 self.active_session_id = session.id();
+                if let Some(notify_rx) = session.take_notify_rx() {
+                    Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
+                }
                 self.sessions.push(session);
                 self.status_message = Some("SSH session connected.".into());
+                self.invalidate_terminal_surface();
             }
             Err(err) => {
                 self.status_message = Some(err.to_string());
@@ -964,13 +1199,17 @@ impl SeanceWorkspace {
             .find(|s| s.id() == self.active_session_id)
     }
 
-    fn spawn_session(&mut self, cx: &mut Context<Self>) {
+    fn spawn_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Ok(session) = self.backend.spawn_local_session() {
             if let Some(geometry) = self.last_applied_geometry {
                 let _ = session.resize(geometry);
             }
             self.active_session_id = session.id();
+            if let Some(notify_rx) = session.take_notify_rx() {
+                Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
+            }
             self.sessions.push(session);
+            self.invalidate_terminal_surface();
             self.perf_overlay.mark_input(RedrawReason::Input);
             cx.notify();
         }
@@ -984,6 +1223,7 @@ impl SeanceWorkspace {
             let _ = session.resize(geometry);
             self.active_terminal_rows = geometry.size.rows as usize;
         }
+        self.invalidate_terminal_surface();
         self.perf_overlay.mark_input(RedrawReason::Input);
         cx.notify();
     }
@@ -997,6 +1237,7 @@ impl SeanceWorkspace {
             self.last_applied_geometry = None;
             self.active_terminal_rows = TerminalGeometry::default().size.rows as usize;
         }
+        self.invalidate_terminal_surface();
         self.perf_overlay.mark_input(RedrawReason::Input);
         cx.notify();
     }
@@ -1013,9 +1254,14 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
-    fn execute_palette_action(&mut self, action: PaletteAction, cx: &mut Context<Self>) {
+    fn execute_palette_action(
+        &mut self,
+        action: PaletteAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match action {
-            PaletteAction::NewLocalTerminal => self.spawn_session(cx),
+            PaletteAction::NewLocalTerminal => self.spawn_session(window, cx),
             PaletteAction::SwitchSession(id) => self.select_session(id, cx),
             PaletteAction::CloseActiveSession => {
                 let id = self.active_session_id;
@@ -1023,6 +1269,7 @@ impl SeanceWorkspace {
             }
             PaletteAction::SwitchTheme(tid) => {
                 self.active_theme = tid;
+                self.invalidate_terminal_surface();
             }
             PaletteAction::UnlockVault => {
                 self.unlock_form.reset_for_unlock();
@@ -1038,12 +1285,14 @@ impl SeanceWorkspace {
                 return;
             }
             PaletteAction::AddPasswordCredential => {
-                match self.backend.save_password_credential(VaultPasswordCredential {
-                    id: String::new(),
-                    label: format!("credential-{}", now_ui_suffix()),
-                    username_hint: None,
-                    secret: "change-me".into(),
-                }) {
+                match self
+                    .backend
+                    .save_password_credential(VaultPasswordCredential {
+                        id: String::new(),
+                        label: format!("credential-{}", now_ui_suffix()),
+                        username_hint: None,
+                        secret: "change-me".into(),
+                    }) {
                     Ok(summary) => {
                         self.status_message = Some(format!(
                             "Created placeholder password credential '{}'. Edit support lands next.",
@@ -1055,8 +1304,7 @@ impl SeanceWorkspace {
             }
             PaletteAction::ImportPrivateKey => {
                 self.status_message = Some(
-                    "Private key import backend is ready; UI import form is still pending."
-                        .into(),
+                    "Private key import backend is ready; UI import form is still pending.".into(),
                 );
             }
             PaletteAction::GenerateEd25519Key => {
@@ -1065,21 +1313,20 @@ impl SeanceWorkspace {
                     .generate_ed25519_key(format!("ed25519-{}", now_ui_suffix()))
                 {
                     Ok(summary) => {
-                        self.status_message = Some(format!(
-                            "Generated vault-backed key '{}'.",
-                            summary.label
-                        ));
+                        self.status_message =
+                            Some(format!("Generated vault-backed key '{}'.", summary.label));
                     }
                     Err(err) => self.status_message = Some(err.to_string()),
                 }
             }
             PaletteAction::GenerateRsaKey => {
-                match self.backend.generate_rsa_key(format!("rsa-{}", now_ui_suffix())) {
+                match self
+                    .backend
+                    .generate_rsa_key(format!("rsa-{}", now_ui_suffix()))
+                {
                     Ok(summary) => {
-                        self.status_message = Some(format!(
-                            "Generated vault-backed key '{}'.",
-                            summary.label
-                        ));
+                        self.status_message =
+                            Some(format!("Generated vault-backed key '{}'.", summary.label));
                     }
                     Err(err) => self.status_message = Some(err.to_string()),
                 }
@@ -1093,7 +1340,7 @@ impl SeanceWorkspace {
                 return;
             }
             PaletteAction::ConnectSavedHost(id) => {
-                self.connect_saved_host(&id, cx);
+                self.connect_saved_host(&id, window, cx);
                 return;
             }
         }
@@ -1130,7 +1377,7 @@ impl SeanceWorkspace {
             return;
         }
         if mods.platform && key == "t" {
-            self.spawn_session(cx);
+            self.spawn_session(window, cx);
             return;
         }
         if mods.platform && key == "w" {
@@ -1142,7 +1389,7 @@ impl SeanceWorkspace {
         }
 
         if self.palette_open {
-            self.handle_palette_key(event, cx);
+            self.handle_palette_key(event, window, cx);
             return;
         }
 
@@ -1155,7 +1402,7 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
-    fn handle_palette_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn handle_palette_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let key_char = event.keystroke.key_char.as_deref();
 
@@ -1199,7 +1446,7 @@ impl SeanceWorkspace {
                 );
                 if let Some(item) = items.get(self.palette_selected) {
                     let action = item.action.clone();
-                    self.execute_palette_action(action, cx);
+                    self.execute_palette_action(action, window, cx);
                 }
             }
             "backspace" => {
@@ -1347,240 +1594,109 @@ impl SeanceWorkspace {
 
     // ─── Rendering ──────────────────────────────────────────
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar_row_shell(&self, active: bool) -> Div {
         let t = self.theme();
-        let vault_status = self.backend.vault_status();
+        let row = div()
+            .px_3()
+            .py(px(9.0))
+            .rounded_xl()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_3();
 
-        let mut session_list = div().flex().flex_col().gap_1().px_2();
-        for session in &self.sessions {
-            let active = session.id() == self.active_session_id;
-            let sid = session.id();
-            let title = session.title().to_string();
-            let snapshot = session.snapshot();
-            let preview = snapshot
-                .lines
-                .iter()
-                .rev()
-                .map(TerminalLine::plain_text)
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or_else(|| "waiting for output…".into());
-
-            let mut card = div()
-                .px_3()
-                .py_2()
-                .rounded_lg()
-                .cursor_pointer()
-                .flex()
-                .flex_col()
-                .gap(px(2.0));
-            card = if active {
-                card.bg(t.glass_active)
-                    .border_1()
-                    .border_color(t.accent_glow)
-            } else {
-                card.hover(|s| s.bg(t.glass_hover))
-            };
-
-            let close_sid = sid;
-            card = card
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(if active {
-                                    t.accent
-                                } else {
-                                    t.text_ghost
-                                }))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(if active {
-                                            t.text_primary
-                                        } else {
-                                            t.text_secondary
-                                        })
-                                        .child(title),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(t.text_ghost)
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(t.text_secondary))
-                                .child("×")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.close_session(close_sid, cx);
-                                    }),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(t.text_muted)
-                        .line_clamp(1)
-                        .child(preview),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.select_session(sid, cx);
-                    }),
-                );
-
-            session_list = session_list.child(card);
+        if active {
+            row.bg(t.sidebar_row_active)
+                .border_1()
+                .border_color(t.sidebar_row_active_border)
+        } else {
+            row.hover(|style| style.bg(t.sidebar_row_hover))
         }
+    }
 
-        let mut host_list = div().flex().flex_col().gap_1().px_2();
-        if vault_status.unlocked {
-            if self.saved_hosts.is_empty() {
-                host_list = host_list.child(
-                    div().px_3().py_2().rounded_lg().bg(t.glass_hover).child(
-                        div()
-                            .text_xs()
-                            .text_color(t.text_muted)
-                            .child("No saved hosts yet"),
-                    ),
-                );
-            }
+    fn render_sidebar_section_heading(&self, label: &'static str, meta: String) -> Div {
+        let t = self.theme();
 
-            for host in &self.saved_hosts {
-                let selected = self
-                    .selected_host_id
-                    .as_ref()
-                    .is_some_and(|id| id == &host.id);
-                let host_id = host.id.clone();
-                let edit_id = host.id.clone();
-                let delete_id = host.id.clone();
+        div()
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(t.sidebar_section_label)
+                    .child(label),
+            )
+            .child(div().text_xs().text_color(t.sidebar_meta).child(meta))
+    }
 
-                let mut card = div()
-                    .px_3()
-                    .py_2()
-                    .rounded_lg()
-                    .cursor_pointer()
+    fn render_sidebar_header(&self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+        let mode_label = if self.selected_host_id.is_some() {
+            "SSH"
+        } else {
+            "LOCAL"
+        };
+
+        div()
+            .pt(px(34.0))
+            .px_4()
+            .pb_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
                     .flex()
-                    .flex_col()
-                    .gap(px(2.0));
-                card = if selected {
-                    card.bg(t.glass_active)
-                        .border_1()
-                        .border_color(t.accent_glow)
-                } else {
-                    card.hover(|s| s.bg(t.glass_hover))
-                };
-
-                card = card
+                    .items_center()
+                    .gap_3()
+                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(t.accent))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .justify_between()
+                            .gap_2()
                             .child(
                                 div()
-                                    .text_xs()
+                                    .text_sm()
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(if selected {
-                                        t.text_primary
-                                    } else {
-                                        t.text_secondary
-                                    })
-                                    .child(host.label.clone()),
+                                    .text_color(t.text_primary)
+                                    .child("Séance"),
                             )
                             .child(
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(t.text_ghost)
-                                            .child("✎")
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.begin_edit_host(&edit_id, cx);
-                                                }),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(t.text_ghost)
-                                            .child("×")
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.delete_saved_host(&delete_id, cx);
-                                                }),
-                                            ),
-                                    ),
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .rounded_full()
+                                    .bg(t.sidebar_row_hover)
+                                    .border_1()
+                                    .border_color(t.sidebar_edge)
+                                    .text_xs()
+                                    .text_color(t.sidebar_meta)
+                                    .child(mode_label),
                             ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(t.text_muted)
-                            .line_clamp(1)
-                            .child(format!("{}@{}:{}", host.username, host.hostname, host.port)),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.selected_host_id = Some(host_id.clone());
-                            this.connect_saved_host(&host_id, cx);
-                        }),
-                    );
-
-                host_list = host_list.child(card);
-            }
-        } else {
-            host_list = host_list.child(
-                div().px_3().py_2().rounded_lg().bg(t.glass_hover).child(
-                    div()
-                        .text_xs()
-                        .text_color(t.text_muted)
-                        .child("Unlock the vault to view saved hosts"),
-                ),
-            );
-        }
-
-        let mut footer = div()
-            .px_3()
-            .pb_3()
-            .flex()
-            .flex_col()
-            .gap_2()
+                    ),
+            )
             .child(
                 div()
                     .px_2()
-                    .py(px(6.0))
-                    .rounded_md()
+                    .py(px(4.0))
+                    .rounded_lg()
                     .border_1()
-                    .border_color(t.glass_border)
-                    .flex()
-                    .items_center()
-                    .gap_2()
+                    .border_color(t.sidebar_edge)
+                    .bg(t.sidebar_row_hover)
+                    .text_xs()
+                    .text_color(t.text_muted)
                     .cursor_pointer()
-                    .hover(|s| s.bg(t.glass_hover))
-                    .child(div().text_xs().text_color(t.text_ghost).child("⌘K"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(t.text_muted)
-                            .child("Command Palette"),
-                    )
+                    .hover(|style| {
+                        style
+                            .bg(t.sidebar_row_active)
+                            .border_color(t.sidebar_edge_bright)
+                            .text_color(t.text_secondary)
+                    })
+                    .child("⌘K")
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -1588,31 +1704,347 @@ impl SeanceWorkspace {
                         }),
                     ),
             )
+    }
+
+    fn render_host_row(&self, host: &HostSummary, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+        let selected = self
+            .selected_host_id
+            .as_ref()
+            .is_some_and(|id| id == &host.id);
+        let host_id = host.id.clone();
+        let edit_id = host.id.clone();
+        let delete_id = host.id.clone();
+        let label = host.label.clone();
+        let target = format!("{}@{}:{}", host.username, host.hostname, host.port);
+        let active_pinline = if selected {
+            t.accent
+        } else {
+            t.sidebar_row_hover
+        };
+
+        self.sidebar_row_shell(selected)
             .child(
                 div()
-                    .px_2()
-                    .py(px(4.0))
-                    .rounded_md()
+                    .w(px(2.0))
+                    .h(px(22.0))
+                    .rounded_full()
+                    .bg(active_pinline),
+            )
+            .child(
+                div()
+                    .flex_1()
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(t.glass_hover))
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if selected {
+                                t.text_primary
+                            } else {
+                                t.text_secondary
+                            })
+                            .line_clamp(1)
+                            .child(label),
+                    )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(if vault_status.unlocked {
-                                t.accent
-                            } else {
-                                t.warning
-                            })
-                            .child("•"),
+                            .text_color(t.sidebar_meta)
+                            .line_clamp(1)
+                            .child(target),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if selected { t.text_muted } else { t.text_ghost })
+                            .hover(|style| style.text_color(t.text_secondary))
+                            .child("✎")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.begin_edit_host(&edit_id, cx);
+                                }),
+                            ),
                     )
-                    .child(div().text_xs().text_color(t.text_muted).child(
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if selected { t.text_muted } else { t.text_ghost })
+                            .hover(|style| style.text_color(t.warning))
+                            .child("×")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.delete_saved_host(&delete_id, cx);
+                                }),
+                            ),
+                    ),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.selected_host_id = Some(host_id.clone());
+                    this.connect_saved_host(&host_id, window, cx);
+                }),
+            )
+    }
+
+    fn render_session_row(
+        &self,
+        session: &Arc<dyn TerminalSession>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let t = self.theme();
+        let active = session.id() == self.active_session_id;
+        let sid = session.id();
+        let title = session.title().to_string();
+        let snapshot = session.snapshot();
+        let preview =
+            session_preview_text(&snapshot.rows).unwrap_or_else(|| "waiting for output…".into());
+        let close_sid = sid;
+
+        self.sidebar_row_shell(active)
+            .child(
+                div()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .mt(px(1.0))
+                    .rounded_full()
+                    .bg(if active { t.accent } else { t.sidebar_meta }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(if active {
+                                        t.text_primary
+                                    } else {
+                                        t.text_secondary
+                                    })
+                                    .line_clamp(1)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if active { t.accent } else { t.sidebar_meta })
+                                    .child(if active {
+                                        "live".into()
+                                    } else {
+                                        format!("#{sid}")
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(t.sidebar_meta)
+                            .line_clamp(1)
+                            .child(preview),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(if active { t.text_muted } else { t.text_ghost })
+                    .hover(|style| style.text_color(t.text_secondary))
+                    .child("×")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.close_session(close_sid, cx);
+                        }),
+                    ),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.select_session(sid, cx);
+                }),
+            )
+    }
+
+    fn render_hosts_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+        let unlocked = self.vault_unlocked();
+        let meta = if unlocked {
+            self.saved_hosts.len().to_string()
+        } else {
+            "locked".into()
+        };
+
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.render_sidebar_section_heading("HOSTS", meta));
+
+        if unlocked {
+            if self.saved_hosts.is_empty() {
+                section = section.child(
+                    div()
+                        .px_3()
+                        .text_xs()
+                        .text_color(t.sidebar_meta)
+                        .child("No saved hosts yet"),
+                );
+            } else {
+                let mut rows = div().flex().flex_col().gap_1().px_2();
+                for host in &self.saved_hosts {
+                    rows = rows.child(self.render_host_row(host, cx));
+                }
+                section = section.child(rows);
+            }
+        } else {
+            section = section.child(
+                div()
+                    .mx_2()
+                    .px_3()
+                    .py(px(10.0))
+                    .rounded_xl()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(t.sidebar_row_hover))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(t.text_muted)
+                            .child("Unlock vault to view saved hosts"),
+                    )
+                    .child(div().text_xs().text_color(t.sidebar_meta).child("unlock"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.unlock_form.reset_for_unlock();
+                            this.unlock_form.message =
+                                Some("Enter the recovery passphrase to unlock the vault.".into());
+                            this.perf_overlay.mark_input(RedrawReason::Input);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+
+        section
+    }
+
+    fn render_recents_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.render_sidebar_section_heading("RECENTS", self.sessions.len().to_string()))
+            .child(
+                div().px_2().flex().justify_end().child(
+                    div()
+                        .px_2()
+                        .py(px(3.0))
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(t.sidebar_meta)
+                        .hover(|style| style.bg(t.sidebar_row_hover).text_color(t.text_secondary))
+                        .child("+ local")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.spawn_session(window, cx);
+                            }),
+                        ),
+                ),
+            );
+
+        if self.sessions.is_empty() {
+            section = section.child(
+                div()
+                    .px_3()
+                    .text_xs()
+                    .text_color(t.sidebar_meta)
+                    .child("No active sessions"),
+            );
+        } else {
+            let mut rows = div().flex().flex_col().gap_1().px_2();
+            for session in &self.sessions {
+                rows = rows.child(self.render_session_row(session, cx));
+            }
+            section = section.child(rows);
+        }
+
+        section
+    }
+
+    fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+        let vault_status = self.backend.vault_status();
+
+        let mut footer = div()
+            .px_3()
+            .pb_3()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .px_2()
+                    .py(px(6.0))
+                    .rounded_lg()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(t.sidebar_row_hover))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if vault_status.unlocked {
+                                        t.accent
+                                    } else {
+                                        t.warning
+                                    })
+                                    .child("•"),
+                            )
+                            .child(div().text_xs().text_color(t.text_muted).child(
+                                if vault_status.unlocked {
+                                    "Vault unlocked"
+                                } else {
+                                    "Unlock vault"
+                                },
+                            )),
+                    )
+                    .child(div().text_xs().text_color(t.sidebar_meta).child(
                         if vault_status.unlocked {
-                            "Vault unlocked"
+                            "lock"
                         } else {
-                            "Unlock vault"
+                            "open"
                         },
                     ))
                     .on_mouse_down(
@@ -1625,6 +2057,7 @@ impl SeanceWorkspace {
                                 this.unlock_form.message = Some(
                                     "Enter the recovery passphrase to unlock the vault.".into(),
                                 );
+                                this.perf_overlay.mark_input(RedrawReason::Input);
                                 cx.notify();
                             }
                         }),
@@ -1633,21 +2066,29 @@ impl SeanceWorkspace {
             .child(
                 div()
                     .px_2()
-                    .py(px(4.0))
-                    .rounded_md()
+                    .py(px(6.0))
+                    .rounded_lg()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .justify_between()
                     .cursor_pointer()
-                    .hover(|s| s.bg(t.glass_hover))
-                    .child(div().text_xs().text_color(t.accent).child("◑"))
-                    .child(div().text_xs().text_color(t.text_muted).child(t.name))
+                    .hover(|style| style.bg(t.sidebar_row_hover))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_xs().text_color(t.accent).child("◑"))
+                            .child(div().text_xs().text_color(t.text_muted).child(t.name)),
+                    )
+                    .child(div().text_xs().text_color(t.sidebar_meta).child("theme"))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             this.palette_open = true;
                             this.palette_query = "theme".into();
                             this.palette_selected = 0;
+                            this.perf_overlay.mark_input(RedrawReason::Palette);
                             cx.notify();
                         }),
                     ),
@@ -1657,14 +2098,19 @@ impl SeanceWorkspace {
             footer = footer.child(
                 div()
                     .px_2()
-                    .py(px(4.0))
-                    .rounded_md()
-                    .bg(t.glass_hover)
+                    .pt_2()
                     .text_xs()
-                    .text_color(t.text_muted)
+                    .text_color(t.sidebar_meta)
+                    .line_clamp(2)
                     .child(message),
             );
         }
+
+        footer
+    }
+
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme();
 
         div()
             .w(px(SIDEBAR_WIDTH))
@@ -1672,98 +2118,59 @@ impl SeanceWorkspace {
             .flex()
             .flex_col()
             .justify_between()
-            .bg(t.glass_tint)
+            .bg(t.sidebar_bg)
             .border_r_1()
-            .border_color(t.glass_border)
+            .border_color(t.sidebar_edge)
+            .child(div().h(px(1.0)).bg(t.sidebar_top_highlight))
             .child(
                 div()
+                    .flex_1()
                     .flex()
                     .flex_col()
-                    .gap_3()
+                    .justify_between()
+                    .bg(t.sidebar_bg_elevated)
                     .child(
                         div()
-                            .pt(px(38.0))
-                            .px_4()
-                            .pb_2()
                             .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().text_size(px(18.0)).text_color(t.accent).child("◈"))
+                            .flex_col()
+                            .gap_5()
+                            .child(self.render_sidebar_header(cx))
                             .child(
                                 div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(t.text_primary)
-                                    .child("Séance"),
+                                    .flex()
+                                    .flex_col()
+                                    .gap_5()
+                                    .child(self.render_hosts_section(cx))
+                                    .child(self.render_recents_section(cx)),
                             ),
                     )
-                    .child(
-                        div()
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(t.text_muted)
-                                    .child("SESSIONS"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py(px(2.0))
-                                    .rounded_md()
-                                    .text_xs()
-                                    .text_color(t.text_ghost)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(t.glass_hover).text_color(t.text_muted))
-                                    .child("+ new")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.spawn_session(cx);
-                                        }),
-                                    ),
-                            ),
-                    )
-                    .child(session_list)
-                    .child(
-                        div()
-                            .px_3()
-                            .pt_2()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(t.text_muted)
-                                    .child("VAULT"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(if vault_status.unlocked {
-                                        t.accent
-                                    } else {
-                                        t.warning
-                                    })
-                                    .child(if vault_status.unlocked {
-                                        "unlocked"
-                                    } else {
-                                        "locked"
-                                    }),
-                            ),
-                    )
-                    .child(host_list),
+                    .child(self.render_sidebar_footer(cx)),
             )
-            .child(footer)
     }
 
-    fn render_terminal_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_terminal_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+
+        div()
+            .flex_1()
+            .h_full()
+            .flex()
+            .child(
+                div()
+                    .w(px(2.0))
+                    .h_full()
+                    .border_l_1()
+                    .border_color(t.sidebar_edge_bright)
+                    .bg(t.shell_divider_glow),
+            )
+            .child(self.render_terminal_pane(window, cx))
+    }
+
+    fn render_terminal_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let t = self.theme();
 
         let base = div()
@@ -1825,27 +2232,35 @@ impl SeanceWorkspace {
                 );
         }
 
-        let session = self.active_session().unwrap();
-        let snapshot = session.snapshot();
-        let mut visible_lines = snapshot.lines;
-        if visible_lines.len() > self.active_terminal_rows {
-            let start = visible_lines.len() - self.active_terminal_rows;
-            visible_lines.drain(0..start);
-        }
-        self.perf_overlay.visible_line_count = visible_lines.len();
+        self.sync_terminal_surface(window);
+        self.perf_overlay.visible_line_count = self.terminal_surface.metrics.visible_rows;
+        let prepared = PreparedTerminalSurface {
+            rows: self.terminal_surface.rows.clone(),
+            line_height_px: self
+                .terminal_metrics
+                .unwrap_or(TerminalMetrics {
+                    cell_width_px: 8.0,
+                    cell_height_px: TERMINAL_LINE_HEIGHT_PX,
+                    line_height_px: TERMINAL_LINE_HEIGHT_PX,
+                    font_size_px: TERMINAL_FONT_SIZE_PX,
+                })
+                .line_height_px,
+        };
+        let exit_status = self
+            .active_session()
+            .and_then(|session| session.snapshot().exit_status);
 
-        let mut term = base
-            .p_4()
-            .font_family(TERMINAL_FONT_FAMILY)
-            .text_size(px(TERMINAL_FONT_SIZE_PX))
-            .line_height(px(TERMINAL_LINE_HEIGHT_PX))
-            .text_color(t.text_primary);
+        let mut term = base.p_4().child(
+            canvas(
+                move |_bounds, _window, _cx| prepared,
+                move |bounds, prepared, window, cx| {
+                    paint_terminal_surface(bounds, prepared, window, cx);
+                },
+            )
+            .size_full(),
+        );
 
-        for line in visible_lines {
-            term = term.child(render_terminal_line(&line, &t));
-        }
-
-        if let Some(exit_status) = snapshot.exit_status {
+        if let Some(exit_status) = exit_status {
             term = term.child(
                 div()
                     .mt_3()
@@ -1857,6 +2272,11 @@ impl SeanceWorkspace {
 
         trace!(
             visible_line_count = self.perf_overlay.visible_line_count,
+            visible_cell_count = self.terminal_surface.metrics.visible_cells,
+            fragments = self.terminal_surface.metrics.fragments,
+            background_quads = self.terminal_surface.metrics.background_quads,
+            special_glyph_cells = self.terminal_surface.metrics.special_glyph_cells,
+            wide_cells = self.terminal_surface.metrics.wide_cells,
             palette_open = self.palette_open,
             "rendered terminal pane"
         );
@@ -1943,8 +2363,8 @@ impl SeanceWorkspace {
                 )
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.execute_palette_action(action.clone(), cx);
+                    cx.listener(move |this, _, window, cx| {
+                        this.execute_palette_action(action.clone(), window, cx);
                     }),
                 );
 
@@ -2200,10 +2620,10 @@ impl SeanceWorkspace {
                 .flex()
                 .items_center()
                 .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(t.text_ghost)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(t.text_ghost)
                         .child("tab move  esc cancel  enter on auth order saves"),
                 )
                 .child(
@@ -2239,6 +2659,7 @@ impl SeanceWorkspace {
             &self.perf_overlay,
             self.active_session_id,
             self.palette_open,
+            self.terminal_surface.metrics,
         );
 
         let mut panel = div()
@@ -2286,8 +2707,11 @@ impl SeanceWorkspace {
         if matches!(self.perf_overlay.mode, UiPerfMode::Expanded) {
             for (label, value) in expanded_rows {
                 let color = match label {
-                    "idle" => {
-                        perf_status_color(self.perf_overlay.idle_refresh_percentage() < 80.0, &t)
+                    "present/ui" => {
+                        let ui_refreshes = self.perf_overlay.ui_refreshes_last_second();
+                        let ok = ui_refreshes == 0
+                            || self.perf_overlay.frames_presented_last_second() <= ui_refreshes;
+                        perf_status_color(ok, &t)
                     }
                     "dirty" => perf_status_color(self.perf_overlay.active_session_dirty(), &t),
                     "palette" => perf_status_color(self.palette_open, &t),
@@ -2402,50 +2826,429 @@ fn compute_terminal_geometry(
     .ok()
 }
 
-fn render_terminal_line(line: &TerminalLine, theme: &Theme) -> StyledText {
-    let (text, runs) = build_text_runs(line, theme);
-    StyledText::new(text).with_runs(runs)
+fn session_preview_text(rows: &[TerminalRow]) -> Option<String> {
+    rows.iter()
+        .rev()
+        .map(TerminalRow::plain_text)
+        .find(|line| !line.trim().is_empty())
 }
 
-fn build_text_runs(line: &TerminalLine, theme: &Theme) -> (SharedString, Vec<TextRun>) {
-    if line.spans.is_empty() {
-        let text: SharedString = " ".into();
-        let runs = vec![text_run("Menlo", " ", TerminalCellStyle::default(), theme)];
-        return (text, runs);
+fn build_terminal_surface_rows(
+    rows: &[TerminalRow],
+    geometry: TerminalGeometry,
+    metrics: TerminalMetrics,
+    theme_id: ThemeId,
+    theme: &Theme,
+    shape_cache: &mut ShapeCache,
+    window: &mut Window,
+) -> (Vec<TerminalPaintRow>, TerminalRendererMetrics) {
+    let visible_cols = geometry.size.cols as usize;
+    let visible_rows = geometry.size.rows as usize;
+    let start = rows.len().saturating_sub(visible_rows);
+    let visible = &rows[start..];
+    let mut renderer_metrics = TerminalRendererMetrics {
+        visible_rows: visible.len(),
+        visible_cells: visible.len() * visible_cols,
+        ..Default::default()
+    };
+    let mut paint_rows = Vec::with_capacity(visible.len());
+
+    for (row_index, row) in visible.iter().enumerate() {
+        paint_rows.push(build_terminal_paint_row(
+            row,
+            row_index,
+            visible_cols,
+            metrics,
+            theme_id,
+            theme,
+            shape_cache,
+            window,
+            &mut renderer_metrics,
+        ));
     }
 
-    let mut text = String::new();
-    let mut runs = Vec::with_capacity(line.spans.len());
-
-    for span in &line.spans {
-        text.push_str(&span.text);
-        runs.push(text_run("Menlo", &span.text, span.style, theme));
-    }
-
-    (text.into(), runs)
+    (paint_rows, renderer_metrics)
 }
 
-fn text_run(family: &'static str, text: &str, style: TerminalCellStyle, theme: &Theme) -> TextRun {
-    let mut terminal_font = font(family);
-    if style.bold {
+fn build_terminal_paint_row(
+    row: &TerminalRow,
+    row_index: usize,
+    visible_cols: usize,
+    metrics: TerminalMetrics,
+    theme_id: ThemeId,
+    theme: &Theme,
+    shape_cache: &mut ShapeCache,
+    window: &mut Window,
+    renderer_metrics: &mut TerminalRendererMetrics,
+) -> TerminalPaintRow {
+    let fragment_plans = terminal_fragment_plans(row, visible_cols, theme, renderer_metrics);
+    let backgrounds = terminal_background_quads(row, visible_cols, metrics, theme);
+    let underlines = terminal_underline_quads(row, visible_cols, metrics, theme);
+    let mut fragments = Vec::with_capacity(fragment_plans.len());
+
+    for plan in fragment_plans {
+        if plan.text.is_empty() {
+            continue;
+        }
+        let line = shape_terminal_fragment(
+            &plan,
+            metrics,
+            theme_id,
+            theme,
+            shape_cache,
+            window,
+            renderer_metrics,
+        );
+        fragments.push(TerminalPaintFragment {
+            x: px(plan.start_col as f32 * metrics.cell_width_px),
+            line,
+        });
+    }
+
+    renderer_metrics.fragments += fragments.len();
+    renderer_metrics.background_quads += backgrounds.len() + underlines.len();
+
+    TerminalPaintRow {
+        y: px(row_index as f32 * metrics.line_height_px),
+        backgrounds,
+        underlines,
+        fragments,
+    }
+}
+
+fn terminal_fragment_plans(
+    row: &TerminalRow,
+    visible_cols: usize,
+    theme: &Theme,
+    renderer_metrics: &mut TerminalRendererMetrics,
+) -> Vec<TerminalFragmentPlan> {
+    let mut plans = Vec::new();
+    let mut current_col = 0;
+    let mut current: Option<TerminalFragmentPlan> = None;
+
+    for cell in &row.cells {
+        if current_col >= visible_cols {
+            break;
+        }
+
+        let cell_width = usize::from(cell.width.max(1));
+        if current_col + cell_width > visible_cols {
+            break;
+        }
+
+        let glyph_policy = terminal_glyph_policy(cell);
+        if matches!(glyph_policy, TerminalGlyphPolicy::PerCellSpecial) {
+            renderer_metrics.special_glyph_cells += cell_width;
+        }
+        if matches!(glyph_policy, TerminalGlyphPolicy::WideCell) {
+            renderer_metrics.wide_cells += 1;
+        }
+
+        let is_blank = cell.text.chars().all(|ch| ch == ' ');
+        if is_blank {
+            if let Some(plan) = current.take() {
+                plans.push(plan);
+            }
+            current_col += cell_width;
+            continue;
+        }
+
+        let should_merge = current.as_ref().is_some_and(|plan| {
+            plan.style == cell.style
+                && plan.glyph_policy == glyph_policy
+                && plan.start_col + plan.cell_count == current_col
+                && glyph_policy == TerminalGlyphPolicy::GroupableAscii
+        });
+
+        if should_merge {
+            let plan = current.as_mut().expect("current fragment exists");
+            plan.text.push_str(&cell.text);
+            plan.cell_count += cell_width;
+        } else {
+            if let Some(plan) = current.take() {
+                plans.push(plan);
+            }
+            current = Some(TerminalFragmentPlan {
+                text: cell.text.clone(),
+                style: cell.style,
+                glyph_policy,
+                start_col: current_col,
+                cell_count: cell_width,
+            });
+        }
+
+        current_col += cell_width;
+    }
+
+    if let Some(plan) = current.take() {
+        plans.push(plan);
+    }
+
+    let _ = theme;
+    plans
+}
+
+fn terminal_background_quads(
+    row: &TerminalRow,
+    visible_cols: usize,
+    metrics: TerminalMetrics,
+    theme: &Theme,
+) -> Vec<TerminalPaintQuad> {
+    let mut quads = Vec::new();
+    let mut current_col = 0;
+    let mut run_start = 0;
+    let mut run_width = 0;
+    let mut run_color: Option<gpui::Hsla> = None;
+
+    for cell in &row.cells {
+        if current_col >= visible_cols {
+            break;
+        }
+
+        let cell_width = usize::from(cell.width.max(1));
+        if current_col + cell_width > visible_cols {
+            break;
+        }
+
+        let cell_color = cell.style.background.map(terminal_color_to_hsla);
+        if cell_color == run_color {
+            run_width += cell_width;
+        } else {
+            if let Some(color) = run_color {
+                quads.push(TerminalPaintQuad {
+                    x: px(run_start as f32 * metrics.cell_width_px),
+                    width: px(run_width as f32 * metrics.cell_width_px),
+                    color,
+                });
+            }
+            run_start = current_col;
+            run_width = cell_width;
+            run_color = cell_color;
+        }
+
+        current_col += cell_width;
+    }
+
+    if let Some(color) = run_color {
+        quads.push(TerminalPaintQuad {
+            x: px(run_start as f32 * metrics.cell_width_px),
+            width: px(run_width as f32 * metrics.cell_width_px),
+            color,
+        });
+    }
+
+    let _ = theme;
+    quads
+}
+
+fn terminal_underline_quads(
+    row: &TerminalRow,
+    visible_cols: usize,
+    metrics: TerminalMetrics,
+    theme: &Theme,
+) -> Vec<TerminalPaintQuad> {
+    let mut quads = Vec::new();
+    let mut current_col = 0;
+    let mut run_start = 0;
+    let mut run_width = 0;
+    let mut run_color: Option<gpui::Hsla> = None;
+
+    for cell in &row.cells {
+        if current_col >= visible_cols {
+            break;
+        }
+
+        let cell_width = usize::from(cell.width.max(1));
+        if current_col + cell_width > visible_cols {
+            break;
+        }
+
+        let cell_color = cell
+            .style
+            .underline
+            .then(|| resolve_terminal_foreground(cell.style, theme));
+        if cell_color == run_color {
+            run_width += cell_width;
+        } else {
+            if let Some(color) = run_color {
+                quads.push(TerminalPaintQuad {
+                    x: px(run_start as f32 * metrics.cell_width_px),
+                    width: px(run_width as f32 * metrics.cell_width_px),
+                    color,
+                });
+            }
+            run_start = current_col;
+            run_width = cell_width;
+            run_color = cell_color;
+        }
+
+        current_col += cell_width;
+    }
+
+    if let Some(color) = run_color {
+        quads.push(TerminalPaintQuad {
+            x: px(run_start as f32 * metrics.cell_width_px),
+            width: px(run_width as f32 * metrics.cell_width_px),
+            color,
+        });
+    }
+
+    quads
+}
+
+fn shape_terminal_fragment(
+    plan: &TerminalFragmentPlan,
+    metrics: TerminalMetrics,
+    theme_id: ThemeId,
+    theme: &Theme,
+    shape_cache: &mut ShapeCache,
+    window: &mut Window,
+    renderer_metrics: &mut TerminalRendererMetrics,
+) -> ShapedLine {
+    let color = resolve_terminal_foreground(plan.style, theme);
+    let key = ShapeCacheKey {
+        text: plan.text.clone(),
+        font_size_bits: metrics.font_size_px.to_bits(),
+        bold: plan.style.bold,
+        italic: plan.style.italic,
+        color: hsla_key(color),
+    };
+
+    if let Some(entry) = shape_cache.entries.get_mut(&key) {
+        shape_cache.generation = shape_cache.generation.saturating_add(1);
+        entry.last_used = shape_cache.generation;
+        renderer_metrics.shape_hits += 1;
+        return entry.line.clone();
+    }
+
+    renderer_metrics.shape_misses += 1;
+    let mut terminal_font = font(TERMINAL_FONT_FAMILY);
+    if plan.style.bold {
         terminal_font = terminal_font.bold();
     }
-    if style.italic {
+    if plan.style.italic {
         terminal_font = terminal_font.italic();
     }
 
-    TextRun {
-        len: text.len(),
-        font: terminal_font,
-        color: resolve_terminal_foreground(style, theme),
-        background_color: style.background.map(terminal_color_to_hsla),
-        underline: style.underline.then_some(UnderlineStyle {
-            thickness: px(1.0),
-            color: Some(resolve_terminal_foreground(style, theme)),
-            wavy: false,
-        }),
-        strikethrough: None,
+    let line = window.text_system().shape_line(
+        SharedString::from(plan.text.clone()),
+        px(metrics.font_size_px),
+        &[TextRun {
+            len: plan.text.len(),
+            font: terminal_font,
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }],
+        None,
+    );
+
+    shape_cache.generation = shape_cache.generation.saturating_add(1);
+    shape_cache.entries.insert(
+        key,
+        CachedShapeLine {
+            line: line.clone(),
+            last_used: shape_cache.generation,
+        },
+    );
+    evict_shape_cache(shape_cache, 2_048);
+    let _ = theme_id;
+    line
+}
+
+fn evict_shape_cache(shape_cache: &mut ShapeCache, limit: usize) {
+    if shape_cache.entries.len() <= limit {
+        return;
     }
+
+    if let Some((oldest_key, _)) = shape_cache
+        .entries
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(key, entry)| (key.clone(), entry.last_used))
+    {
+        shape_cache.entries.remove(&oldest_key);
+    }
+}
+
+fn hsla_key(color: gpui::Hsla) -> HslaKey {
+    HslaKey {
+        h: color.h.to_bits(),
+        s: color.s.to_bits(),
+        l: color.l.to_bits(),
+        a: color.a.to_bits(),
+    }
+}
+
+fn paint_terminal_surface(
+    bounds: Bounds<Pixels>,
+    surface: PreparedTerminalSurface,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let line_height = px(surface.line_height_px);
+
+    for row in surface.rows {
+        let row_origin = point(bounds.origin.x, bounds.origin.y + row.y);
+
+        for background in row.backgrounds {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(row_origin.x + background.x, row_origin.y),
+                    size(background.width, line_height),
+                ),
+                background.color,
+            ));
+        }
+
+        for fragment in row.fragments {
+            let _ = fragment.line.paint(
+                point(row_origin.x + fragment.x, row_origin.y),
+                line_height,
+                window,
+                cx,
+            );
+        }
+
+        for underline in row.underlines {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(
+                        row_origin.x + underline.x,
+                        row_origin.y + line_height - px(1.0),
+                    ),
+                    size(underline.width, px(1.0)),
+                ),
+                underline.color,
+            ));
+        }
+    }
+}
+
+fn terminal_glyph_policy(cell: &TerminalCell) -> TerminalGlyphPolicy {
+    if cell.width > 1 {
+        return TerminalGlyphPolicy::WideCell;
+    }
+
+    let mut chars = cell.text.chars();
+    let Some(first) = chars.next() else {
+        return TerminalGlyphPolicy::GroupableAscii;
+    };
+
+    if first.is_ascii() && !chars.any(|ch| !ch.is_ascii()) && !first.is_ascii_control() {
+        return TerminalGlyphPolicy::GroupableAscii;
+    }
+
+    let _ = is_terminal_special_glyph(first);
+    TerminalGlyphPolicy::PerCellSpecial
+}
+
+fn is_terminal_special_glyph(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2500..=0x257f | 0x2580..=0x259f | 0x2800..=0x28ff | 0xe000..=0xf8ff
+    )
 }
 
 fn resolve_terminal_foreground(style: TerminalCellStyle, theme: &Theme) -> gpui::Hsla {
@@ -2492,8 +3295,8 @@ fn terminal_color_to_hsla(color: TerminalColor) -> gpui::Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{FontStyle, FontWeight, size};
-    use seance_terminal::{TerminalLine, TerminalSpan};
+    use gpui::size;
+    use seance_terminal::{TerminalCell, TerminalRow};
 
     #[test]
     fn compute_geometry_uses_viewport_minus_sidebar_and_padding() {
@@ -2503,13 +3306,14 @@ mod tests {
                 cell_width_px: 8.0,
                 cell_height_px: 19.0,
                 line_height_px: 19.0,
+                font_size_px: 13.0,
             },
         )
         .expect("geometry");
 
-        assert_eq!(geometry.pixel_size.width_px, 988);
+        assert_eq!(geometry.pixel_size.width_px, 976);
         assert_eq!(geometry.pixel_size.height_px, 788);
-        assert_eq!(geometry.size.cols, 123);
+        assert_eq!(geometry.size.cols, 122);
         assert_eq!(geometry.size.rows, 41);
     }
 
@@ -2521,6 +3325,7 @@ mod tests {
                 cell_width_px: 20.0,
                 cell_height_px: 40.0,
                 line_height_px: 40.0,
+                font_size_px: 13.0,
             },
         )
         .expect("geometry");
@@ -2530,54 +3335,167 @@ mod tests {
     }
 
     #[test]
-    fn builds_runs_with_utf8_byte_lengths() {
-        let line = TerminalLine {
-            spans: vec![
-                TerminalSpan {
-                    text: "café".into(),
+    fn row_plans_preserve_visible_column_count() {
+        let row = TerminalRow {
+            cells: vec![
+                TerminalCell {
+                    text: "a".into(),
                     style: TerminalCellStyle::default(),
+                    width: 1,
                 },
-                TerminalSpan {
-                    text: " 👋".into(),
-                    style: TerminalCellStyle {
-                        bold: true,
-                        ..TerminalCellStyle::default()
-                    },
+                TerminalCell {
+                    text: "bc".into(),
+                    style: TerminalCellStyle::default(),
+                    width: 1,
+                },
+                TerminalCell {
+                    text: "界".into(),
+                    style: TerminalCellStyle::default(),
+                    width: 2,
                 },
             ],
         };
 
-        let (text, runs) = build_text_runs(&line, &ThemeId::ObsidianSmoke.theme());
+        let mut metrics = TerminalRendererMetrics::default();
+        let segments =
+            terminal_fragment_plans(&row, 6, &ThemeId::ObsidianSmoke.theme(), &mut metrics);
 
-        assert_eq!(text.as_ref(), "café 👋");
-        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), text.len());
-        assert_eq!(runs[0].len, "café".len());
-        assert_eq!(runs[1].len, " 👋".len());
-        assert_eq!(runs[1].font.weight, FontWeight::BOLD);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.cell_count)
+                .sum::<usize>(),
+            4
+        );
     }
 
     #[test]
-    fn maps_background_and_underline_styles() {
-        let line = TerminalLine {
-            spans: vec![TerminalSpan {
-                text: "styled".into(),
-                style: TerminalCellStyle {
-                    foreground: Some(TerminalColor { r: 255, g: 0, b: 0 }),
-                    background: Some(TerminalColor { r: 0, g: 0, b: 0 }),
-                    bold: false,
-                    italic: true,
-                    underline: true,
-                    ..TerminalCellStyle::default()
-                },
-            }],
+    fn special_glyphs_render_per_cell() {
+        let box_cell = TerminalCell {
+            text: "┌".into(),
+            style: TerminalCellStyle::default(),
+            width: 1,
+        };
+        let braille_cell = TerminalCell {
+            text: "⣶".into(),
+            style: TerminalCellStyle::default(),
+            width: 1,
+        };
+        let private_use_cell = TerminalCell {
+            text: "\u{e0b0}".into(),
+            style: TerminalCellStyle::default(),
+            width: 1,
+        };
+        let ascii_cell = TerminalCell {
+            text: "A".into(),
+            style: TerminalCellStyle::default(),
+            width: 1,
         };
 
-        let (_text, runs) = build_text_runs(&line, &ThemeId::ObsidianSmoke.theme());
+        assert_eq!(
+            terminal_glyph_policy(&box_cell),
+            TerminalGlyphPolicy::PerCellSpecial
+        );
+        assert_eq!(
+            terminal_glyph_policy(&braille_cell),
+            TerminalGlyphPolicy::PerCellSpecial
+        );
+        assert_eq!(
+            terminal_glyph_policy(&private_use_cell),
+            TerminalGlyphPolicy::PerCellSpecial
+        );
+        assert_eq!(
+            terminal_glyph_policy(&ascii_cell),
+            TerminalGlyphPolicy::GroupableAscii
+        );
+    }
 
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].font.style, FontStyle::Italic);
-        assert!(runs[0].background_color.is_some());
-        assert!(runs[0].underline.is_some());
+    #[test]
+    fn preview_text_uses_last_non_empty_row() {
+        let rows = vec![
+            TerminalRow::default(),
+            TerminalRow {
+                cells: vec![TerminalCell {
+                    text: "prompt$".into(),
+                    style: TerminalCellStyle::default(),
+                    width: 1,
+                }],
+            },
+        ];
+
+        assert_eq!(session_preview_text(&rows).as_deref(), Some("prompt$"));
+    }
+
+    #[test]
+    fn clips_wide_cells_at_visible_edge() {
+        let row = TerminalRow {
+            cells: vec![
+                TerminalCell {
+                    text: "A".into(),
+                    style: TerminalCellStyle::default(),
+                    width: 1,
+                },
+                TerminalCell {
+                    text: "界".into(),
+                    style: TerminalCellStyle::default(),
+                    width: 2,
+                },
+            ],
+        };
+
+        let mut metrics = TerminalRendererMetrics::default();
+        let segments =
+            terminal_fragment_plans(&row, 2, &ThemeId::ObsidianSmoke.theme(), &mut metrics);
+
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.cell_count)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "A");
+        assert_eq!(segments[0].cell_count, 1);
+    }
+
+    #[test]
+    fn background_quads_merge_adjacent_cells() {
+        let row = TerminalRow {
+            cells: vec![
+                TerminalCell {
+                    text: "A".into(),
+                    style: TerminalCellStyle {
+                        background: Some(TerminalColor { r: 1, g: 2, b: 3 }),
+                        ..TerminalCellStyle::default()
+                    },
+                    width: 1,
+                },
+                TerminalCell {
+                    text: "B".into(),
+                    style: TerminalCellStyle {
+                        background: Some(TerminalColor { r: 1, g: 2, b: 3 }),
+                        ..TerminalCellStyle::default()
+                    },
+                    width: 1,
+                },
+            ],
+        };
+
+        let quads = terminal_background_quads(
+            &row,
+            4,
+            TerminalMetrics {
+                cell_width_px: 8.0,
+                cell_height_px: 19.0,
+                line_height_px: 19.0,
+                font_size_px: 13.0,
+            },
+            &ThemeId::ObsidianSmoke.theme(),
+        );
+
+        assert_eq!(quads.len(), 1);
+        assert_eq!(quads[0].width, px(16.0));
     }
 
     #[test]
@@ -2603,23 +3521,91 @@ mod tests {
 
     #[test]
     fn frame_stats_compute_average_and_percentile() {
-        let samples = VecDeque::from(vec![
-            Duration::from_millis(10),
-            Duration::from_millis(12),
-            Duration::from_millis(18),
-            Duration::from_millis(20),
-        ]);
         let now = Instant::now();
-        let timestamps = VecDeque::from(vec![now, now, now]);
+        let render_samples = VecDeque::from(vec![
+            (now + Duration::from_millis(4), Duration::from_millis(4)),
+            (now + Duration::from_millis(9), Duration::from_millis(5)),
+            (now + Duration::from_millis(16), Duration::from_millis(7)),
+        ]);
+        let cadence_samples = VecDeque::from(vec![
+            (now + Duration::from_millis(10), Duration::from_millis(10)),
+            (now + Duration::from_millis(43), Duration::from_millis(33)),
+            (now + Duration::from_millis(93), Duration::from_millis(50)),
+        ]);
+        let timestamps = VecDeque::from(vec![
+            now,
+            now + Duration::from_millis(100),
+            now + Duration::from_millis(200),
+        ]);
 
-        let stats = build_frame_stats(9, &samples, &timestamps, RedrawReason::TerminalUpdate);
+        let stats = build_frame_stats(
+            9,
+            &render_samples,
+            &cadence_samples,
+            &timestamps,
+            RedrawReason::TerminalUpdate,
+        );
 
         assert_eq!(stats.frame_count_total, 9);
-        assert_eq!(stats.fps_1s, 3.0);
-        assert_eq!(stats.frame_time_last_ms, 20.0);
-        assert!((stats.frame_time_avg_ms - 15.0).abs() < 0.01);
-        assert_eq!(stats.frame_time_p95_ms, 20.0);
+        assert!((stats.fps_1s - 3.0).abs() < 0.01);
+        assert_eq!(stats.frame_time_last_ms, 7.0);
+        assert!((stats.frame_time_avg_ms - 5.3333335).abs() < 0.01);
+        assert_eq!(stats.frame_time_p95_ms, 7.0);
+        assert_eq!(stats.present_interval_last_ms, 50.0);
+        assert!((stats.present_interval_avg_ms - 31.0).abs() < 0.01);
+        assert_eq!(stats.present_interval_p95_ms, 50.0);
         assert_eq!(stats.redraw_reason, RedrawReason::TerminalUpdate);
+    }
+
+    #[test]
+    fn normalized_fps_counts_frames_in_window() {
+        let now = Instant::now();
+        let timestamps = VecDeque::from(vec![
+            now,
+            now + Duration::from_millis(250),
+            now + Duration::from_millis(500),
+        ]);
+
+        assert!((normalized_fps_1s(&timestamps) - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn refresh_and_present_counts_are_tracked_separately() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.mark_terminal_refresh_request(now, RedrawReason::TerminalUpdate, None);
+        state.mark_ui_refresh_request(now + Duration::from_millis(10), RedrawReason::UiRefresh);
+
+        assert_eq!(state.ui_refreshes_last_second(), 2);
+        assert_eq!(state.terminal_refreshes_last_second(), 1);
+        assert_eq!(state.frames_presented_last_second(), 0);
+
+        state.finish_render(
+            now + Duration::from_millis(16),
+            now + Duration::from_millis(20),
+        );
+
+        assert_eq!(state.ui_refreshes_last_second(), 2);
+        assert_eq!(state.terminal_refreshes_last_second(), 1);
+        assert_eq!(state.frames_presented_last_second(), 1);
+    }
+
+    #[test]
+    fn redraw_reason_is_consumed_on_present() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.mark_ui_refresh_request(now, RedrawReason::Palette);
+        assert_eq!(state.pending_redraw_reason, RedrawReason::Palette);
+
+        state.finish_render(
+            now + Duration::from_millis(8),
+            now + Duration::from_millis(16),
+        );
+
+        assert_eq!(state.frame_stats.redraw_reason, RedrawReason::Palette);
+        assert_eq!(state.pending_redraw_reason, RedrawReason::Unknown);
     }
 
     #[test]
@@ -2631,7 +3617,7 @@ mod tests {
         let rows = compact_perf_strings(&state);
         let labels = rows.into_iter().map(|(label, _)| label).collect::<Vec<_>>();
 
-        assert_eq!(labels, vec!["fps", "frame", "snapshot", "lines", "spans"]);
+        assert_eq!(labels, vec!["fps", "frame", "snapshot", "rows", "cells"]);
     }
 
     #[test]
@@ -2641,14 +3627,208 @@ mod tests {
         state.pending_redraw_reason = RedrawReason::Palette;
         state.frame_stats.redraw_reason = RedrawReason::Palette;
 
-        let rows = expanded_perf_strings(&state, 7, true);
+        let rows = expanded_perf_strings(&state, 7, true, TerminalRendererMetrics::default());
         let labels = rows.into_iter().map(|(label, _)| label).collect::<Vec<_>>();
 
-        assert!(labels.contains(&"refresh"));
+        assert!(labels.contains(&"ui refresh"));
+        assert!(labels.contains(&"terminal refresh"));
         assert!(labels.contains(&"presented"));
-        assert!(labels.contains(&"idle"));
+        assert!(labels.contains(&"present/ui"));
+        assert!(labels.contains(&"cadence"));
         assert!(labels.contains(&"visible"));
         assert!(labels.contains(&"reason"));
+        assert!(labels.contains(&"fragments"));
+    }
+
+    #[test]
+    fn present_intervals_are_trimmed_to_perf_window() {
+        let now = Instant::now();
+        let mut samples = VecDeque::from(vec![
+            (now - Duration::from_secs(2), Duration::from_millis(80_000)),
+            (now - Duration::from_millis(800), Duration::from_millis(16)),
+            (now - Duration::from_millis(100), Duration::from_millis(20)),
+        ]);
+
+        trim_timed_durations(&mut samples, now, PERF_WINDOW);
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples.front().unwrap().1, Duration::from_millis(16));
+        assert_eq!(samples.back().unwrap().1, Duration::from_millis(20));
+    }
+
+    #[test]
+    fn terminal_refresh_is_counted_as_ui_refresh() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.mark_terminal_refresh_request(now, RedrawReason::TerminalUpdate, None);
+
+        assert_eq!(state.ui_refreshes_last_second(), 1);
+        assert_eq!(state.terminal_refreshes_last_second(), 1);
+    }
+
+    #[test]
+    fn perf_mode_enable_resets_sampling_window() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Off);
+        let now = Instant::now();
+
+        state.mark_ui_refresh_request(now, RedrawReason::UiRefresh);
+        state.finish_render(
+            now + Duration::from_millis(8),
+            now + Duration::from_millis(16),
+        );
+        state.mode = UiPerfMode::Compact;
+        state.reset_sampling_window();
+
+        assert!(state.present_timestamps.is_empty());
+        assert!(state.present_intervals.is_empty());
+        assert!(state.render_cost_samples.is_empty());
+        assert!(state.ui_refresh_timestamps.is_empty());
+        assert!(state.terminal_refresh_timestamps.is_empty());
+        assert!(state.last_present_timestamp.is_none());
+        assert_eq!(state.frame_stats.frame_count_total, 0);
+    }
+
+    #[test]
+    fn frame_stats_ignore_stale_intervals_after_idle_gap() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.last_present_timestamp = Some(now - Duration::from_secs(3));
+        state
+            .present_intervals
+            .push_back((now - Duration::from_secs(3), Duration::from_secs(86)));
+        state
+            .render_cost_samples
+            .push_back((now - Duration::from_secs(3), Duration::from_secs(40)));
+        state
+            .present_timestamps
+            .push_back(now - Duration::from_secs(3));
+
+        state.finish_render(
+            now - Duration::from_millis(204),
+            now - Duration::from_millis(200),
+        );
+        state.finish_render(
+            now - Duration::from_millis(55),
+            now - Duration::from_millis(50),
+        );
+
+        assert_eq!(state.frame_stats.frame_time_last_ms, 5.0);
+        assert!(state.frame_stats.frame_time_avg_ms < 10.0);
+        assert!(state.frame_stats.frame_time_p95_ms < 10.0);
+        assert_eq!(state.frame_stats.present_interval_last_ms, 150.0);
+        assert!(state.frame_stats.present_interval_avg_ms < 2_900.0);
+        assert!(state.frame_stats.present_interval_p95_ms < 3_000.0);
+    }
+
+    #[test]
+    fn presented_and_ui_refresh_are_comparable() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.mark_ui_refresh_request(now, RedrawReason::UiRefresh);
+        state.mark_ui_refresh_request(now + Duration::from_millis(10), RedrawReason::Palette);
+        state.finish_render(
+            now + Duration::from_millis(16),
+            now + Duration::from_millis(20),
+        );
+
+        let rows = expanded_perf_strings(&state, 1, false, TerminalRendererMetrics::default());
+        let ratio = rows
+            .into_iter()
+            .find(|(label, _)| *label == "present/ui")
+            .map(|(_, value)| value)
+            .unwrap();
+
+        assert_eq!(ratio, "1/2");
+    }
+
+    #[test]
+    fn render_cost_and_cadence_are_computed_separately() {
+        let now = Instant::now();
+        let render_samples = VecDeque::from(vec![
+            (now + Duration::from_millis(4), Duration::from_millis(4)),
+            (now + Duration::from_millis(9), Duration::from_millis(5)),
+            (now + Duration::from_millis(16), Duration::from_millis(7)),
+        ]);
+        let cadence_samples = VecDeque::from(vec![
+            (now + Duration::from_millis(16), Duration::from_millis(16)),
+            (now + Duration::from_millis(49), Duration::from_millis(33)),
+            (now + Duration::from_millis(99), Duration::from_millis(50)),
+        ]);
+        let timestamps = VecDeque::from(vec![
+            now,
+            now + Duration::from_millis(250),
+            now + Duration::from_millis(500),
+        ]);
+
+        let stats = build_frame_stats(
+            3,
+            &render_samples,
+            &cadence_samples,
+            &timestamps,
+            RedrawReason::Input,
+        );
+
+        assert_eq!(stats.frame_time_last_ms, 7.0);
+        assert!((stats.frame_time_avg_ms - 5.3333335).abs() < 0.01);
+        assert_eq!(stats.frame_time_p95_ms, 7.0);
+        assert_eq!(stats.present_interval_last_ms, 50.0);
+        assert!((stats.present_interval_avg_ms - 33.0).abs() < 0.01);
+        assert_eq!(stats.present_interval_p95_ms, 50.0);
+    }
+
+    #[test]
+    fn stale_render_cost_samples_are_trimmed_to_perf_window() {
+        let now = Instant::now();
+        let mut samples = VecDeque::from(vec![
+            (now - Duration::from_secs(2), Duration::from_secs(2)),
+            (now - Duration::from_millis(300), Duration::from_millis(4)),
+            (now - Duration::from_millis(100), Duration::from_millis(5)),
+        ]);
+
+        trim_timed_durations(&mut samples, now, PERF_WINDOW);
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(average_duration_ms(&samples), 4.5);
+        assert!(percentile_duration_ms(&samples, 0.95) < 6.0);
+    }
+
+    #[test]
+    fn stale_cadence_samples_are_trimmed_to_perf_window() {
+        let now = Instant::now();
+        let mut samples = VecDeque::from(vec![
+            (now - Duration::from_secs(2), Duration::from_secs(30)),
+            (now - Duration::from_millis(200), Duration::from_millis(16)),
+            (now - Duration::from_millis(50), Duration::from_millis(20)),
+        ]);
+
+        trim_timed_durations(&mut samples, now, PERF_WINDOW);
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples.front().unwrap().1, Duration::from_millis(16));
+        assert_eq!(samples.back().unwrap().1, Duration::from_millis(20));
+    }
+
+    #[test]
+    fn focus_like_notify_pattern_does_not_inflate_frame_cost() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.finish_render(now, now + Duration::from_millis(4));
+        state.finish_render(
+            now + Duration::from_millis(80),
+            now + Duration::from_millis(85),
+        );
+        state.finish_render(
+            now + Duration::from_millis(200),
+            now + Duration::from_millis(206),
+        );
+
+        assert!(state.frame_stats.frame_time_last_ms <= 6.0);
+        assert!(state.frame_stats.frame_time_avg_ms <= 5.1);
+        assert!(state.frame_stats.present_interval_last_ms >= 100.0);
     }
 }
 
@@ -2659,7 +3839,10 @@ impl Focusable for SeanceWorkspace {
 }
 
 impl Render for SeanceWorkspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let perf_enabled = self.perf_overlay.mode.is_enabled();
+        let render_started_at = perf_enabled.then(Instant::now);
+
         let t = self.theme();
 
         let mut root = div()
@@ -2668,7 +3851,7 @@ impl Render for SeanceWorkspace {
             .bg(t.bg_deep)
             .text_color(t.text_primary)
             .child(self.render_sidebar(cx))
-            .child(self.render_terminal_pane(cx));
+            .child(self.render_terminal_shell(window, cx));
 
         if self.palette_open {
             root = root.child(deferred(self.render_palette_overlay(cx)).with_priority(1));
@@ -2681,6 +3864,10 @@ impl Render for SeanceWorkspace {
         }
         if self.perf_overlay.mode.is_enabled() {
             root = root.child(deferred(self.render_perf_overlay()).with_priority(4));
+        }
+
+        if let Some(started_at) = render_started_at {
+            self.perf_overlay.finish_render(started_at, Instant::now());
         }
 
         root
