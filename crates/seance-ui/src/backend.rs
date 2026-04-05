@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use seance_ssh::{ResolvedAuthMethod, SshConnectRequest, SshConnectionConfig, SshSessionManager};
+use seance_ssh::{
+    ResolvedAuthMethod, SftpEntry, SshConnectRequest, SshConnectionConfig, SshSessionManager,
+};
 use seance_terminal::{LocalSessionFactory, TerminalSession};
 use seance_vault::{
     CredentialSummary, GenerateKeyAlgorithm, GenerateKeyRequest, HostAuthRef, HostSummary,
@@ -11,7 +13,7 @@ use seance_vault::{
 
 pub struct UiBackend {
     vault: VaultStore,
-    ssh: SshSessionManager,
+    ssh: Arc<SshSessionManager>,
     local: LocalSessionFactory,
 }
 
@@ -19,9 +21,13 @@ impl UiBackend {
     pub fn new(vault: VaultStore) -> Result<Self> {
         Ok(Self {
             vault,
-            ssh: SshSessionManager::new()?,
+            ssh: Arc::new(SshSessionManager::new()?),
             local: LocalSessionFactory::default(),
         })
+    }
+
+    pub fn ssh_manager(&self) -> Arc<SshSessionManager> {
+        Arc::clone(&self.ssh)
     }
 
     pub fn vault_status(&self) -> VaultStatus {
@@ -117,7 +123,7 @@ impl UiBackend {
         })
     }
 
-    pub fn connect_host(&mut self, host_id: &str) -> Result<Arc<dyn TerminalSession>> {
+    pub fn build_connect_request(&self, host_id: &str) -> Result<SshConnectRequest> {
         let host = self
             .vault
             .load_host_profile(host_id)?
@@ -157,7 +163,7 @@ impl UiBackend {
             }
         }
 
-        let result = self.ssh.connect(SshConnectRequest {
+        Ok(SshConnectRequest {
             connection: SshConnectionConfig {
                 label: host.label,
                 hostname: host.hostname,
@@ -165,8 +171,39 @@ impl UiBackend {
                 username: host.username,
             },
             auth_order,
-        })?;
+        })
+    }
 
-        Ok(result.session as Arc<dyn TerminalSession>)
+    pub fn sftp_canonicalize(&self, session_id: u64, path: &str) -> Result<String> {
+        Ok(self.ssh.sftp_canonicalize(session_id, path)?)
+    }
+
+    pub fn sftp_list_dir(&self, session_id: u64, path: &str) -> Result<Vec<SftpEntry>> {
+        Ok(self.ssh.sftp_list_dir(session_id, path)?)
+    }
+
+    pub fn sftp_read_file(&self, session_id: u64, remote_path: &str) -> Result<Vec<u8>> {
+        Ok(self.ssh.sftp_read_file(session_id, remote_path)?)
+    }
+
+    pub fn sftp_write_file(
+        &self,
+        session_id: u64,
+        remote_path: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        Ok(self.ssh.sftp_write_file(session_id, remote_path, data)?)
+    }
+
+    pub fn sftp_mkdir(&self, session_id: u64, path: &str) -> Result<()> {
+        Ok(self.ssh.sftp_mkdir(session_id, path)?)
+    }
+
+    pub fn sftp_remove(&self, session_id: u64, path: &str, is_dir: bool) -> Result<()> {
+        Ok(self.ssh.sftp_remove(session_id, path, is_dir)?)
+    }
+
+    pub fn sftp_rename(&self, session_id: u64, old_path: &str, new_path: &str) -> Result<()> {
+        Ok(self.ssh.sftp_rename(session_id, old_path, new_path)?)
     }
 }

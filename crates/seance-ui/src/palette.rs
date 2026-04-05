@@ -44,6 +44,7 @@ pub enum PaletteAction {
     EditSavedHost(String),
     DeleteSavedHost(String),
     ConnectSavedHost(String),
+    OpenSftpBrowser(u64),
 }
 
 #[derive(Clone)]
@@ -131,6 +132,7 @@ pub fn build_items(
     active_theme: ThemeId,
     query: &str,
     vault_unlocked: bool,
+    remote_session_ids: &[u64],
 ) -> Vec<PaletteItem> {
     let mut items: Vec<PaletteItem> = Vec::new();
 
@@ -174,6 +176,24 @@ pub fn build_items(
             shortcut: Some("\u{2318}W"),
             match_indices: Vec::new(),
         });
+    }
+
+    for session in sessions {
+        if remote_session_ids.contains(&session.id()) {
+            let label = session_labels
+                .get(&session.id())
+                .cloned()
+                .unwrap_or_else(|| session.title().to_string());
+            items.push(PaletteItem {
+                glyph: "\u{25a4}",
+                label: format!("Browse Files: {label}"),
+                hint: "Open SFTP file browser".into(),
+                action: PaletteAction::OpenSftpBrowser(session.id()),
+                group: PaletteGroup::Sessions,
+                shortcut: None,
+                match_indices: Vec::new(),
+            });
+        }
     }
 
     // --- Hosts group ---
@@ -451,6 +471,7 @@ mod tests {
             ThemeId::ObsidianSmoke,
             "",
             false,
+            &[],
         );
 
         let switch_item = items

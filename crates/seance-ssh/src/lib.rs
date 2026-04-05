@@ -1,9 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
@@ -12,7 +9,9 @@ use russh::{
     Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, client, keys::PrivateKeyWithHashAlg,
 };
 use russh_sftp::client::SftpSession;
-use seance_terminal::{SharedSessionState, TerminalEmulator, TerminalGeometry, TerminalSession};
+use seance_terminal::{
+    SharedSessionState, TerminalEmulator, TerminalGeometry, TerminalSession, next_session_id,
+};
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, runtime::Runtime, sync::mpsc};
 
@@ -48,6 +47,16 @@ pub struct SftpBootstrapHandle {
 }
 
 #[derive(Debug, Clone)]
+pub struct SftpEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: Option<u32>,
+    pub permissions: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SshConnectResult {
     pub session: Arc<SshSessionHandle>,
     pub sftp: SftpBootstrapHandle,
@@ -65,6 +74,10 @@ pub enum SshError {
     Transport(String),
     #[error("SFTP bootstrap failed: {0}")]
     SftpBootstrap(String),
+    #[error("no SFTP session for this connection")]
+    SftpNotConnected,
+    #[error("SFTP operation failed: {0}")]
+    SftpOperation(String),
 }
 
 #[derive(Default)]
@@ -140,9 +153,15 @@ impl TerminalSession for SshSessionHandle {
 
 pub struct SshSessionManager {
     runtime: Runtime,
-    next_id: AtomicU64,
     sftp_sessions: Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<SftpSession>>>>>,
 }
+
+const _: () = {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    fn _assert() {
+        _assert_send_sync::<SshSessionManager>();
+    }
+};
 
 impl SshSessionManager {
     pub fn new() -> Result<Self> {
@@ -151,7 +170,6 @@ impl SshSessionManager {
                 .enable_all()
                 .build()
                 .context("failed to initialize SSH runtime")?,
-            next_id: AtomicU64::new(1),
             sftp_sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -160,7 +178,7 @@ impl SshSessionManager {
         &self,
         request: SshConnectRequest,
     ) -> std::result::Result<SshConnectResult, SshError> {
-        let session_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let session_id = next_session_id();
         self.runtime
             .block_on(self.connect_async(session_id, request))
     }
@@ -278,6 +296,197 @@ impl SshSessionManager {
         Ok(SftpBootstrapHandle {
             session_id,
             ready: true,
+        })
+    }
+
+    fn get_sftp(
+        &self,
+        session_id: u64,
+    ) -> std::result::Result<Arc<tokio::sync::Mutex<SftpSession>>, SshError> {
+        self.sftp_sessions
+            .lock()
+            .expect("sftp session map poisoned")
+            .get(&session_id)
+            .cloned()
+            .ok_or(SshError::SftpNotConnected)
+    }
+
+    pub fn sftp_canonicalize(
+        &self,
+        session_id: u64,
+        path: &str,
+    ) -> std::result::Result<String, SshError> {
+        let sftp = self.get_sftp(session_id)?;
+        let path = path.to_string();
+        self.runtime.block_on(async {
+            let session = sftp.lock().await;
+            session
+                .canonicalize(path)
+                .await
+                .map_err(|err| SshError::SftpOperation(err.to_string()))
+        })
+    }
+
+    pub fn sftp_list_dir(
+        &self,
+        session_id: u64,
+        path: &str,
+    ) -> std::result::Result<Vec<SftpEntry>, SshError> {
+        let sftp = self.get_sftp(session_id)?;
+        let path = path.to_string();
+        self.runtime.block_on(async {
+            let session = sftp.lock().await;
+            let dir = session
+                .read_dir(&path)
+                .await
+                .map_err(|err| SshError::SftpOperation(err.to_string()))?;
+
+            let mut entries = Vec::new();
+            for entry in dir {
+                let name = entry.file_name();
+                if name == "." {
+                    continue;
+                }
+                let entry_path = if path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{path}/{name}")
+                };
+                let is_dir = entry.metadata().is_dir();
+                let size = entry.metadata().size.unwrap_or(0);
+                let modified = entry.metadata().mtime;
+                let permissions = entry.metadata().permissions;
+                entries.push(SftpEntry {
+                    name,
+                    path: entry_path,
+                    is_dir,
+                    size,
+                    modified,
+                    permissions,
+                });
+            }
+            Ok(entries)
+        })
+    }
+
+    pub fn sftp_read_file(
+        &self,
+        session_id: u64,
+        remote_path: &str,
+    ) -> std::result::Result<Vec<u8>, SshError> {
+        let sftp = self.get_sftp(session_id)?;
+        let remote_path = remote_path.to_string();
+        self.runtime.block_on(async {
+            let session = sftp.lock().await;
+            session
+                .read(remote_path)
+                .await
+                .map_err(|err| SshError::SftpOperation(err.to_string()))
+        })
+    }
+
+    pub fn sftp_write_file(
+        &self,
+        session_id: u64,
+        remote_path: &str,
+        data: &[u8],
+    ) -> std::result::Result<(), SshError> {
+        let sftp = self.get_sftp(session_id)?;
+        let remote_path = remote_path.to_string();
+        let data = data.to_vec();
+        self.runtime.block_on(async {
+            let session = sftp.lock().await;
+            session
+                .write(remote_path, &data)
+                .await
+                .map_err(|err| SshError::SftpOperation(err.to_string()))
+        })
+    }
+
+    pub fn sftp_mkdir(
+        &self,
+        session_id: u64,
+        path: &str,
+    ) -> std::result::Result<(), SshError> {
+        let sftp = self.get_sftp(session_id)?;
+        let path = path.to_string();
+        self.runtime.block_on(async {
+            let session = sftp.lock().await;
+            session
+                .create_dir(path)
+                .await
+                .map_err(|err| SshError::SftpOperation(err.to_string()))
+        })
+    }
+
+    pub fn sftp_remove(
+        &self,
+        session_id: u64,
+        path: &str,
+        is_dir: bool,
+    ) -> std::result::Result<(), SshError> {
+        let sftp = self.get_sftp(session_id)?;
+        let path = path.to_string();
+        self.runtime.block_on(async {
+            let session = sftp.lock().await;
+            if is_dir {
+                session
+                    .remove_dir(path)
+                    .await
+                    .map_err(|err| SshError::SftpOperation(err.to_string()))
+            } else {
+                session
+                    .remove_file(path)
+                    .await
+                    .map_err(|err| SshError::SftpOperation(err.to_string()))
+            }
+        })
+    }
+
+    pub fn sftp_rename(
+        &self,
+        session_id: u64,
+        old_path: &str,
+        new_path: &str,
+    ) -> std::result::Result<(), SshError> {
+        let sftp = self.get_sftp(session_id)?;
+        let old_path = old_path.to_string();
+        let new_path = new_path.to_string();
+        self.runtime.block_on(async {
+            let session = sftp.lock().await;
+            session
+                .rename(old_path, new_path)
+                .await
+                .map_err(|err| SshError::SftpOperation(err.to_string()))
+        })
+    }
+
+    pub fn sftp_metadata(
+        &self,
+        session_id: u64,
+        path: &str,
+    ) -> std::result::Result<SftpEntry, SshError> {
+        let sftp = self.get_sftp(session_id)?;
+        let path_str = path.to_string();
+        self.runtime.block_on(async {
+            let session = sftp.lock().await;
+            let meta = session
+                .metadata(&path_str)
+                .await
+                .map_err(|err| SshError::SftpOperation(err.to_string()))?;
+            let name = path_str
+                .rsplit('/')
+                .next()
+                .unwrap_or(&path_str)
+                .to_string();
+            Ok(SftpEntry {
+                name,
+                path: path_str,
+                is_dir: meta.is_dir(),
+                size: meta.size.unwrap_or(0),
+                modified: meta.mtime,
+                permissions: meta.permissions,
+            })
         })
     }
 }

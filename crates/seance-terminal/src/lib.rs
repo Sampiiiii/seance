@@ -28,6 +28,13 @@ const DEFAULT_PIXEL_WIDTH: u16 = DEFAULT_COLS * DEFAULT_CELL_WIDTH_PX;
 const DEFAULT_PIXEL_HEIGHT: u16 = DEFAULT_ROWS * DEFAULT_CELL_HEIGHT_PX;
 const MAX_RENDERED_LINES: usize = 2_000;
 
+static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Returns a unique session id for any terminal session (local shell, SSH, etc.).
+pub fn next_session_id() -> u64 {
+    SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalSize {
     pub cols: u16,
@@ -428,21 +435,12 @@ impl TerminalSession for LocalSessionHandle {
     }
 }
 
-pub struct LocalSessionFactory {
-    next_id: AtomicU64,
-}
-
-impl Default for LocalSessionFactory {
-    fn default() -> Self {
-        Self {
-            next_id: AtomicU64::new(1),
-        }
-    }
-}
+#[derive(Default)]
+pub struct LocalSessionFactory;
 
 impl LocalSessionFactory {
     pub fn spawn(&self) -> Result<LocalSessionHandle> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = next_session_id();
         let title: Arc<str> = format!("local-{id}").into();
         spawn_local_session(id, title)
     }
