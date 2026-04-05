@@ -1,0 +1,9 @@
+[package]
+name = "seance-ui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+gpui = "0.2.2"
+seance-terminal = { path = "../seance-terminal" }

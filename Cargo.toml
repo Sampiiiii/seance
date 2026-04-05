@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/seance-app",
+    "crates/seance-config",
+    "crates/seance-ssh",
+    "crates/seance-terminal",
+    "crates/seance-ui",
+    "crates/seance-vault",
+]
+default-members = ["crates/seance-app"]
+resolver = "2"
