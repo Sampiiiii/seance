@@ -49,16 +49,15 @@ pub struct Theme {
     pub glass_hover: Hsla,
     pub glass_active: Hsla,
 
-    pub sidebar_bg: Hsla,
     pub sidebar_bg_elevated: Hsla,
     pub sidebar_edge: Hsla,
     pub sidebar_edge_bright: Hsla,
     pub sidebar_row_hover: Hsla,
     pub sidebar_row_active: Hsla,
-    pub sidebar_row_active_border: Hsla,
     pub sidebar_section_label: Hsla,
     pub sidebar_meta: Hsla,
-    pub sidebar_top_highlight: Hsla,
+    pub sidebar_separator: Hsla,
+    pub sidebar_indicator: Hsla,
     pub shell_divider_glow: Hsla,
 
     pub accent: Hsla,
@@ -72,6 +71,9 @@ pub struct Theme {
 
     pub warning: Hsla,
     pub scrim: Hsla,
+
+    pub palette_group_label: Hsla,
+    pub palette_group_separator: Hsla,
 }
 
 fn obsidian_smoke() -> Theme {
@@ -85,16 +87,15 @@ fn obsidian_smoke() -> Theme {
         glass_border_bright: alpha(0xffffff, 0.13),
         glass_hover: alpha(0xffffff, 0.04),
         glass_active: alpha(0xffffff, 0.09),
-        sidebar_bg: alpha(0x101014, 0.88),
         sidebar_bg_elevated: alpha(0x16171d, 0.94),
         sidebar_edge: alpha(0xffffff, 0.06),
         sidebar_edge_bright: alpha(0xffffff, 0.13),
         sidebar_row_hover: alpha(0xffffff, 0.035),
         sidebar_row_active: alpha(0x23242b, 0.96),
-        sidebar_row_active_border: alpha(0xffffff, 0.11),
         sidebar_section_label: solid(0x605c56),
         sidebar_meta: solid(0x5b5751),
-        sidebar_top_highlight: alpha(0xffffff, 0.16),
+        sidebar_separator: alpha(0xffffff, 0.05),
+        sidebar_indicator: alpha(0xc9885f, 0.80),
         shell_divider_glow: alpha(0xc9885f, 0.08),
         accent: solid(0xc9885f),
         accent_glow: alpha(0xc9885f, 0.14),
@@ -105,6 +106,8 @@ fn obsidian_smoke() -> Theme {
         text_ghost: solid(0x46423c),
         warning: solid(0xebcb8b),
         scrim: alpha(0x08070a, 0.85),
+        palette_group_label: solid(0x58534c),
+        palette_group_separator: alpha(0xffffff, 0.05),
     }
 }
 
@@ -119,16 +122,15 @@ fn midnight_frost() -> Theme {
         glass_border_bright: alpha(0x80b0e0, 0.15),
         glass_hover: alpha(0x80b0e0, 0.04),
         glass_active: alpha(0x80b0e0, 0.10),
-        sidebar_bg: alpha(0x0b1017, 0.88),
         sidebar_bg_elevated: alpha(0x0f1520, 0.94),
         sidebar_edge: alpha(0x80b0e0, 0.08),
         sidebar_edge_bright: alpha(0xb7d2ee, 0.16),
         sidebar_row_hover: alpha(0x80b0e0, 0.035),
         sidebar_row_active: alpha(0x141d2a, 0.96),
-        sidebar_row_active_border: alpha(0x9cc0e6, 0.15),
         sidebar_section_label: solid(0x64788a),
         sidebar_meta: solid(0x5f7487),
-        sidebar_top_highlight: alpha(0xb7d2ee, 0.18),
+        sidebar_separator: alpha(0x80b0e0, 0.06),
+        sidebar_indicator: alpha(0x5b9bd5, 0.80),
         shell_divider_glow: alpha(0x5b9bd5, 0.08),
         accent: solid(0x5b9bd5),
         accent_glow: alpha(0x5b9bd5, 0.14),
@@ -139,6 +141,8 @@ fn midnight_frost() -> Theme {
         text_ghost: solid(0x354555),
         warning: solid(0xe5c07b),
         scrim: alpha(0x060a10, 0.85),
+        palette_group_label: solid(0x4a6078),
+        palette_group_separator: alpha(0x80b0e0, 0.06),
     }
 }
 
@@ -153,16 +157,15 @@ fn bone() -> Theme {
         glass_border_bright: alpha(0x000000, 0.14),
         glass_hover: alpha(0x000000, 0.03),
         glass_active: alpha(0x000000, 0.07),
-        sidebar_bg: alpha(0xf2ede5, 0.92),
         sidebar_bg_elevated: alpha(0xf7f1e8, 0.96),
         sidebar_edge: alpha(0x000000, 0.08),
         sidebar_edge_bright: alpha(0x000000, 0.14),
         sidebar_row_hover: alpha(0x000000, 0.028),
         sidebar_row_active: alpha(0xffffff, 0.72),
-        sidebar_row_active_border: alpha(0x000000, 0.10),
         sidebar_section_label: solid(0x857b70),
         sidebar_meta: solid(0x8a8278),
-        sidebar_top_highlight: alpha(0xffffff, 0.65),
+        sidebar_separator: alpha(0x000000, 0.06),
+        sidebar_indicator: alpha(0x8b5e3c, 0.80),
         shell_divider_glow: alpha(0x8b5e3c, 0.07),
         accent: solid(0x8b5e3c),
         accent_glow: alpha(0x8b5e3c, 0.10),
@@ -173,6 +176,8 @@ fn bone() -> Theme {
         text_ghost: solid(0xb8b0a6),
         warning: solid(0xb8860b),
         scrim: alpha(0x1a1816, 0.50),
+        palette_group_label: solid(0x9a9088),
+        palette_group_separator: alpha(0x000000, 0.06),
     }
 }
 
@@ -187,16 +192,15 @@ fn phosphor() -> Theme {
         glass_border_bright: alpha(0x33ff66, 0.12),
         glass_hover: alpha(0x33ff66, 0.03),
         glass_active: alpha(0x33ff66, 0.08),
-        sidebar_bg: alpha(0x050805, 0.92),
         sidebar_bg_elevated: alpha(0x081008, 0.96),
         sidebar_edge: alpha(0x33ff66, 0.07),
         sidebar_edge_bright: alpha(0x33ff66, 0.13),
         sidebar_row_hover: alpha(0x33ff66, 0.03),
         sidebar_row_active: alpha(0x0b160b, 0.97),
-        sidebar_row_active_border: alpha(0x33ff66, 0.12),
         sidebar_section_label: solid(0x188c32),
         sidebar_meta: solid(0x168830),
-        sidebar_top_highlight: alpha(0x33ff66, 0.16),
+        sidebar_separator: alpha(0x33ff66, 0.05),
+        sidebar_indicator: alpha(0x33ff66, 0.80),
         shell_divider_glow: alpha(0x33ff66, 0.07),
         accent: solid(0x33ff66),
         accent_glow: alpha(0x33ff66, 0.12),
@@ -207,5 +211,7 @@ fn phosphor() -> Theme {
         text_ghost: solid(0x0a4418),
         warning: solid(0xffcc33),
         scrim: alpha(0x040604, 0.90),
+        palette_group_label: solid(0x0e6624),
+        palette_group_separator: alpha(0x33ff66, 0.04),
     }
 }

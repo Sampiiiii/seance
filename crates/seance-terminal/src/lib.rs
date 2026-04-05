@@ -292,7 +292,6 @@ impl SharedSessionState {
         state.exit_status = Some("startup error".to_string());
         let _ = self.notify_tx.try_send(());
     }
-
 }
 
 pub struct TerminalEmulator {
@@ -312,7 +311,8 @@ impl TerminalEmulator {
                 max_scrollback: 10_000,
             })
             .context("failed to initialize Ghostty terminal")?,
-            render_state: RenderState::new().context("failed to initialize Ghostty render state")?,
+            render_state: RenderState::new()
+                .context("failed to initialize Ghostty render state")?,
             row_iterator: RowIterator::new().context("failed to create Ghostty row iterator")?,
             cell_iterator: CellIterator::new().context("failed to create Ghostty cell iterator")?,
             pending_vt_bytes: 0,
@@ -779,8 +779,7 @@ mod tests {
     }
 
     fn last_non_empty_row(rows: &[TerminalRow]) -> &TerminalRow {
-        rows
-            .iter()
+        rows.iter()
             .rev()
             .find(|row| !row.plain_text().trim().is_empty())
             .expect("non-empty line")
@@ -832,14 +831,8 @@ mod tests {
 
         assert_eq!(row.cells[0].text, "X");
         assert_eq!(row.cells[1].text, "Y");
-        assert_eq!(
-            row.cells[0].style.foreground,
-            row.cells[1].style.background
-        );
-        assert_eq!(
-            row.cells[0].style.background,
-            row.cells[1].style.foreground
-        );
+        assert_eq!(row.cells[0].style.foreground, row.cells[1].style.background);
+        assert_eq!(row.cells[0].style.background, row.cells[1].style.foreground);
         assert!(row.cells[1].style.inverse);
     }
 
@@ -849,7 +842,11 @@ mod tests {
         let row = last_non_empty_row(&rows);
 
         assert_eq!(row.plain_text().trim_end(), "hi 👋 café");
-        assert!(row.cells.iter().any(|cell| cell.text == "👋" && cell.width == 2));
+        assert!(
+            row.cells
+                .iter()
+                .any(|cell| cell.text == "👋" && cell.width == 2)
+        );
     }
 
     #[test]
@@ -926,8 +923,13 @@ mod tests {
             perf.snapshot.terminal.snapshot_seq = 3;
         }
 
-        let handle =
-            LocalSessionHandle::new(1, Arc::<str>::from("test"), state, mpsc::channel().0, _notify_rx);
+        let handle = LocalSessionHandle::new(
+            1,
+            Arc::<str>::from("test"),
+            state,
+            mpsc::channel().0,
+            _notify_rx,
+        );
 
         let first = handle.perf_snapshot();
         let second = handle.perf_snapshot();

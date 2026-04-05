@@ -26,10 +26,12 @@ use tracing::trace;
 use zeroize::Zeroizing;
 
 use backend::UiBackend;
-use palette::{PaletteAction, build_items};
+use palette::{PaletteAction, PaletteGroup, build_items};
 use theme::{Theme, ThemeId};
 
-const SIDEBAR_WIDTH: f32 = 272.0;
+const SIDEBAR_WIDTH: f32 = 260.0;
+const SIDEBAR_FONT_MONO: &str = "JetBrains Mono";
+const SIDEBAR_MONO_SIZE_PX: f32 = 11.0;
 const PERF_HISTORY_LIMIT: usize = 120;
 const PERF_WINDOW: Duration = Duration::from_secs(1);
 const TERMINAL_FONT_FAMILY: &str = "Menlo";
@@ -53,6 +55,7 @@ pub fn run(vault: VaultStore) -> Result<()> {
     let initial = backend
         .spawn_local_session()
         .expect("failed to create initial local session");
+    let initial_id = initial.id();
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
@@ -76,7 +79,8 @@ pub fn run(vault: VaultStore) -> Result<()> {
                     let mut ws = SeanceWorkspace {
                         focus_handle,
                         sessions: vec![initial],
-                        active_session_id: 1,
+                        session_kinds: HashMap::from([(initial_id, SessionKind::Local)]),
+                        active_session_id: initial_id,
                         backend,
                         saved_hosts: initial_saved_hosts,
                         selected_host_id: None,
@@ -128,6 +132,7 @@ pub fn run(vault: VaultStore) -> Result<()> {
 struct SeanceWorkspace {
     focus_handle: FocusHandle,
     sessions: Vec<Arc<dyn TerminalSession>>,
+    session_kinds: HashMap<u64, SessionKind>,
     active_session_id: u64,
     backend: UiBackend,
     saved_hosts: Vec<HostSummary>,
@@ -144,6 +149,12 @@ struct SeanceWorkspace {
     active_terminal_rows: usize,
     terminal_surface: TerminalSurfaceState,
     perf_overlay: PerfOverlayState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionKind {
+    Local,
+    Remote,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -816,9 +827,72 @@ fn expanded_perf_strings(
     ]
 }
 
+fn local_session_display_number_for_ids(
+    session_ids: &[u64],
+    session_kinds: &HashMap<u64, SessionKind>,
+    target_id: u64,
+) -> Option<usize> {
+    let mut local_count = 0;
+
+    for session_id in session_ids {
+        if matches!(session_kinds.get(session_id), Some(SessionKind::Local)) {
+            local_count += 1;
+            if *session_id == target_id {
+                return Some(local_count);
+            }
+        }
+    }
+
+    None
+}
+
 impl SeanceWorkspace {
     fn theme(&self) -> Theme {
         self.active_theme.theme()
+    }
+
+    fn session_kind(&self, id: u64) -> Option<SessionKind> {
+        self.session_kinds.get(&id).copied()
+    }
+
+    fn local_session_display_number(&self, id: u64) -> Option<usize> {
+        let session_ids = self
+            .sessions
+            .iter()
+            .map(|session| session.id())
+            .collect::<Vec<_>>();
+        local_session_display_number_for_ids(&session_ids, &self.session_kinds, id)
+    }
+
+    fn session_display_title(&self, session: &Arc<dyn TerminalSession>) -> String {
+        match self.session_kind(session.id()) {
+            Some(SessionKind::Local) => self
+                .local_session_display_number(session.id())
+                .map(|number| format!("local-{number}"))
+                .unwrap_or_else(|| session.title().to_string()),
+            Some(SessionKind::Remote) | None => session.title().to_string(),
+        }
+    }
+
+    fn session_display_badge(&self, session: &Arc<dyn TerminalSession>, active: bool) -> String {
+        if active {
+            return "live".into();
+        }
+
+        match self.session_kind(session.id()) {
+            Some(SessionKind::Local) => self
+                .local_session_display_number(session.id())
+                .map(|number| format!("#{number}"))
+                .unwrap_or_else(|| format!("#{}", session.id())),
+            Some(SessionKind::Remote) | None => format!("#{}", session.id()),
+        }
+    }
+
+    fn palette_session_labels(&self) -> HashMap<u64, String> {
+        self.sessions
+            .iter()
+            .map(|session| (session.id(), self.session_display_title(session)))
+            .collect()
     }
 
     fn terminal_metrics(&mut self, window: &Window) -> TerminalMetrics {
@@ -1141,6 +1215,7 @@ impl SeanceWorkspace {
                     let _ = session.resize(geometry);
                 }
                 self.active_session_id = session.id();
+                self.session_kinds.insert(session.id(), SessionKind::Remote);
                 if let Some(notify_rx) = session.take_notify_rx() {
                     Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
                 }
@@ -1205,6 +1280,7 @@ impl SeanceWorkspace {
                 let _ = session.resize(geometry);
             }
             self.active_session_id = session.id();
+            self.session_kinds.insert(session.id(), SessionKind::Local);
             if let Some(notify_rx) = session.take_notify_rx() {
                 Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
             }
@@ -1230,6 +1306,7 @@ impl SeanceWorkspace {
 
     fn close_session(&mut self, id: u64, cx: &mut Context<Self>) {
         self.sessions.retain(|s| s.id() != id);
+        self.session_kinds.remove(&id);
         if self.active_session_id == id {
             self.active_session_id = self.sessions.last().map(|s| s.id()).unwrap_or(0);
         }
@@ -1402,7 +1479,12 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
-    fn handle_palette_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_palette_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let key = event.keystroke.key.as_str();
         let key_char = event.keystroke.key_char.as_deref();
 
@@ -1420,8 +1502,10 @@ impl SeanceWorkspace {
                 cx.notify();
             }
             "down" => {
+                let session_labels = self.palette_session_labels();
                 let count = build_items(
                     &self.sessions,
+                    &session_labels,
                     &self.saved_hosts,
                     self.active_session_id,
                     self.active_theme,
@@ -1436,8 +1520,10 @@ impl SeanceWorkspace {
                 cx.notify();
             }
             "enter" => {
+                let session_labels = self.palette_session_labels();
                 let items = build_items(
                     &self.sessions,
+                    &session_labels,
                     &self.saved_hosts,
                     self.active_session_id,
                     self.active_theme,
@@ -1597,20 +1683,19 @@ impl SeanceWorkspace {
     fn sidebar_row_shell(&self, active: bool) -> Div {
         let t = self.theme();
         let row = div()
-            .px_3()
-            .py(px(9.0))
-            .rounded_xl()
+            .px(px(12.0))
+            .py(px(6.0))
             .cursor_pointer()
             .flex()
             .items_center()
-            .gap_3();
+            .gap(px(8.0));
 
         if active {
-            row.bg(t.sidebar_row_active)
-                .border_1()
-                .border_color(t.sidebar_row_active_border)
+            row.border_l_2()
+                .border_color(t.sidebar_indicator)
+                .bg(t.sidebar_row_active)
         } else {
-            row.hover(|style| style.bg(t.sidebar_row_hover))
+            row.ml(px(2.0)).hover(|style| style.bg(t.sidebar_row_hover))
         }
     }
 
@@ -1618,32 +1703,40 @@ impl SeanceWorkspace {
         let t = self.theme();
 
         div()
-            .px_3()
+            .px(px(14.0))
+            .py(px(4.0))
             .flex()
             .items_center()
-            .justify_between()
+            .gap(px(6.0))
             .child(
                 div()
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
                     .text_color(t.sidebar_section_label)
-                    .child(label),
+                    .child(format!("-- {label}")),
             )
-            .child(div().text_xs().text_color(t.sidebar_meta).child(meta))
+            .child(div().flex_1().h(px(1.0)).bg(t.sidebar_separator))
+            .child(
+                div()
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                    .text_color(t.sidebar_meta)
+                    .child(meta),
+            )
     }
 
     fn render_sidebar_header(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
         let mode_label = if self.selected_host_id.is_some() {
-            "SSH"
+            "[ssh]"
         } else {
-            "LOCAL"
+            "[local]"
         };
 
         div()
-            .pt(px(34.0))
-            .px_4()
-            .pb_3()
+            .pt(px(36.0))
+            .px(px(14.0))
+            .pb(px(10.0))
             .flex()
             .items_center()
             .justify_between()
@@ -1651,52 +1744,31 @@ impl SeanceWorkspace {
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(t.accent))
+                    .gap(px(6.0))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(t.text_primary)
-                                    .child("Séance"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py(px(2.0))
-                                    .rounded_full()
-                                    .bg(t.sidebar_row_hover)
-                                    .border_1()
-                                    .border_color(t.sidebar_edge)
-                                    .text_xs()
-                                    .text_color(t.sidebar_meta)
-                                    .child(mode_label),
-                            ),
+                            .font_family(SIDEBAR_FONT_MONO)
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.text_primary)
+                            .child("séance"),
+                    )
+                    .child(
+                        div()
+                            .font_family(SIDEBAR_FONT_MONO)
+                            .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                            .text_color(t.sidebar_meta)
+                            .child(mode_label),
                     ),
             )
             .child(
                 div()
-                    .px_2()
-                    .py(px(4.0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(t.sidebar_edge)
-                    .bg(t.sidebar_row_hover)
-                    .text_xs()
-                    .text_color(t.text_muted)
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                    .text_color(t.text_ghost)
                     .cursor_pointer()
-                    .hover(|style| {
-                        style
-                            .bg(t.sidebar_row_active)
-                            .border_color(t.sidebar_edge_bright)
-                            .text_color(t.text_secondary)
-                    })
-                    .child("⌘K")
+                    .hover(|style| style.text_color(t.text_muted))
+                    .child("^K")
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -1717,76 +1789,84 @@ impl SeanceWorkspace {
         let delete_id = host.id.clone();
         let label = host.label.clone();
         let target = format!("{}@{}:{}", host.username, host.hostname, host.port);
-        let active_pinline = if selected {
-            t.accent
-        } else {
-            t.sidebar_row_hover
-        };
 
         self.sidebar_row_shell(selected)
             .child(
                 div()
-                    .w(px(2.0))
-                    .h(px(22.0))
-                    .rounded_full()
-                    .bg(active_pinline),
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                    .text_color(if selected { t.accent } else { t.text_ghost })
+                    .child(if selected { ">" } else { " " }),
             )
             .child(
                 div()
                     .flex_1()
                     .flex()
                     .flex_col()
-                    .gap(px(2.0))
+                    .gap(px(1.0))
+                    .overflow_hidden()
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(if selected {
-                                t.text_primary
-                            } else {
-                                t.text_secondary
-                            })
-                            .line_clamp(1)
-                            .child(label),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if selected {
+                                        t.text_primary
+                                    } else {
+                                        t.text_secondary
+                                    })
+                                    .line_clamp(1)
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .font_family(SIDEBAR_FONT_MONO)
+                                            .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                                            .text_color(t.text_ghost)
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(t.text_secondary))
+                                            .child("edit")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.begin_edit_host(&edit_id, cx);
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(SIDEBAR_FONT_MONO)
+                                            .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                                            .text_color(t.text_ghost)
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(t.warning))
+                                            .child("del")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.delete_saved_host(&delete_id, cx);
+                                                }),
+                                            ),
+                                    ),
+                            ),
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .font_family(SIDEBAR_FONT_MONO)
+                            .text_size(px(SIDEBAR_MONO_SIZE_PX))
                             .text_color(t.sidebar_meta)
                             .line_clamp(1)
                             .child(target),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(if selected { t.text_muted } else { t.text_ghost })
-                            .hover(|style| style.text_color(t.text_secondary))
-                            .child("✎")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.begin_edit_host(&edit_id, cx);
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(if selected { t.text_muted } else { t.text_ghost })
-                            .hover(|style| style.text_color(t.warning))
-                            .child("×")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.delete_saved_host(&delete_id, cx);
-                                }),
-                            ),
                     ),
             )
             .on_mouse_down(
@@ -1806,27 +1886,28 @@ impl SeanceWorkspace {
         let t = self.theme();
         let active = session.id() == self.active_session_id;
         let sid = session.id();
-        let title = session.title().to_string();
+        let title = self.session_display_title(session);
         let snapshot = session.snapshot();
         let preview =
             session_preview_text(&snapshot.rows).unwrap_or_else(|| "waiting for output…".into());
         let close_sid = sid;
+        let badge = self.session_display_badge(session, active);
 
         self.sidebar_row_shell(active)
             .child(
                 div()
-                    .w(px(6.0))
-                    .h(px(6.0))
-                    .mt(px(1.0))
-                    .rounded_full()
-                    .bg(if active { t.accent } else { t.sidebar_meta }),
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                    .text_color(if active { t.accent } else { t.text_ghost })
+                    .child(if active { ">" } else { " " }),
             )
             .child(
                 div()
                     .flex_1()
                     .flex()
                     .flex_col()
-                    .gap(px(2.0))
+                    .gap(px(1.0))
+                    .overflow_hidden()
                     .child(
                         div()
                             .flex()
@@ -1835,8 +1916,8 @@ impl SeanceWorkspace {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::BOLD)
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
                                     .text_color(if active {
                                         t.text_primary
                                     } else {
@@ -1847,18 +1928,16 @@ impl SeanceWorkspace {
                             )
                             .child(
                                 div()
-                                    .text_xs()
+                                    .font_family(SIDEBAR_FONT_MONO)
+                                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
                                     .text_color(if active { t.accent } else { t.sidebar_meta })
-                                    .child(if active {
-                                        "live".into()
-                                    } else {
-                                        format!("#{sid}")
-                                    }),
+                                    .child(badge),
                             ),
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .font_family(SIDEBAR_FONT_MONO)
+                            .text_size(px(SIDEBAR_MONO_SIZE_PX))
                             .text_color(t.sidebar_meta)
                             .line_clamp(1)
                             .child(preview),
@@ -1866,10 +1945,12 @@ impl SeanceWorkspace {
             )
             .child(
                 div()
-                    .text_xs()
-                    .text_color(if active { t.text_muted } else { t.text_ghost })
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                    .text_color(t.text_ghost)
+                    .cursor_pointer()
                     .hover(|style| style.text_color(t.text_secondary))
-                    .child("×")
+                    .child("x")
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -1897,44 +1978,55 @@ impl SeanceWorkspace {
         let mut section = div()
             .flex()
             .flex_col()
-            .gap_2()
-            .child(self.render_sidebar_section_heading("HOSTS", meta));
+            .gap(px(4.0))
+            .child(self.render_sidebar_section_heading("hosts", meta));
 
         if unlocked {
             if self.saved_hosts.is_empty() {
                 section = section.child(
                     div()
-                        .px_3()
-                        .text_xs()
+                        .px(px(14.0))
+                        .font_family(SIDEBAR_FONT_MONO)
+                        .text_size(px(SIDEBAR_MONO_SIZE_PX))
                         .text_color(t.sidebar_meta)
-                        .child("No saved hosts yet"),
+                        .child("no saved hosts"),
                 );
             } else {
-                let mut rows = div().flex().flex_col().gap_1().px_2();
+                let mut rows = div().flex().flex_col();
                 for host in &self.saved_hosts {
                     rows = rows.child(self.render_host_row(host, cx));
                 }
                 section = section.child(rows);
             }
+
+            section = section.child(
+                div().px(px(14.0)).pt(px(2.0)).child(
+                    div()
+                        .font_family(SIDEBAR_FONT_MONO)
+                        .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                        .text_color(t.text_ghost)
+                        .cursor_pointer()
+                        .hover(|style| style.text_color(t.text_secondary))
+                        .child("+ add host")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.begin_add_host(cx);
+                            }),
+                        ),
+                ),
+            );
         } else {
             section = section.child(
                 div()
-                    .mx_2()
-                    .px_3()
-                    .py(px(10.0))
-                    .rounded_xl()
+                    .px(px(14.0))
+                    .py(px(6.0))
                     .cursor_pointer()
-                    .hover(|style| style.bg(t.sidebar_row_hover))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(t.text_muted)
-                            .child("Unlock vault to view saved hosts"),
-                    )
-                    .child(div().text_xs().text_color(t.sidebar_meta).child("unlock"))
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                    .text_color(t.text_muted)
+                    .hover(|style| style.text_color(t.text_secondary))
+                    .child("vault locked -- unlock to view")
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -1953,46 +2045,139 @@ impl SeanceWorkspace {
 
     fn render_recents_section(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(self.render_sidebar_section_heading("RECENTS", self.sessions.len().to_string()))
-            .child(
-                div().px_2().flex().justify_end().child(
-                    div()
-                        .px_2()
-                        .py(px(3.0))
-                        .rounded_lg()
-                        .cursor_pointer()
-                        .text_xs()
-                        .text_color(t.sidebar_meta)
-                        .hover(|style| style.bg(t.sidebar_row_hover).text_color(t.text_secondary))
-                        .child("+ local")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
-                                this.spawn_session(window, cx);
-                            }),
-                        ),
-                ),
+        let mut section =
+            div().flex().flex_col().gap(px(4.0)).child(
+                self.render_sidebar_section_heading("recents", self.sessions.len().to_string()),
             );
 
         if self.sessions.is_empty() {
             section = section.child(
                 div()
-                    .px_3()
-                    .text_xs()
+                    .px(px(14.0))
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
                     .text_color(t.sidebar_meta)
-                    .child("No active sessions"),
+                    .child("no active sessions"),
             );
         } else {
-            let mut rows = div().flex().flex_col().gap_1().px_2();
+            let mut rows = div().flex().flex_col();
             for session in &self.sessions {
                 rows = rows.child(self.render_session_row(session, cx));
             }
             section = section.child(rows);
         }
+
+        section = section.child(
+            div().px(px(14.0)).pt(px(2.0)).child(
+                div()
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                    .text_color(t.text_ghost)
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(t.text_secondary))
+                    .child("+ new local session")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.spawn_session(window, cx);
+                        }),
+                    ),
+            ),
+        );
+
+        section
+    }
+
+    fn render_vault_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(self.render_sidebar_section_heading("vault", String::new()));
+
+        let vault_action = |label: &'static str| {
+            div()
+                .px(px(14.0))
+                .py(px(3.0))
+                .cursor_pointer()
+                .font_family(SIDEBAR_FONT_MONO)
+                .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                .text_color(t.text_ghost)
+                .hover(|s| s.text_color(t.text_secondary))
+                .child(label)
+        };
+
+        section = section.child(
+            div()
+                .flex()
+                .flex_col()
+                .child(vault_action("+ add credential").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        match this
+                            .backend
+                            .save_password_credential(VaultPasswordCredential {
+                                id: String::new(),
+                                label: format!("credential-{}", now_ui_suffix()),
+                                username_hint: None,
+                                secret: "change-me".into(),
+                            }) {
+                            Ok(summary) => {
+                                this.status_message =
+                                    Some(format!("Created credential '{}'.", summary.label));
+                            }
+                            Err(err) => this.status_message = Some(err.to_string()),
+                        }
+                        this.perf_overlay.mark_input(RedrawReason::Input);
+                        cx.notify();
+                    }),
+                ))
+                .child(vault_action("+ import key").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.status_message =
+                            Some("Private key import UI is still pending.".into());
+                        this.perf_overlay.mark_input(RedrawReason::Input);
+                        cx.notify();
+                    }),
+                ))
+                .child(vault_action("+ generate ed25519").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        match this
+                            .backend
+                            .generate_ed25519_key(format!("ed25519-{}", now_ui_suffix()))
+                        {
+                            Ok(summary) => {
+                                this.status_message =
+                                    Some(format!("Generated key '{}'.", summary.label));
+                            }
+                            Err(err) => this.status_message = Some(err.to_string()),
+                        }
+                        this.perf_overlay.mark_input(RedrawReason::Input);
+                        cx.notify();
+                    }),
+                ))
+                .child(vault_action("+ generate rsa").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        match this
+                            .backend
+                            .generate_rsa_key(format!("rsa-{}", now_ui_suffix()))
+                        {
+                            Ok(summary) => {
+                                this.status_message =
+                                    Some(format!("Generated key '{}'.", summary.label));
+                            }
+                            Err(err) => this.status_message = Some(err.to_string()),
+                        }
+                        this.perf_overlay.mark_input(RedrawReason::Input);
+                        cx.notify();
+                    }),
+                )),
+        );
 
         section
     }
@@ -2001,105 +2186,119 @@ impl SeanceWorkspace {
         let t = self.theme();
         let vault_status = self.backend.vault_status();
 
+        let vault_label = if vault_status.unlocked {
+            "unlocked"
+        } else {
+            "locked"
+        };
+
         let mut footer = div()
-            .px_3()
-            .pb_3()
+            .px(px(14.0))
+            .pb(px(10.0))
             .flex()
             .flex_col()
-            .gap_1()
+            .gap(px(6.0))
+            .child(div().h(px(1.0)).bg(t.sidebar_separator))
+            .child({
+                let mut theme_row = div().flex().items_center().gap(px(6.0));
+                let active_theme = self.active_theme;
+                for &tid in ThemeId::ALL {
+                    let tid_theme = tid.theme();
+                    let is_active = tid == active_theme;
+                    let accent_color = tid_theme.accent;
+                    theme_row = theme_row.child(
+                        div()
+                            .w(px(8.0))
+                            .h(px(8.0))
+                            .rounded_full()
+                            .bg(accent_color)
+                            .cursor_pointer()
+                            .when(is_active, |el| el.border_1().border_color(t.text_secondary))
+                            .when(!is_active, |el| {
+                                el.hover(|s| s.border_1().border_color(t.sidebar_edge_bright))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.active_theme = tid;
+                                            this.invalidate_terminal_surface();
+                                            this.perf_overlay.mark_input(RedrawReason::Input);
+                                            cx.notify();
+                                        }),
+                                    )
+                            }),
+                    );
+                }
+                theme_row
+            })
             .child(
                 div()
-                    .px_2()
-                    .py(px(6.0))
-                    .rounded_lg()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(t.sidebar_row_hover))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap(px(4.0))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(t.text_secondary))
                             .child(
                                 div()
-                                    .text_xs()
+                                    .font_family(SIDEBAR_FONT_MONO)
+                                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                                    .text_color(t.sidebar_section_label)
+                                    .child("vault:"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(SIDEBAR_FONT_MONO)
+                                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
                                     .text_color(if vault_status.unlocked {
                                         t.accent
                                     } else {
                                         t.warning
                                     })
-                                    .child("•"),
+                                    .child(vault_label),
                             )
-                            .child(div().text_xs().text_color(t.text_muted).child(
-                                if vault_status.unlocked {
-                                    "Vault unlocked"
-                                } else {
-                                    "Unlock vault"
-                                },
-                            )),
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    if this.vault_unlocked() {
+                                        this.lock_vault(cx);
+                                    } else {
+                                        this.unlock_form.reset_for_unlock();
+                                        this.unlock_form.message = Some(
+                                            "Enter the recovery passphrase to unlock the vault."
+                                                .into(),
+                                        );
+                                        this.perf_overlay.mark_input(RedrawReason::Input);
+                                        cx.notify();
+                                    }
+                                }),
+                            ),
                     )
-                    .child(div().text_xs().text_color(t.sidebar_meta).child(
-                        if vault_status.unlocked {
-                            "lock"
-                        } else {
-                            "open"
-                        },
-                    ))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            if this.vault_unlocked() {
-                                this.lock_vault(cx);
-                            } else {
-                                this.unlock_form.reset_for_unlock();
-                                this.unlock_form.message = Some(
-                                    "Enter the recovery passphrase to unlock the vault.".into(),
-                                );
-                                this.perf_overlay.mark_input(RedrawReason::Input);
-                                cx.notify();
-                            }
-                        }),
-                    ),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .py(px(6.0))
-                    .rounded_lg()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(t.sidebar_row_hover))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().text_xs().text_color(t.accent).child("◑"))
-                            .child(div().text_xs().text_color(t.text_muted).child(t.name)),
-                    )
-                    .child(div().text_xs().text_color(t.sidebar_meta).child("theme"))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.palette_open = true;
-                            this.palette_query = "theme".into();
-                            this.palette_selected = 0;
-                            this.perf_overlay.mark_input(RedrawReason::Palette);
-                            cx.notify();
-                        }),
+                            .font_family(SIDEBAR_FONT_MONO)
+                            .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                            .text_color(t.text_ghost)
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(t.text_muted))
+                            .child("^K")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_palette(cx);
+                                }),
+                            ),
                     ),
             );
 
         if let Some(message) = self.status_message.clone() {
             footer = footer.child(
                 div()
-                    .px_2()
-                    .pt_2()
-                    .text_xs()
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
                     .text_color(t.sidebar_meta)
                     .line_clamp(2)
                     .child(message),
@@ -2118,34 +2317,24 @@ impl SeanceWorkspace {
             .flex()
             .flex_col()
             .justify_between()
-            .bg(t.sidebar_bg)
+            .bg(t.sidebar_bg_elevated)
             .border_r_1()
             .border_color(t.sidebar_edge)
-            .child(div().h(px(1.0)).bg(t.sidebar_top_highlight))
-            .child(
-                div()
+            .child({
+                let mut content = div()
                     .flex_1()
                     .flex()
                     .flex_col()
-                    .justify_between()
-                    .bg(t.sidebar_bg_elevated)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_5()
-                            .child(self.render_sidebar_header(cx))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_5()
-                                    .child(self.render_hosts_section(cx))
-                                    .child(self.render_recents_section(cx)),
-                            ),
-                    )
-                    .child(self.render_sidebar_footer(cx)),
-            )
+                    .gap(px(16.0))
+                    .child(self.render_sidebar_header(cx))
+                    .child(self.render_hosts_section(cx))
+                    .child(self.render_recents_section(cx));
+                if self.vault_unlocked() {
+                    content = content.child(self.render_vault_section(cx));
+                }
+                content
+            })
+            .child(self.render_sidebar_footer(cx))
     }
 
     fn render_terminal_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -2286,8 +2475,10 @@ impl SeanceWorkspace {
 
     fn render_palette_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme();
+        let session_labels = self.palette_session_labels();
         let items = build_items(
             &self.sessions,
+            &session_labels,
             &self.saved_hosts,
             self.active_session_id,
             self.active_theme,
@@ -2296,8 +2487,9 @@ impl SeanceWorkspace {
         );
         trace!(palette_items = items.len(), "rendered palette overlay");
         let selected = self.palette_selected.min(items.len().saturating_sub(1));
+        let show_groups = self.palette_query.is_empty();
 
-        let mut item_list = div().flex().flex_col().p_2();
+        let mut item_list = div().flex().flex_col().py_1();
 
         if items.is_empty() {
             item_list = item_list.child(
@@ -2311,13 +2503,43 @@ impl SeanceWorkspace {
             );
         }
 
+        let mut prev_group: Option<PaletteGroup> = None;
+
         for (idx, item) in items.iter().enumerate() {
+            if show_groups {
+                let cur_group = item.group;
+                if prev_group.map_or(true, |pg| pg != cur_group) {
+                    let is_first = prev_group.is_none();
+                    let mut header = div()
+                        .px_4()
+                        .pt(px(if is_first { 6.0 } else { 12.0 }))
+                        .pb(px(4.0))
+                        .flex()
+                        .items_center()
+                        .gap_2();
+
+                    header = header
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(t.palette_group_label)
+                                .child(cur_group.label()),
+                        )
+                        .child(div().flex_1().h(px(1.0)).bg(t.palette_group_separator));
+
+                    item_list = item_list.child(header);
+                    prev_group = Some(cur_group);
+                }
+            }
+
             let is_sel = idx == selected;
             let action = item.action.clone();
 
             let mut row = div()
-                .px_3()
-                .py(px(8.0))
+                .mx_2()
+                .px_2()
+                .py(px(7.0))
                 .rounded_lg()
                 .flex()
                 .items_center()
@@ -2326,14 +2548,80 @@ impl SeanceWorkspace {
 
             row = if is_sel {
                 row.bg(t.selection_soft)
+                    .child(div().w(px(2.0)).h(px(20.0)).rounded_full().bg(t.accent))
             } else {
-                row.hover(|s| s.bg(t.glass_hover))
+                row.hover(|s| s.bg(t.glass_hover)).child(div().w(px(2.0)))
             };
+
+            let label_el = if !item.match_indices.is_empty() {
+                let chars: Vec<char> = item.label.chars().collect();
+                let mut label_row = div().flex().items_center().text_sm();
+                let mut i = 0;
+                while i < chars.len() {
+                    let is_match = item.match_indices.contains(&i);
+                    let start = i;
+                    while i < chars.len() && item.match_indices.contains(&i) == is_match {
+                        i += 1;
+                    }
+                    let segment: String = chars[start..i].iter().collect();
+                    let color = if is_match {
+                        t.accent
+                    } else if is_sel {
+                        t.text_primary
+                    } else {
+                        t.text_secondary
+                    };
+                    label_row = label_row.child(
+                        div()
+                            .text_color(color)
+                            .font_weight(if is_match {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .child(segment),
+                    );
+                }
+                label_row
+            } else {
+                div()
+                    .text_sm()
+                    .text_color(if is_sel {
+                        t.text_primary
+                    } else {
+                        t.text_secondary
+                    })
+                    .child(item.label.clone())
+            };
+
+            let content = div().flex_1().child(label_el).child(
+                div()
+                    .text_xs()
+                    .text_color(t.text_muted)
+                    .child(item.hint.clone()),
+            );
+
+            let mut right_section = div().flex().items_center().gap_2();
+
+            if let Some(shortcut) = item.shortcut {
+                right_section = right_section.child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(t.glass_border)
+                        .bg(t.glass_tint)
+                        .text_xs()
+                        .text_color(t.text_ghost)
+                        .child(shortcut),
+                );
+            }
 
             row = row
                 .child(
                     div()
-                        .w(px(24.0))
+                        .w(px(22.0))
                         .flex()
                         .justify_center()
                         .text_sm()
@@ -2341,26 +2629,8 @@ impl SeanceWorkspace {
                         .text_color(if is_sel { t.accent } else { t.text_muted })
                         .child(item.glyph),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(if is_sel {
-                                    t.text_primary
-                                } else {
-                                    t.text_secondary
-                                })
-                                .child(item.label.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(t.text_muted)
-                                .child(item.hint.clone()),
-                        ),
-                )
+                .child(content)
+                .child(right_section)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, window, cx| {
@@ -2371,8 +2641,14 @@ impl SeanceWorkspace {
             item_list = item_list.child(row);
         }
 
+        let scrollable_list = div()
+            .id("palette-scroll")
+            .max_h(px(420.0))
+            .overflow_y_scroll()
+            .child(item_list);
+
         let panel = div()
-            .w(px(540.0))
+            .w(px(560.0))
             .bg(t.glass_strong)
             .border_1()
             .border_color(t.glass_border_bright)
@@ -2395,14 +2671,14 @@ impl SeanceWorkspace {
                             .text_sm()
                             .text_color(t.accent)
                             .font_weight(FontWeight::BOLD)
-                            .child("›"),
+                            .child("/"),
                     )
                     .child(div().flex_1().flex().items_center().child(
                         if self.palette_query.is_empty() {
                             div()
                                 .text_sm()
                                 .text_color(t.text_muted)
-                                .child("Search commands…")
+                                .child("Search commands\u{2026}")
                         } else {
                             div()
                                 .flex()
@@ -2428,7 +2704,7 @@ impl SeanceWorkspace {
                             .child("esc"),
                     ),
             )
-            .child(item_list)
+            .child(scrollable_list)
             .child(
                 div()
                     .px_4()
@@ -2437,12 +2713,24 @@ impl SeanceWorkspace {
                     .border_color(t.glass_border)
                     .flex()
                     .items_center()
-                    .gap_4()
-                    .text_xs()
-                    .text_color(t.text_ghost)
-                    .child("↑↓ navigate")
-                    .child("↵ select")
-                    .child("esc close"),
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_4()
+                            .text_xs()
+                            .text_color(t.text_ghost)
+                            .child("↑↓ navigate")
+                            .child("↵ select")
+                            .child("esc close"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(t.text_ghost)
+                            .child(format!("{} commands", items.len())),
+                    ),
             );
 
         div()
@@ -3297,6 +3585,92 @@ mod tests {
     use super::*;
     use gpui::size;
     use seance_terminal::{TerminalCell, TerminalRow};
+
+    fn session_kind_map(entries: &[(u64, SessionKind)]) -> HashMap<u64, SessionKind> {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn local_display_number_is_one_for_single_local_session() {
+        let session_kinds = session_kind_map(&[(7, SessionKind::Local)]);
+
+        assert_eq!(
+            local_session_display_number_for_ids(&[7], &session_kinds, 7),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn local_display_numbers_follow_open_local_session_order() {
+        let session_kinds = session_kind_map(&[
+            (7, SessionKind::Local),
+            (10, SessionKind::Local),
+            (14, SessionKind::Local),
+        ]);
+
+        assert_eq!(
+            local_session_display_number_for_ids(&[7, 10, 14], &session_kinds, 7),
+            Some(1)
+        );
+        assert_eq!(
+            local_session_display_number_for_ids(&[7, 10, 14], &session_kinds, 10),
+            Some(2)
+        );
+        assert_eq!(
+            local_session_display_number_for_ids(&[7, 10, 14], &session_kinds, 14),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn local_display_numbers_repack_after_middle_session_closes() {
+        let session_kinds = session_kind_map(&[(7, SessionKind::Local), (14, SessionKind::Local)]);
+
+        assert_eq!(
+            local_session_display_number_for_ids(&[7, 14], &session_kinds, 7),
+            Some(1)
+        );
+        assert_eq!(
+            local_session_display_number_for_ids(&[7, 14], &session_kinds, 14),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn local_display_numbers_stay_dense_after_reopen() {
+        let session_kinds = session_kind_map(&[
+            (7, SessionKind::Local),
+            (14, SessionKind::Local),
+            (18, SessionKind::Local),
+        ]);
+
+        assert_eq!(
+            local_session_display_number_for_ids(&[7, 14, 18], &session_kinds, 18),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn remote_sessions_do_not_consume_local_display_numbers() {
+        let session_kinds = session_kind_map(&[
+            (7, SessionKind::Local),
+            (9, SessionKind::Remote),
+            (14, SessionKind::Local),
+        ]);
+
+        assert_eq!(
+            local_session_display_number_for_ids(&[7, 9, 14], &session_kinds, 7),
+            Some(1)
+        );
+        assert_eq!(
+            local_session_display_number_for_ids(&[7, 9, 14], &session_kinds, 14),
+            Some(2)
+        );
+        assert_eq!(
+            local_session_display_number_for_ids(&[7, 9, 14], &session_kinds, 9),
+            None
+        );
+    }
 
     #[test]
     fn compute_geometry_uses_viewport_minus_sidebar_and_padding() {

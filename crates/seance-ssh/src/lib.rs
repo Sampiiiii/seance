@@ -7,16 +7,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use russh::keys::{Algorithm as SshAlgorithm, PrivateKey as SshPrivateKey, PublicKey};
 use russh::{
-    Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf,
-    client,
-    keys::PrivateKeyWithHashAlg,
+    Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, client, keys::PrivateKeyWithHashAlg,
 };
 use russh_sftp::client::SftpSession;
-use seance_terminal::{
-    SharedSessionState, TerminalEmulator, TerminalGeometry, TerminalSession,
-};
-use russh::keys::{Algorithm as SshAlgorithm, PrivateKey as SshPrivateKey, PublicKey};
+use seance_terminal::{SharedSessionState, TerminalEmulator, TerminalGeometry, TerminalSession};
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, runtime::Runtime, sync::mpsc};
 
@@ -160,9 +156,13 @@ impl SshSessionManager {
         })
     }
 
-    pub fn connect(&self, request: SshConnectRequest) -> std::result::Result<SshConnectResult, SshError> {
+    pub fn connect(
+        &self,
+        request: SshConnectRequest,
+    ) -> std::result::Result<SshConnectResult, SshError> {
         let session_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.runtime.block_on(self.connect_async(session_id, request))
+        self.runtime
+            .block_on(self.connect_async(session_id, request))
     }
 
     pub fn sftp_ready(&self, session_id: u64) -> bool {
@@ -182,12 +182,20 @@ impl SshSessionManager {
         }
 
         let config = Arc::new(client::Config::default());
-        let addr = (request.connection.hostname.as_str(), request.connection.port);
+        let addr = (
+            request.connection.hostname.as_str(),
+            request.connection.port,
+        );
         let mut session = client::connect(config, addr, AcceptAnyHostKeyHandler)
             .await
             .map_err(|err| SshError::Transport(err.to_string()))?;
 
-        authenticate(&mut session, &request.connection.username, &request.auth_order).await?;
+        authenticate(
+            &mut session,
+            &request.connection.username,
+            &request.auth_order,
+        )
+        .await?;
 
         let channel = session
             .channel_open_session()
@@ -235,11 +243,7 @@ impl SshSessionManager {
                     .build()
                     .expect("failed to initialize SSH session runtime");
                 runtime.block_on(run_ssh_session(
-                    session,
-                    channel,
-                    state,
-                    geometry,
-                    command_rx,
+                    session, channel, state, geometry, command_rx,
                 ));
             })
             .map_err(|err| SshError::Transport(err.to_string()))?;
@@ -306,13 +310,11 @@ async fn authenticate(
                         .map_err(|err| SshError::InvalidPrivateKey(err.to_string()))?;
                 }
                 let hash_alg = match private_key.algorithm() {
-                    SshAlgorithm::Rsa { .. } => {
-                        session
-                            .best_supported_rsa_hash()
-                            .await
-                            .map_err(|err| SshError::Transport(err.to_string()))?
-                            .flatten()
-                    }
+                    SshAlgorithm::Rsa { .. } => session
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(|err| SshError::Transport(err.to_string()))?
+                        .flatten(),
                     _ => None,
                 };
                 session
@@ -349,10 +351,8 @@ async fn run_ssh_session(
     };
     emulator.publish(&state, None);
 
-    let (mut read_half, write_half): (
-        ChannelReadHalf,
-        ChannelWriteHalf<russh::client::Msg>,
-    ) = channel.split();
+    let (mut read_half, write_half): (ChannelReadHalf, ChannelWriteHalf<russh::client::Msg>) =
+        channel.split();
     let mut writer = write_half.make_writer();
     let mut exit_status = None;
 

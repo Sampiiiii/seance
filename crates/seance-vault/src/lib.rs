@@ -11,8 +11,8 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use rand_core::{Infallible, TryCryptoRng, TryRng};
 use keyring::Entry;
+use rand_core::{Infallible, TryCryptoRng, TryRng};
 use rusqlite::Connection;
 use secrecy::ExposeSecret;
 use ssh_key::{
@@ -231,7 +231,11 @@ impl VaultStore {
         self.last_unlock_method
     }
 
-    pub fn create_vault(&mut self, passphrase: &SecretString, device_name: &str) -> VaultResult<()> {
+    pub fn create_vault(
+        &mut self,
+        passphrase: &SecretString,
+        device_name: &str,
+    ) -> VaultResult<()> {
         if self.header.is_some() {
             return Err(VaultError::VaultAlreadyInitialized);
         }
@@ -487,7 +491,10 @@ impl VaultStore {
             GenerateKeyAlgorithm::Rsa { bits } => {
                 let bits = if bits == 0 { DEFAULT_RSA_BITS } else { bits };
                 let keypair = RsaKeypair::random(&mut SystemRng, bits as usize)?;
-                (SshPrivateKey::from(keypair), PrivateKeyAlgorithm::Rsa { bits })
+                (
+                    SshPrivateKey::from(keypair),
+                    PrivateKeyAlgorithm::Rsa { bits },
+                )
             }
         };
 
@@ -553,7 +560,12 @@ impl VaultStore {
         let modified_at = now_ts();
         let record_key = SecretKey::generate();
         let payload = Zeroizing::new(serde_json::to_vec(value)?);
-        let aad = record_aad(&header.vault_id, value.record_id(), kind, RECORD_SCHEMA_VERSION);
+        let aad = record_aad(
+            &header.vault_id,
+            value.record_id(),
+            kind,
+            RECORD_SCHEMA_VERSION,
+        );
         let payload_envelope = encrypt(&record_key, payload.as_ref(), aad.as_bytes())?;
         let wrapped_record_key = encrypt(
             &master_key,
@@ -577,7 +589,10 @@ impl VaultStore {
         Ok(())
     }
 
-    fn decrypt_record<T: serde::de::DeserializeOwned>(&self, record: &EncryptedRecord) -> VaultResult<T> {
+    fn decrypt_record<T: serde::de::DeserializeOwned>(
+        &self,
+        record: &EncryptedRecord,
+    ) -> VaultResult<T> {
         let master_key = self.master_key()?;
         let header = self.header.clone().ok_or(VaultError::VaultNotInitialized)?;
         let wrapped_record_key = decrypt(
@@ -641,7 +656,9 @@ impl VaultStore {
                         )?
                         .is_none()
                     {
-                        return Err(VaultError::MissingCredentialReference(credential_id.clone()));
+                        return Err(VaultError::MissingCredentialReference(
+                            credential_id.clone(),
+                        ));
                     }
                 }
                 HostAuthRef::PrivateKey {
@@ -662,7 +679,9 @@ impl VaultStore {
                             )?
                             .is_none()
                     {
-                        return Err(VaultError::MissingCredentialReference(passphrase_id.clone()));
+                        return Err(VaultError::MissingCredentialReference(
+                            passphrase_id.clone(),
+                        ));
                     }
                 }
             }
@@ -670,7 +689,10 @@ impl VaultStore {
         Ok(())
     }
 
-    fn validate_password_credential(&self, credential: &VaultPasswordCredential) -> VaultResult<()> {
+    fn validate_password_credential(
+        &self,
+        credential: &VaultPasswordCredential,
+    ) -> VaultResult<()> {
         if credential.label.trim().is_empty() {
             return Err(VaultError::EmptyCredentialLabel);
         }
@@ -971,7 +993,10 @@ mod tests {
             .unlock_with_passphrase(&secret("new passphrase"), "test-device")
             .unwrap();
 
-        let restored = vault.load_password_credential(&summary.id).unwrap().unwrap();
+        let restored = vault
+            .load_password_credential(&summary.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(restored.secret, "password");
     }
 
@@ -1034,7 +1059,12 @@ mod tests {
 
         assert_eq!(vault.list_password_credentials().unwrap().len(), 1);
         assert!(vault.delete_password_credential(&credential.id).unwrap());
-        assert!(vault.load_password_credential(&credential.id).unwrap().is_none());
+        assert!(
+            vault
+                .load_password_credential(&credential.id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
