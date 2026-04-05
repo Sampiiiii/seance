@@ -10,13 +10,13 @@ use std::{
 use anyhow::Result;
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, Focusable, FontWeight, KeyDownEvent,
-    MouseButton, SharedString, StyledText, TextRun, UnderlineStyle, Window,
+    MouseButton, Pixels, SharedString, StyledText, TextRun, UnderlineStyle, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, deferred, div, font, prelude::*, px,
     size,
 };
 use seance_terminal::{
     LocalSessionFactory, LocalSessionHandle, SessionPerfSnapshot, TerminalCellStyle, TerminalColor,
-    TerminalLine,
+    TerminalGeometry, TerminalLine,
 };
 use seance_vault::{HostConfig, HostSummary, SecretString, VaultStore};
 use tracing::trace;
@@ -25,10 +25,13 @@ use zeroize::Zeroizing;
 use palette::{PaletteAction, build_items};
 use theme::{Theme, ThemeId};
 
-const TERMINAL_LINE_COUNT: usize = 40;
 const SIDEBAR_WIDTH: f32 = 260.0;
 const PERF_HISTORY_LIMIT: usize = 120;
 const PERF_WINDOW: Duration = Duration::from_secs(1);
+const TERMINAL_FONT_FAMILY: &str = "Menlo";
+const TERMINAL_FONT_SIZE_PX: f32 = 13.0;
+const TERMINAL_LINE_HEIGHT_PX: f32 = 19.0;
+const TERMINAL_PANE_PADDING_PX: f32 = 16.0;
 
 pub fn run(mut vault: VaultStore) -> Result<()> {
     let vault_status = vault.status();
@@ -67,7 +70,7 @@ pub fn run(mut vault: VaultStore) -> Result<()> {
                         .spawn()
                         .expect("failed to create initial local session");
 
-                    let ws = SeanceWorkspace {
+                    let mut ws = SeanceWorkspace {
                         focus_handle,
                         session_factory: factory,
                         sessions: vec![initial],
@@ -86,8 +89,18 @@ pub fn run(mut vault: VaultStore) -> Result<()> {
                         palette_open: false,
                         palette_query: String::new(),
                         palette_selected: 0,
+                        terminal_metrics: None,
+                        last_applied_geometry: None,
+                        active_terminal_rows: TerminalGeometry::default().size.rows as usize,
                         perf_overlay: PerfOverlayState::new(perf_mode_from_env()),
                     };
+                    cx.observe_window_bounds(window, |this: &mut SeanceWorkspace, window, cx| {
+                        this.apply_active_terminal_geometry(window);
+                        this.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
+                        cx.notify();
+                    })
+                    .detach();
+                    ws.apply_active_terminal_geometry(window);
                     ws.schedule_refresh(window, cx, entity.clone());
                     ws.schedule_perf_sampling(window, entity);
                     ws
@@ -114,7 +127,17 @@ struct SeanceWorkspace {
     palette_open: bool,
     palette_query: String,
     palette_selected: usize,
+    terminal_metrics: Option<TerminalMetrics>,
+    last_applied_geometry: Option<TerminalGeometry>,
+    active_terminal_rows: usize,
     perf_overlay: PerfOverlayState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalMetrics {
+    cell_width_px: f32,
+    cell_height_px: f32,
+    line_height_px: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -596,6 +619,68 @@ impl SeanceWorkspace {
         self.active_theme.theme()
     }
 
+    fn terminal_metrics(&mut self, window: &Window) -> TerminalMetrics {
+        if let Some(metrics) = self.terminal_metrics {
+            return metrics;
+        }
+
+        let font_size = px(TERMINAL_FONT_SIZE_PX);
+        let font_id = window
+            .text_system()
+            .resolve_font(&font(TERMINAL_FONT_FAMILY));
+        let cell_width_px = window
+            .text_system()
+            .ch_advance(font_id, font_size)
+            .map(f32::from)
+            .unwrap_or(8.0)
+            .ceil()
+            .max(1.0);
+        let line_height_px = TERMINAL_LINE_HEIGHT_PX.ceil().max(1.0);
+        let metrics = TerminalMetrics {
+            cell_width_px,
+            cell_height_px: line_height_px,
+            line_height_px,
+        };
+        trace!(?metrics, "measured terminal metrics");
+        self.terminal_metrics = Some(metrics);
+        metrics
+    }
+
+    fn apply_active_terminal_geometry(&mut self, window: &Window) {
+        let Some(session) = self.active_session().cloned() else {
+            self.last_applied_geometry = None;
+            self.active_terminal_rows = TerminalGeometry::default().size.rows as usize;
+            return;
+        };
+
+        let metrics = self.terminal_metrics(window);
+        let geometry = compute_terminal_geometry(window.viewport_size(), metrics)
+            .unwrap_or_else(TerminalGeometry::default);
+        self.active_terminal_rows = geometry.size.rows as usize;
+
+        if self.last_applied_geometry == Some(geometry) {
+            trace!(?geometry, "skipping unchanged UI terminal geometry");
+            return;
+        }
+
+        trace!(
+            ?geometry,
+            session_id = session.id(),
+            "computed UI terminal geometry"
+        );
+        if let Err(error) = session.resize(geometry) {
+            trace!(
+                ?geometry,
+                session_id = session.id(),
+                error = %error,
+                "failed to apply terminal geometry"
+            );
+            return;
+        }
+
+        self.last_applied_geometry = Some(geometry);
+    }
+
     fn schedule_refresh(
         &self,
         window: &mut Window,
@@ -862,6 +947,9 @@ impl SeanceWorkspace {
 
     fn spawn_session(&mut self, cx: &mut Context<Self>) {
         if let Ok(session) = self.session_factory.spawn() {
+            if let Some(geometry) = self.last_applied_geometry {
+                let _ = session.resize(geometry);
+            }
             self.active_session_id = session.id();
             self.sessions.push(session);
             self.perf_overlay.mark_input(RedrawReason::Input);
@@ -871,6 +959,12 @@ impl SeanceWorkspace {
 
     fn select_session(&mut self, id: u64, cx: &mut Context<Self>) {
         self.active_session_id = id;
+        if let Some(geometry) = self.last_applied_geometry
+            && let Some(session) = self.active_session()
+        {
+            let _ = session.resize(geometry);
+            self.active_terminal_rows = geometry.size.rows as usize;
+        }
         self.perf_overlay.mark_input(RedrawReason::Input);
         cx.notify();
     }
@@ -879,6 +973,10 @@ impl SeanceWorkspace {
         self.sessions.retain(|s| s.id() != id);
         if self.active_session_id == id {
             self.active_session_id = self.sessions.last().map(|s| s.id()).unwrap_or(0);
+        }
+        if self.active_session_id == 0 {
+            self.last_applied_geometry = None;
+            self.active_terminal_rows = TerminalGeometry::default().size.rows as usize;
         }
         self.perf_overlay.mark_input(RedrawReason::Input);
         cx.notify();
@@ -1660,17 +1758,17 @@ impl SeanceWorkspace {
         let session = self.active_session().unwrap();
         let snapshot = session.snapshot();
         let mut visible_lines = snapshot.lines;
-        if visible_lines.len() > TERMINAL_LINE_COUNT {
-            let start = visible_lines.len() - TERMINAL_LINE_COUNT;
+        if visible_lines.len() > self.active_terminal_rows {
+            let start = visible_lines.len() - self.active_terminal_rows;
             visible_lines.drain(0..start);
         }
         self.perf_overlay.visible_line_count = visible_lines.len();
 
         let mut term = base
             .p_4()
-            .font_family("Menlo")
-            .text_size(px(13.0))
-            .line_height(px(19.0))
+            .font_family(TERMINAL_FONT_FAMILY)
+            .text_size(px(TERMINAL_FONT_SIZE_PX))
+            .line_height(px(TERMINAL_LINE_HEIGHT_PX))
             .text_color(t.text_primary);
 
         for line in visible_lines {
@@ -2211,6 +2309,28 @@ fn masked_value(value: &str) -> String {
     }
 }
 
+fn compute_terminal_geometry(
+    viewport_size: gpui::Size<Pixels>,
+    metrics: TerminalMetrics,
+) -> Option<TerminalGeometry> {
+    let pane_width_px = (f32::from(viewport_size.width) - SIDEBAR_WIDTH).max(0.0);
+    let pane_height_px = f32::from(viewport_size.height).max(0.0);
+    let usable_width_px = (pane_width_px - (TERMINAL_PANE_PADDING_PX * 2.0)).max(1.0);
+    let usable_height_px = (pane_height_px - (TERMINAL_PANE_PADDING_PX * 2.0)).max(1.0);
+    let cols = (usable_width_px / metrics.cell_width_px).floor().max(1.0) as u16;
+    let rows = (usable_height_px / metrics.cell_height_px).floor().max(1.0) as u16;
+
+    TerminalGeometry::new(
+        cols,
+        rows,
+        usable_width_px.floor() as u16,
+        usable_height_px.floor() as u16,
+        metrics.cell_width_px.ceil() as u16,
+        metrics.line_height_px.ceil() as u16,
+    )
+    .ok()
+}
+
 fn render_terminal_line(line: &TerminalLine, theme: &Theme) -> StyledText {
     let (text, runs) = build_text_runs(line, theme);
     StyledText::new(text).with_runs(runs)
@@ -2301,8 +2421,42 @@ fn terminal_color_to_hsla(color: TerminalColor) -> gpui::Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{FontStyle, FontWeight};
+    use gpui::{FontStyle, FontWeight, size};
     use seance_terminal::{TerminalLine, TerminalSpan};
+
+    #[test]
+    fn compute_geometry_uses_viewport_minus_sidebar_and_padding() {
+        let geometry = compute_terminal_geometry(
+            size(px(1280.0), px(820.0)),
+            TerminalMetrics {
+                cell_width_px: 8.0,
+                cell_height_px: 19.0,
+                line_height_px: 19.0,
+            },
+        )
+        .expect("geometry");
+
+        assert_eq!(geometry.pixel_size.width_px, 988);
+        assert_eq!(geometry.pixel_size.height_px, 788);
+        assert_eq!(geometry.size.cols, 123);
+        assert_eq!(geometry.size.rows, 41);
+    }
+
+    #[test]
+    fn compute_geometry_clamps_small_windows_to_one_by_one() {
+        let geometry = compute_terminal_geometry(
+            size(px(10.0), px(10.0)),
+            TerminalMetrics {
+                cell_width_px: 20.0,
+                cell_height_px: 40.0,
+                line_height_px: 40.0,
+            },
+        )
+        .expect("geometry");
+
+        assert_eq!(geometry.size.cols, 1);
+        assert_eq!(geometry.size.rows, 1);
+    }
 
     #[test]
     fn builds_runs_with_utf8_byte_lengths() {

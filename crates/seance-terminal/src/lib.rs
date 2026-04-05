@@ -22,7 +22,80 @@ use tracing::trace;
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
+const DEFAULT_CELL_WIDTH_PX: u16 = 8;
+const DEFAULT_CELL_HEIGHT_PX: u16 = 19;
+const DEFAULT_PIXEL_WIDTH: u16 = DEFAULT_COLS * DEFAULT_CELL_WIDTH_PX;
+const DEFAULT_PIXEL_HEIGHT: u16 = DEFAULT_ROWS * DEFAULT_CELL_HEIGHT_PX;
 const MAX_RENDERED_LINES: usize = 2_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalPixelSize {
+    pub width_px: u16,
+    pub height_px: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalGeometry {
+    pub size: TerminalSize,
+    pub pixel_size: TerminalPixelSize,
+    pub cell_width_px: u16,
+    pub cell_height_px: u16,
+}
+
+impl TerminalGeometry {
+    pub fn new(
+        cols: u16,
+        rows: u16,
+        width_px: u16,
+        height_px: u16,
+        cell_width_px: u16,
+        cell_height_px: u16,
+    ) -> Result<Self> {
+        anyhow::ensure!(cols > 0, "terminal cols must be greater than zero");
+        anyhow::ensure!(rows > 0, "terminal rows must be greater than zero");
+        anyhow::ensure!(
+            cell_width_px > 0,
+            "terminal cell width must be greater than zero"
+        );
+        anyhow::ensure!(
+            cell_height_px > 0,
+            "terminal cell height must be greater than zero"
+        );
+
+        Ok(Self {
+            size: TerminalSize { cols, rows },
+            pixel_size: TerminalPixelSize {
+                width_px,
+                height_px,
+            },
+            cell_width_px,
+            cell_height_px,
+        })
+    }
+}
+
+impl Default for TerminalGeometry {
+    fn default() -> Self {
+        Self {
+            size: TerminalSize {
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+            pixel_size: TerminalPixelSize {
+                width_px: DEFAULT_PIXEL_WIDTH,
+                height_px: DEFAULT_PIXEL_HEIGHT,
+            },
+            cell_width_px: DEFAULT_CELL_WIDTH_PX,
+            cell_height_px: DEFAULT_CELL_HEIGHT_PX,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionSnapshot {
@@ -145,6 +218,13 @@ impl LocalSessionHandle {
             .context("failed to forward input to local shell")
     }
 
+    pub fn resize(&self, geometry: TerminalGeometry) -> Result<()> {
+        trace!(?geometry, session_id = self.id, "queueing terminal resize");
+        self.command_tx
+            .send(SessionCommand::Resize(geometry))
+            .context("failed to forward resize to local shell")
+    }
+
     pub fn perf_snapshot(&self) -> SessionPerfSnapshot {
         let mut perf = self.perf_snapshot.lock().expect("session perf poisoned");
         let snapshot = perf.snapshot.clone();
@@ -175,6 +255,7 @@ impl LocalSessionFactory {
 
 enum SessionCommand {
     Input(Vec<u8>),
+    Resize(TerminalGeometry),
 }
 
 #[derive(Debug, Default)]
@@ -240,13 +321,14 @@ fn run_local_session(
     perf_snapshot: Arc<Mutex<SessionPerfState>>,
     command_rx: mpsc::Receiver<SessionCommand>,
 ) -> Result<()> {
+    let mut current_geometry = TerminalGeometry::default();
     let pty_system = native_pty_system();
     let pty_pair = pty_system
         .openpty(PtySize {
-            rows: DEFAULT_ROWS,
-            cols: DEFAULT_COLS,
-            pixel_width: 0,
-            pixel_height: 0,
+            rows: current_geometry.size.rows,
+            cols: current_geometry.size.cols,
+            pixel_width: current_geometry.pixel_size.width_px,
+            pixel_height: current_geometry.pixel_size.height_px,
         })
         .context("failed to open PTY")?;
 
@@ -288,8 +370,8 @@ fn run_local_session(
         .context("failed to spawn PTY reader")?;
 
     let mut terminal = Terminal::new(TerminalOptions {
-        cols: DEFAULT_COLS,
-        rows: DEFAULT_ROWS,
+        cols: current_geometry.size.cols,
+        rows: current_geometry.size.rows,
         max_scrollback: 10_000,
     })
     .context("failed to initialize Ghostty terminal")?;
@@ -327,6 +409,46 @@ fn run_local_session(
                     .write_all(&bytes)
                     .context("failed to write input to PTY")?;
                 writer.flush().ok();
+            }
+            Ok(SessionCommand::Resize(new_geometry)) => {
+                if new_geometry == current_geometry {
+                    trace!(?new_geometry, "skipping redundant terminal resize");
+                    continue;
+                }
+
+                pty_pair
+                    .master
+                    .resize(PtySize {
+                        rows: new_geometry.size.rows,
+                        cols: new_geometry.size.cols,
+                        pixel_width: new_geometry.pixel_size.width_px,
+                        pixel_height: new_geometry.pixel_size.height_px,
+                    })
+                    .context("failed to resize PTY")?;
+                trace!(?new_geometry, "applied PTY resize");
+
+                terminal
+                    .resize(
+                        new_geometry.size.cols,
+                        new_geometry.size.rows,
+                        u32::from(new_geometry.cell_width_px),
+                        u32::from(new_geometry.cell_height_px),
+                    )
+                    .context("failed to resize Ghostty terminal")?;
+                trace!(?new_geometry, "applied Ghostty resize");
+
+                current_geometry = new_geometry;
+                publish_snapshot(
+                    &snapshot,
+                    &perf_snapshot,
+                    &mut terminal,
+                    &mut render_state,
+                    &mut row_iterator,
+                    &mut cell_iterator,
+                    pending_vt_bytes,
+                    None,
+                );
+                pending_vt_bytes = 0;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -560,6 +682,26 @@ fn normalize_cell_style(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_geometry_defaults_are_consistent() {
+        let geometry = TerminalGeometry::default();
+
+        assert_eq!(geometry.size.cols, DEFAULT_COLS);
+        assert_eq!(geometry.size.rows, DEFAULT_ROWS);
+        assert_eq!(geometry.pixel_size.width_px, DEFAULT_PIXEL_WIDTH);
+        assert_eq!(geometry.pixel_size.height_px, DEFAULT_PIXEL_HEIGHT);
+        assert_eq!(geometry.cell_width_px, DEFAULT_CELL_WIDTH_PX);
+        assert_eq!(geometry.cell_height_px, DEFAULT_CELL_HEIGHT_PX);
+    }
+
+    #[test]
+    fn resize_command_rejects_invalid_geometry() {
+        assert!(TerminalGeometry::new(0, 24, 100, 100, 8, 19).is_err());
+        assert!(TerminalGeometry::new(80, 0, 100, 100, 8, 19).is_err());
+        assert!(TerminalGeometry::new(80, 24, 100, 100, 0, 19).is_err());
+        assert!(TerminalGeometry::new(80, 24, 100, 100, 8, 0).is_err());
+    }
 
     fn render_lines_from_vt(vt: &[u8]) -> Vec<TerminalLine> {
         let mut terminal = Terminal::new(TerminalOptions {
