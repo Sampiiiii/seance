@@ -102,3 +102,15 @@ seance-ui (GPUI render terminal grid)
 * Write integration tests for SSH against a local `sshd` in CI
 * Target Rust stable, no nightly features
 * Format with `rustfmt`, lint with `clippy`, deny all warnings in CI
+
+## Module Organization Policy
+
+* Keep `lib.rs` or `main.rs` as the crate's API map and high-level wiring, not the long-term home for mixed implementation details
+* Split a growing root file once it starts mixing 3 or more concerns such as models, validation, persistence, platform glue, or UI coordination, or once it exceeds roughly 250-350 meaningful lines
+* Prefer concern-based module names such as `model`, `storage`, `validation`, `defaults`, `backend`, `actions`, or `theme` over type-per-file layouts
+* Preserve import ergonomics by re-exporting stable public types from the crate root when downstream crates commonly use them together
+* Keep stable data structures and their core validation logic close to each other; move persistence, platform integration, and heavy orchestration into separate modules
+* Avoid both extremes: one giant root file and excessive fragmentation into many tiny files with weak ownership boundaries
+* Place tests near the concern they exercise so behavior stays easy to find and validate during refactors
+* Add a short top-of-file ownership comment when a module's responsibility is not obvious from its name alone
+* Use `seance-config`, `seance-vault`, and `seance-ui` as the reference patterns for concern-based crate structure
