@@ -49,7 +49,7 @@ Resident lifecycle behavior now works like this:
 ## Getting started
 
 ```
-git clone https://github.com/yourusername/seance.git
+git clone https://github.com/sampiiiii/seance.git
 cd seance
 make run
 ```
