@@ -403,11 +403,7 @@ impl SshSessionManager {
         })
     }
 
-    pub fn sftp_mkdir(
-        &self,
-        session_id: u64,
-        path: &str,
-    ) -> std::result::Result<(), SshError> {
+    pub fn sftp_mkdir(&self, session_id: u64, path: &str) -> std::result::Result<(), SshError> {
         let sftp = self.get_sftp(session_id)?;
         let path = path.to_string();
         self.runtime.block_on(async {
@@ -474,11 +470,7 @@ impl SshSessionManager {
                 .metadata(&path_str)
                 .await
                 .map_err(|err| SshError::SftpOperation(err.to_string()))?;
-            let name = path_str
-                .rsplit('/')
-                .next()
-                .unwrap_or(&path_str)
-                .to_string();
+            let name = path_str.rsplit('/').next().unwrap_or(&path_str).to_string();
             Ok(SftpEntry {
                 name,
                 path: path_str,

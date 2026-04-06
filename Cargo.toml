@@ -1,7 +1,11 @@
 [workspace]
 members = [
     "crates/seance-app",
+    "crates/seance-core",
     "crates/seance-config",
+    "crates/seance-platform",
+    "crates/seance-platform-linux",
+    "crates/seance-platform-macos",
     "crates/seance-ssh",
     "crates/seance-terminal",
     "crates/seance-ui",

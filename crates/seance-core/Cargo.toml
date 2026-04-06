@@ -1,17 +1,11 @@
 [package]
-name = "seance-ui"
+name = "seance-core"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
 dirs = "6.0"
-gpui = "0.2.2"
-seance-core = { path = "../seance-core" }
-seance-platform = { path = "../seance-platform" }
 seance-ssh = { path = "../seance-ssh" }
 seance-terminal = { path = "../seance-terminal" }
 seance-vault = { path = "../seance-vault" }
-serde_json = "1.0"
-tracing = "0.1"
-zeroize = "1.8"

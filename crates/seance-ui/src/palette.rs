@@ -309,7 +309,11 @@ pub fn build_items(
             let algo = match &key.algorithm {
                 PrivateKeyAlgorithm::Ed25519 => "Ed25519",
                 PrivateKeyAlgorithm::Rsa { bits } => {
-                    if *bits == 4096 { "RSA-4096" } else { "RSA" }
+                    if *bits == 4096 {
+                        "RSA-4096"
+                    } else {
+                        "RSA"
+                    }
                 }
             };
             items.push(PaletteItem {

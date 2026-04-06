@@ -52,6 +52,32 @@ impl ThemeId {
             ThemeId::SolarizedDark => solarized_dark(),
         }
     }
+
+    pub fn key(&self) -> &'static str {
+        match self {
+            ThemeId::ObsidianSmoke => "obsidian-smoke",
+            ThemeId::MidnightFrost => "midnight-frost",
+            ThemeId::Bone => "bone",
+            ThemeId::Phosphor => "phosphor",
+            ThemeId::TokyoNight => "tokyo-night",
+            ThemeId::CatppuccinMocha => "catppuccin-mocha",
+            ThemeId::RosePine => "rose-pine",
+            ThemeId::Dracula => "dracula",
+            ThemeId::Nord => "nord",
+            ThemeId::SolarizedDark => "solarized-dark",
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        self.theme().name
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|theme_id| theme_id.key() == key)
+    }
 }
 
 pub struct Theme {

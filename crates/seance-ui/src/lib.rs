@@ -1,3 +1,4 @@
+mod actions;
 mod backend;
 mod palette;
 mod theme;
@@ -6,31 +7,43 @@ use std::{
     collections::{HashMap, VecDeque},
     env, fs,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::Receiver,
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use gpui::{
-    App, Application, Bounds, Context, Div, FocusHandle, Focusable, FontWeight, KeyDownEvent,
-    MouseButton, Pixels, ShapedLine, SharedString, TextRun, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, canvas, deferred, div, fill, font, point, prelude::*, px, size,
+    AnyWindowHandle, App, Application, Bounds, Context, Div, FocusHandle, Focusable, FontWeight,
+    Global, KeyBinding, KeyDownEvent, MouseButton, Pixels, ShapedLine, SharedString, TextRun,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, canvas, deferred, div, fill,
+    font, point, prelude::*, px, size,
 };
+use seance_core::{AppControllerHandle, PlatformCloseAction, SessionKind, WindowTarget};
 use seance_terminal::{
     SessionPerfSnapshot, TerminalCell, TerminalCellStyle, TerminalColor, TerminalGeometry,
     TerminalRow, TerminalSession,
 };
 use seance_vault::{
-    CredentialSummary, HostAuthRef, HostSummary, KeySummary, PrivateKeyAlgorithm,
-    PrivateKeySource, SecretString, VaultHostProfile, VaultPasswordCredential, VaultStore,
+    CredentialSummary, HostAuthRef, HostSummary, KeySummary, PrivateKeyAlgorithm, PrivateKeySource,
+    SecretString, VaultHostProfile, VaultPasswordCredential,
 };
 use tracing::trace;
 use zeroize::Zeroizing;
 
+pub use actions::{
+    CloseActiveSession, ConnectHost, HideOtherApps, HideSeance, NewTerminal, OpenCommandPalette,
+    OpenNewWindow, OpenPreferences, QuitSeance, SelectSession, ShowAllApps, SwitchTheme,
+    TogglePerfHud,
+};
 use backend::UiBackend;
 use palette::{PaletteAction, PaletteGroup, build_items};
 use seance_ssh::{SftpEntry, SshConnectResult, SshError};
-use theme::{Theme, ThemeId};
+use theme::Theme;
+pub use theme::ThemeId;
 
 const SIDEBAR_WIDTH: f32 = 260.0;
 const SIDEBAR_FONT_MONO: &str = "JetBrains Mono";
@@ -42,116 +55,477 @@ const TERMINAL_FONT_SIZE_PX: f32 = 13.0;
 const TERMINAL_LINE_HEIGHT_PX: f32 = 19.0;
 const TERMINAL_PANE_PADDING_PX: f32 = 16.0;
 
-pub fn run(vault: VaultStore) -> Result<()> {
-    let mut backend = UiBackend::new(vault)?;
-    let vault_status = backend.vault_status();
-    let device_unlock_attempted = vault_status.initialized;
-    if vault_status.initialized {
-        let _ = backend.try_unlock_with_device();
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UiCommand {
+    OpenWindow { target: WindowTarget },
+    ActivateApp,
+    HideApp,
+    QuitApp,
+    OpenHost { host_id: String },
+}
+
+#[derive(Default)]
+pub struct UiIntegration {
+    pub configure_application: Option<Box<dyn Fn(&Application)>>,
+    pub configure_app: Option<Box<dyn Fn(&mut App)>>,
+    pub refresh_app_menus: Option<Arc<dyn Fn(&mut App) + Send + Sync>>,
+}
+
+pub struct UiRuntime {
+    pub controller: AppControllerHandle,
+    pub commands: Receiver<UiCommand>,
+    pub integration: UiIntegration,
+}
+
+pub fn run(runtime: UiRuntime) -> Result<()> {
+    let UiRuntime {
+        controller,
+        commands,
+        mut integration,
+    } = runtime;
+    let backend = UiBackend::new(controller)?;
+    let menu_refresher = integration.refresh_app_menus.clone();
+    let application = Application::new();
+    if let Some(configure_application) = integration.configure_application.take() {
+        configure_application(&application);
     }
-    let unlocked = backend.vault_status().unlocked;
-    let initial_saved_hosts = if unlocked {
-        backend.list_hosts().unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let initial_credentials = if unlocked {
-        backend.list_password_credentials().unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let initial_keys = if unlocked {
-        backend.list_private_keys().unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let initial = backend
-        .spawn_local_session()
-        .expect("failed to create initial local session");
-    let initial_id = initial.id();
 
-    Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_background: WindowBackgroundAppearance::Blurred,
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Séance".into()),
-                    appears_transparent: true,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            move |window, cx| {
-                cx.new(move |cx| {
-                    let entity = cx.entity();
-                    let focus_handle = cx.focus_handle();
-                    focus_handle.focus(window);
+    application.run(move |cx: &mut App| {
+        if let Some(menu_refresher) = menu_refresher.clone() {
+            cx.set_global(AppMenuRefresher(menu_refresher));
+        }
+        cx.set_global(WorkspaceWindowRegistry::default());
+        register_app_actions(cx, backend.clone());
+        if let Some(configure_app) = integration.configure_app.take() {
+            configure_app(cx);
+        }
+        refresh_app_menus(cx);
 
-                    let mut ws = SeanceWorkspace {
-                        focus_handle,
-                        sessions: vec![initial],
-                        session_kinds: HashMap::from([(initial_id, SessionKind::Local)]),
-                        active_session_id: initial_id,
-                        backend,
-                        saved_hosts: initial_saved_hosts,
-                        selected_host_id: None,
-                        connecting_host_id: None,
-                        unlock_form: UnlockFormState::new(
-                            vault_status.initialized,
-                            unlocked,
-                            device_unlock_attempted,
-                        ),
-                        host_editor: None,
-                        credential_editor: None,
-                        vault_panel_open: false,
-                        sftp_browser: None,
-                        cached_credentials: initial_credentials,
-                        cached_keys: initial_keys,
-                        status_message: None,
-                        active_theme: ThemeId::ObsidianSmoke,
-                        palette_open: false,
-                        palette_query: String::new(),
-                        palette_selected: 0,
-                        terminal_metrics: None,
-                        last_applied_geometry: None,
-                        active_terminal_rows: TerminalGeometry::default().size.rows as usize,
-                        terminal_surface: TerminalSurfaceState {
-                            theme_id: ThemeId::ObsidianSmoke,
-                            ..Default::default()
-                        },
-                        perf_overlay: PerfOverlayState::new(perf_mode_from_env()),
+        let async_app = cx.to_async();
+        let quit_requested = Arc::new(AtomicBool::new(false));
+        let backend_for_close = backend.clone();
+        let quit_requested_for_close = Arc::clone(&quit_requested);
+        cx.on_window_closed(move |cx| {
+            backend_for_close.controller().on_window_closed();
+            WorkspaceWindowRegistry::retain_open_windows(cx);
+            if cx.windows().is_empty() && !quit_requested_for_close.load(Ordering::Relaxed) {
+                match backend_for_close.controller().on_last_window_closed() {
+                    PlatformCloseAction::Hide => cx.hide(),
+                    PlatformCloseAction::Exit => cx.quit(),
+                }
+            }
+            refresh_app_menus(cx);
+        })
+        .detach();
+
+        let commands = Arc::new(Mutex::new(commands));
+        let backend_for_commands = backend.clone();
+        let quit_requested_for_commands = Arc::clone(&quit_requested);
+        cx.foreground_executor()
+            .spawn(async move {
+                loop {
+                    let commands_for_recv = Arc::clone(&commands);
+                    let recv_result = async_app
+                        .background_executor()
+                        .spawn(async move { commands_for_recv.lock().unwrap().recv() })
+                        .await;
+                    let Ok(command) = recv_result else {
+                        break;
                     };
-                    cx.observe_window_bounds(window, |this: &mut SeanceWorkspace, window, cx| {
-                        this.apply_active_terminal_geometry(window);
-                        this.invalidate_terminal_surface();
-                        this.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
-                        cx.notify();
-                    })
-                    .detach();
-                    ws.apply_active_terminal_geometry(window);
-                    if let Some(notify_rx) = ws.active_session().and_then(|s| s.take_notify_rx()) {
-                        SeanceWorkspace::schedule_session_watcher(
-                            window,
-                            cx,
-                            entity.clone(),
-                            notify_rx,
-                        );
-                    }
-                    ws
-                })
-            },
-        )
-        .expect("failed to open Séance window");
+                    let backend = backend_for_commands.clone();
+                    let quit_requested = Arc::clone(&quit_requested_for_commands);
+                    let _ = async_app.update(move |cx| match command {
+                        UiCommand::OpenWindow { target } => {
+                            let _ = open_workspace_window(cx, backend, target, None);
+                            refresh_app_menus(cx);
+                        }
+                        UiCommand::ActivateApp => cx.activate(false),
+                        UiCommand::HideApp => cx.hide(),
+                        UiCommand::QuitApp => {
+                            quit_requested.store(true, Ordering::Relaxed);
+                            cx.quit();
+                        }
+                        UiCommand::OpenHost { host_id } => {
+                            let _ = open_workspace_window(
+                                cx,
+                                backend,
+                                WindowTarget::MostRecentOrNew,
+                                Some(InitialWorkspaceAction::ConnectHost(host_id)),
+                            );
+                            cx.activate(false);
+                            refresh_app_menus(cx);
+                        }
+                    });
+                }
+            })
+            .detach();
     });
+    Ok(())
+}
+
+#[derive(Clone)]
+struct AppMenuRefresher(Arc<dyn Fn(&mut App) + Send + Sync>);
+
+impl Global for AppMenuRefresher {}
+
+#[derive(Default)]
+struct WorkspaceWindowRegistry {
+    ordered: Vec<AnyWindowHandle>,
+}
+
+impl Global for WorkspaceWindowRegistry {}
+
+impl WorkspaceWindowRegistry {
+    fn ordered_handles(&self) -> Vec<AnyWindowHandle> {
+        self.ordered.clone()
+    }
+
+    fn register(cx: &mut App, handle: AnyWindowHandle) {
+        cx.update_global(|registry: &mut Self, _| {
+            promote_unique(&mut registry.ordered, handle);
+        });
+    }
+
+    fn unregister(cx: &mut App, handle: AnyWindowHandle) {
+        cx.update_global(|registry: &mut Self, _| {
+            remove_item(&mut registry.ordered, handle);
+        });
+    }
+
+    fn promote(cx: &mut App, handle: AnyWindowHandle) {
+        cx.update_global(|registry: &mut Self, _| {
+            promote_unique(&mut registry.ordered, handle);
+        });
+    }
+
+    fn retain_open_windows(cx: &mut App) {
+        let live_windows = cx.windows();
+        cx.update_global(|registry: &mut Self, _| {
+            registry
+                .ordered
+                .retain(|handle| live_windows.contains(handle));
+        });
+    }
+}
+
+#[derive(Clone, Debug)]
+enum InitialWorkspaceAction {
+    ConnectHost(String),
+    OpenPreferences,
+    OpenCommandPalette,
+    TogglePerfHud,
+    SwitchTheme(ThemeId),
+}
+
+fn refresh_app_menus(cx: &mut App) {
+    let refresher = cx.try_global::<AppMenuRefresher>().cloned();
+    if let Some(refresher) = refresher {
+        (refresher.0)(cx);
+    }
+}
+
+fn promote_unique<H: Copy + PartialEq>(ordered: &mut Vec<H>, item: H) {
+    remove_item(ordered, item);
+    ordered.insert(0, item);
+}
+
+fn remove_item<H: PartialEq>(ordered: &mut Vec<H>, item: H) {
+    if let Some(index) = ordered.iter().position(|existing| *existing == item) {
+        ordered.remove(index);
+    }
+}
+
+fn with_registered_workspace(
+    cx: &mut App,
+    mut update: impl FnMut(&mut SeanceWorkspace, &mut Window, &mut Context<SeanceWorkspace>),
+) -> bool {
+    let candidates = cx
+        .try_global::<WorkspaceWindowRegistry>()
+        .map(WorkspaceWindowRegistry::ordered_handles)
+        .unwrap_or_default();
+
+    if candidates.is_empty() {
+        trace!("with_registered_workspace: no candidate windows in registry");
+    }
+
+    let mut stale_handles = Vec::new();
+
+    for window_handle in candidates {
+        match window_handle.update(cx, |root, window, cx| {
+            let Ok(workspace) = root.downcast::<SeanceWorkspace>() else {
+                trace!("with_registered_workspace: downcast failed for window {:?}", window_handle.window_id());
+                return false;
+            };
+            cx.activate(false);
+            window.activate_window();
+            workspace.update(cx, |this, cx| {
+                update(this, window, cx);
+            });
+            true
+        }) {
+            Ok(true) => {
+                WorkspaceWindowRegistry::promote(cx, window_handle);
+                return true;
+            }
+            Ok(false) => stale_handles.push(window_handle),
+            Err(err) => {
+                trace!("with_registered_workspace: window update failed for {:?}: {err}", window_handle.window_id());
+                stale_handles.push(window_handle);
+            }
+        }
+    }
+
+    for handle in stale_handles {
+        WorkspaceWindowRegistry::unregister(cx, handle);
+    }
+
+    false
+}
+
+fn register_app_actions(cx: &mut App, backend: UiBackend) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-,", OpenPreferences, None),
+        KeyBinding::new("cmd-k", OpenCommandPalette, None),
+        KeyBinding::new("cmd-t", NewTerminal, None),
+        KeyBinding::new("cmd-w", CloseActiveSession, None),
+        KeyBinding::new("cmd-shift-.", TogglePerfHud, None),
+        KeyBinding::new("cmd-n", OpenNewWindow, None),
+        KeyBinding::new("cmd-q", QuitSeance, None),
+        KeyBinding::new("cmd-h", HideSeance, None),
+    ]);
+
+    let backend_for_new_terminal = backend.clone();
+    cx.on_action(move |_: &NewTerminal, cx| {
+        if !with_registered_workspace(cx, |this, window, cx| this.spawn_session(window, cx)) {
+            let _ = open_workspace_window(
+                cx,
+                backend_for_new_terminal.clone(),
+                WindowTarget::NewLocal,
+                None,
+            );
+        }
+        refresh_app_menus(cx);
+    });
+
+    let backend_for_palette = backend.clone();
+    cx.on_action(move |_: &OpenCommandPalette, cx| {
+        if !with_registered_workspace(cx, |this, _window, cx| this.toggle_palette(cx)) {
+            let _ = open_workspace_window(
+                cx,
+                backend_for_palette.clone(),
+                WindowTarget::MostRecentOrNew,
+                Some(InitialWorkspaceAction::OpenCommandPalette),
+            );
+        }
+    });
+
+    let backend_for_preferences = backend.clone();
+    cx.on_action(move |_: &OpenPreferences, cx| {
+        if !with_registered_workspace(cx, |this, _window, cx| this.open_vault_panel(cx)) {
+            let _ = open_workspace_window(
+                cx,
+                backend_for_preferences.clone(),
+                WindowTarget::MostRecentOrNew,
+                Some(InitialWorkspaceAction::OpenPreferences),
+            );
+        }
+        refresh_app_menus(cx);
+    });
+
+    cx.on_action(move |_: &CloseActiveSession, cx| {
+        let handled = with_registered_workspace(cx, |this, _window, cx| {
+            if this.active_session_id != 0 {
+                this.close_session(this.active_session_id, cx);
+            }
+        });
+        if handled {
+            refresh_app_menus(cx);
+        }
+    });
+
+    let backend_for_new_window = backend.clone();
+    cx.on_action(move |_: &OpenNewWindow, cx| {
+        let _ = open_workspace_window(
+            cx,
+            backend_for_new_window.clone(),
+            WindowTarget::MostRecentOrNew,
+            None,
+        );
+        cx.activate(false);
+        refresh_app_menus(cx);
+    });
+
+    let backend_for_toggle_perf = backend.clone();
+    cx.on_action(move |_: &TogglePerfHud, cx| {
+        if !with_registered_workspace(cx, |this, window, cx| this.toggle_perf_mode(window, cx)) {
+            let _ = open_workspace_window(
+                cx,
+                backend_for_toggle_perf.clone(),
+                WindowTarget::MostRecentOrNew,
+                Some(InitialWorkspaceAction::TogglePerfHud),
+            );
+        }
+    });
+
+    cx.on_action(move |_: &QuitSeance, cx| {
+        cx.quit();
+    });
+
+    cx.on_action(move |_: &HideSeance, cx| {
+        cx.hide();
+    });
+
+    cx.on_action(move |_: &HideOtherApps, _cx| {});
+    cx.on_action(move |_: &ShowAllApps, _cx| {});
+
+    let backend_for_connect_host = backend.clone();
+    cx.on_action(move |action: &ConnectHost, cx| {
+        let host_id = action.host_id.clone();
+        if !with_registered_workspace(cx, |this, window, cx| {
+            this.selected_host_id = Some(host_id.clone());
+            this.connect_saved_host(&host_id, window, cx);
+        }) {
+            let _ = open_workspace_window(
+                cx,
+                backend_for_connect_host.clone(),
+                WindowTarget::MostRecentOrNew,
+                Some(InitialWorkspaceAction::ConnectHost(host_id)),
+            );
+        }
+        refresh_app_menus(cx);
+    });
+
+    let backend_for_select_session = backend.clone();
+    cx.on_action(move |action: &SelectSession, cx| {
+        let session_id = action.session_id;
+        if !with_registered_workspace(cx, |this, _window, cx| {
+            if this.backend.session(session_id).is_some() {
+                this.select_session(session_id, cx);
+            }
+        }) {
+            let _ = open_workspace_window(
+                cx,
+                backend_for_select_session.clone(),
+                WindowTarget::Session { session_id },
+                None,
+            );
+            cx.activate(false);
+        }
+        refresh_app_menus(cx);
+    });
+
+    let backend_for_switch_theme = backend;
+    cx.on_action(move |action: &SwitchTheme, cx| {
+        let theme_id = action.theme_id;
+        if !with_registered_workspace(cx, |this, _window, cx| this.apply_theme(theme_id, cx)) {
+            let _ = open_workspace_window(
+                cx,
+                backend_for_switch_theme.clone(),
+                WindowTarget::MostRecentOrNew,
+                Some(InitialWorkspaceAction::SwitchTheme(theme_id)),
+            );
+        }
+        refresh_app_menus(cx);
+    });
+}
+
+fn open_workspace_window(
+    cx: &mut App,
+    backend: UiBackend,
+    target: WindowTarget,
+    initial_action: Option<InitialWorkspaceAction>,
+) -> Result<()> {
+    let bootstrap = backend.controller().prepare_window(target)?;
+    backend.controller().on_window_opened();
+    let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_background: WindowBackgroundAppearance::Blurred,
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("Séance".into()),
+                appears_transparent: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        move |window, cx| {
+            let window_handle = window.window_handle();
+            WorkspaceWindowRegistry::register(cx, window_handle);
+            let backend = backend.clone();
+            let bootstrap = bootstrap.clone();
+            let initial_action = initial_action.clone();
+            cx.new(move |cx| {
+                let entity = cx.entity();
+                let focus_handle = cx.focus_handle();
+                focus_handle.focus(window);
+                let _ = cx.on_release({
+                    let window_handle = window_handle;
+                    move |_, cx| {
+                        WorkspaceWindowRegistry::unregister(cx, window_handle);
+                    }
+                });
+
+                let mut ws = SeanceWorkspace {
+                    focus_handle,
+                    active_session_id: bootstrap.attached_session_id,
+                    backend: backend.clone(),
+                    saved_hosts: bootstrap.saved_hosts.clone(),
+                    selected_host_id: None,
+                    connecting_host_id: None,
+                    unlock_form: UnlockFormState::new(
+                        bootstrap.vault_status.initialized,
+                        bootstrap.vault_status.unlocked,
+                        bootstrap.device_unlock_attempted,
+                    ),
+                    host_editor: None,
+                    credential_editor: None,
+                    vault_panel_open: false,
+                    sftp_browser: None,
+                    cached_credentials: bootstrap.cached_credentials.clone(),
+                    cached_keys: bootstrap.cached_keys.clone(),
+                    status_message: None,
+                    active_theme: ThemeId::ObsidianSmoke,
+                    palette_open: false,
+                    palette_query: String::new(),
+                    palette_selected: 0,
+                    terminal_metrics: None,
+                    last_applied_geometry: None,
+                    active_terminal_rows: TerminalGeometry::default().size.rows as usize,
+                    terminal_surface: TerminalSurfaceState {
+                        theme_id: ThemeId::ObsidianSmoke,
+                        ..Default::default()
+                    },
+                    perf_overlay: PerfOverlayState::new(perf_mode_from_env()),
+                };
+                cx.observe_window_bounds(window, |this: &mut SeanceWorkspace, window, cx| {
+                    this.apply_active_terminal_geometry(window);
+                    this.invalidate_terminal_surface();
+                    this.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
+                    cx.notify();
+                })
+                .detach();
+                ws.apply_active_terminal_geometry(window);
+                if let Some(notify_rx) = ws.active_session().and_then(|s| s.take_notify_rx()) {
+                    SeanceWorkspace::schedule_session_watcher(
+                        window,
+                        cx,
+                        entity.clone(),
+                        notify_rx,
+                    );
+                }
+                if let Some(initial_action) = initial_action.as_ref() {
+                    ws.apply_initial_action(initial_action.clone(), window, cx);
+                }
+                ws
+            })
+        },
+    )?;
     Ok(())
 }
 
 struct SeanceWorkspace {
     focus_handle: FocusHandle,
-    sessions: Vec<Arc<dyn TerminalSession>>,
-    session_kinds: HashMap<u64, SessionKind>,
     active_session_id: u64,
     backend: UiBackend,
     saved_hosts: Vec<HostSummary>,
@@ -174,12 +548,6 @@ struct SeanceWorkspace {
     active_terminal_rows: usize,
     terminal_surface: TerminalSurfaceState,
     perf_overlay: PerfOverlayState,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SessionKind {
-    Local,
-    Remote,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -499,8 +867,7 @@ impl HostEditorState {
             auth_cursor: 0,
             selected_field: 0,
             message: Some(
-                "Create an encrypted SSH host. Use the Auth section to select credentials."
-                    .into(),
+                "Create an encrypted SSH host. Use the Auth section to select credentials.".into(),
             ),
         }
     }
@@ -1016,22 +1383,59 @@ fn local_session_display_number_for_ids(
     None
 }
 
+fn session_kind_map_from_sessions(
+    sessions: &[Arc<dyn TerminalSession>],
+    backend: &UiBackend,
+) -> HashMap<u64, SessionKind> {
+    sessions
+        .iter()
+        .filter_map(|session| {
+            backend
+                .session_kind(session.id())
+                .map(|kind| (session.id(), kind))
+        })
+        .collect()
+}
+
 impl SeanceWorkspace {
+    fn apply_initial_action(
+        &mut self,
+        action: InitialWorkspaceAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            InitialWorkspaceAction::ConnectHost(host_id) => {
+                self.selected_host_id = Some(host_id.clone());
+                self.connect_saved_host(&host_id, window, cx);
+            }
+            InitialWorkspaceAction::OpenPreferences => self.open_vault_panel(cx),
+            InitialWorkspaceAction::OpenCommandPalette => self.toggle_palette(cx),
+            InitialWorkspaceAction::TogglePerfHud => self.toggle_perf_mode(window, cx),
+            InitialWorkspaceAction::SwitchTheme(theme_id) => self.apply_theme(theme_id, cx),
+        }
+    }
+
     fn theme(&self) -> Theme {
         self.active_theme.theme()
     }
 
     fn session_kind(&self, id: u64) -> Option<SessionKind> {
-        self.session_kinds.get(&id).copied()
+        self.backend.session_kind(id)
+    }
+
+    fn sessions(&self) -> Vec<Arc<dyn TerminalSession>> {
+        self.backend.list_sessions()
     }
 
     fn local_session_display_number(&self, id: u64) -> Option<usize> {
-        let session_ids = self
-            .sessions
+        let sessions = self.sessions();
+        let session_ids = sessions
             .iter()
             .map(|session| session.id())
             .collect::<Vec<_>>();
-        local_session_display_number_for_ids(&session_ids, &self.session_kinds, id)
+        let session_kinds = session_kind_map_from_sessions(&sessions, &self.backend);
+        local_session_display_number_for_ids(&session_ids, &session_kinds, id)
     }
 
     fn session_display_title(&self, session: &Arc<dyn TerminalSession>) -> String {
@@ -1059,14 +1463,14 @@ impl SeanceWorkspace {
     }
 
     fn palette_session_labels(&self) -> HashMap<u64, String> {
-        self.sessions
+        self.sessions()
             .iter()
             .map(|session| (session.id(), self.session_display_title(session)))
             .collect()
     }
 
     fn remote_session_ids(&self) -> Vec<u64> {
-        self.sessions
+        self.sessions()
             .iter()
             .filter(|s| self.session_kind(s.id()) == Some(SessionKind::Remote))
             .map(|s| s.id())
@@ -1102,7 +1506,7 @@ impl SeanceWorkspace {
     }
 
     fn apply_active_terminal_geometry(&mut self, window: &Window) {
-        let Some(session) = self.active_session().cloned() else {
+        let Some(session) = self.active_session() else {
             self.last_applied_geometry = None;
             self.active_terminal_rows = TerminalGeometry::default().size.rows as usize;
             return;
@@ -1192,7 +1596,7 @@ impl SeanceWorkspace {
     }
 
     fn sync_terminal_surface(&mut self, window: &mut Window) {
-        let Some(session) = self.active_session().cloned() else {
+        let Some(session) = self.active_session() else {
             self.terminal_surface.rows.clear();
             self.terminal_surface.metrics = TerminalRendererMetrics::default();
             self.terminal_surface.active_session_id = 0;
@@ -1248,6 +1652,14 @@ impl SeanceWorkspace {
         self.perf_overlay
             .mark_ui_refresh_request(Instant::now(), RedrawReason::UiRefresh);
         window.refresh();
+        cx.notify();
+    }
+
+    fn apply_theme(&mut self, theme_id: ThemeId, cx: &mut Context<Self>) {
+        self.active_theme = theme_id;
+        self.invalidate_terminal_surface();
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        refresh_app_menus(cx);
         cx.notify();
     }
 
@@ -1320,6 +1732,7 @@ impl SeanceWorkspace {
         }
 
         self.perf_overlay.mark_input(RedrawReason::Input);
+        refresh_app_menus(cx);
         cx.notify();
     }
 
@@ -1339,6 +1752,7 @@ impl SeanceWorkspace {
         self.palette_open = false;
         self.invalidate_terminal_surface();
         self.perf_overlay.mark_input(RedrawReason::Input);
+        refresh_app_menus(cx);
         cx.notify();
     }
 
@@ -1390,6 +1804,7 @@ impl SeanceWorkspace {
         }
         self.palette_open = false;
         self.perf_overlay.mark_input(RedrawReason::Palette);
+        refresh_app_menus(cx);
         cx.notify();
     }
 
@@ -1445,11 +1860,11 @@ impl SeanceWorkspace {
                     let _ = session.resize(geometry);
                 }
                 self.active_session_id = session.id();
-                self.session_kinds.insert(session.id(), SessionKind::Remote);
+                self.backend.register_remote_session(Arc::clone(&session));
                 if let Some(notify_rx) = session.take_notify_rx() {
                     Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
                 }
-                self.sessions.push(session);
+                self.backend.touch_session(session.id());
                 self.vault_panel_open = false;
                 self.status_message = Some("SSH session connected.".into());
                 self.invalidate_terminal_surface();
@@ -1460,6 +1875,7 @@ impl SeanceWorkspace {
         }
         self.palette_open = false;
         self.perf_overlay.mark_input(RedrawReason::Palette);
+        refresh_app_menus(cx);
         cx.notify();
     }
 
@@ -1496,6 +1912,7 @@ impl SeanceWorkspace {
         }
 
         self.perf_overlay.mark_input(RedrawReason::Input);
+        refresh_app_menus(cx);
         cx.notify();
     }
 
@@ -1547,8 +1964,7 @@ impl SeanceWorkspace {
         };
         match self.backend.save_password_credential(draft) {
             Ok(summary) => {
-                self.status_message =
-                    Some(format!("Saved credential '{}'.", summary.label));
+                self.status_message = Some(format!("Saved credential '{}'.", summary.label));
                 self.credential_editor = None;
                 self.refresh_vault_cache();
             }
@@ -1594,10 +2010,8 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
-    fn active_session(&self) -> Option<&Arc<dyn TerminalSession>> {
-        self.sessions
-            .iter()
-            .find(|s| s.id() == self.active_session_id)
+    fn active_session(&self) -> Option<Arc<dyn TerminalSession>> {
+        self.backend.session(self.active_session_id)
     }
 
     fn spawn_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1606,19 +2020,20 @@ impl SeanceWorkspace {
                 let _ = session.resize(geometry);
             }
             self.active_session_id = session.id();
-            self.session_kinds.insert(session.id(), SessionKind::Local);
             if let Some(notify_rx) = session.take_notify_rx() {
                 Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
             }
-            self.sessions.push(session);
+            self.backend.touch_session(session.id());
             self.invalidate_terminal_surface();
             self.perf_overlay.mark_input(RedrawReason::Input);
+            refresh_app_menus(cx);
             cx.notify();
         }
     }
 
     fn select_session(&mut self, id: u64, cx: &mut Context<Self>) {
         self.active_session_id = id;
+        self.backend.touch_session(id);
         if let Some(geometry) = self.last_applied_geometry
             && let Some(session) = self.active_session()
         {
@@ -1631,8 +2046,7 @@ impl SeanceWorkspace {
     }
 
     fn close_session(&mut self, id: u64, cx: &mut Context<Self>) {
-        self.sessions.retain(|s| s.id() != id);
-        self.session_kinds.remove(&id);
+        self.backend.close_session(id);
         if self
             .sftp_browser
             .as_ref()
@@ -1641,7 +2055,7 @@ impl SeanceWorkspace {
             self.sftp_browser = None;
         }
         if self.active_session_id == id {
-            self.active_session_id = self.sessions.last().map(|s| s.id()).unwrap_or(0);
+            self.active_session_id = self.backend.recent_session_id().unwrap_or(0);
         }
         if self.active_session_id == 0 {
             self.last_applied_geometry = None;
@@ -1649,6 +2063,7 @@ impl SeanceWorkspace {
         }
         self.invalidate_terminal_surface();
         self.perf_overlay.mark_input(RedrawReason::Input);
+        refresh_app_menus(cx);
         cx.notify();
     }
 
@@ -1678,8 +2093,7 @@ impl SeanceWorkspace {
                 self.close_session(id, cx);
             }
             PaletteAction::SwitchTheme(tid) => {
-                self.active_theme = tid;
-                self.invalidate_terminal_surface();
+                self.apply_theme(tid, cx);
             }
             PaletteAction::UnlockVault => {
                 self.unlock_form.reset_for_unlock();
@@ -1775,12 +2189,7 @@ impl SeanceWorkspace {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
-        let mods = event.keystroke.modifiers;
 
-        if mods.platform && mods.shift && key == "." {
-            self.toggle_perf_mode(window, cx);
-            return;
-        }
         if self.unlock_form.is_visible() {
             self.handle_unlock_key(event, cx);
             return;
@@ -1791,25 +2200,6 @@ impl SeanceWorkspace {
         }
         if self.host_editor.is_some() {
             self.handle_host_editor_key(event, cx);
-            return;
-        }
-        if mods.platform && key == "," {
-            self.open_vault_panel(cx);
-            return;
-        }
-        if mods.platform && key == "k" {
-            self.toggle_palette(cx);
-            return;
-        }
-        if mods.platform && key == "t" {
-            self.spawn_session(window, cx);
-            return;
-        }
-        if mods.platform && key == "w" {
-            if self.active_session_id != 0 {
-                let id = self.active_session_id;
-                self.close_session(id, cx);
-            }
             return;
         }
 
@@ -1864,8 +2254,9 @@ impl SeanceWorkspace {
             "down" => {
                 let session_labels = self.palette_session_labels();
                 let remote_ids = self.remote_session_ids();
+                let sessions = self.sessions();
                 let count = build_items(
-                    &self.sessions,
+                    &sessions,
                     &session_labels,
                     &self.saved_hosts,
                     &self.cached_credentials,
@@ -1886,8 +2277,9 @@ impl SeanceWorkspace {
             "enter" => {
                 let session_labels = self.palette_session_labels();
                 let remote_ids = self.remote_session_ids();
+                let sessions = self.sessions();
                 let items = build_items(
-                    &self.sessions,
+                    &sessions,
                     &session_labels,
                     &self.saved_hosts,
                     &self.cached_credentials,
@@ -2026,11 +2418,21 @@ impl SeanceWorkspace {
                 }
             }
             "backspace" => match editor.field() {
-                HostField::Label => { editor.label.pop(); }
-                HostField::Hostname => { editor.hostname.pop(); }
-                HostField::Username => { editor.username.pop(); }
-                HostField::Port => { editor.port.pop(); }
-                HostField::Notes => { editor.notes.pop(); }
+                HostField::Label => {
+                    editor.label.pop();
+                }
+                HostField::Hostname => {
+                    editor.hostname.pop();
+                }
+                HostField::Username => {
+                    editor.username.pop();
+                }
+                HostField::Port => {
+                    editor.port.pop();
+                }
+                HostField::Notes => {
+                    editor.notes.pop();
+                }
                 HostField::Auth => {}
             },
             "enter" | " " if in_auth => {
@@ -2084,8 +2486,7 @@ impl SeanceWorkspace {
             let key_idx = cursor - cred_count;
             if key_idx < self.cached_keys.len() {
                 let key = &self.cached_keys[key_idx];
-                let matches_key =
-                    |a: &HostAuthRef| matches!(a, HostAuthRef::PrivateKey { key_id, .. } if *key_id == key.id);
+                let matches_key = |a: &HostAuthRef| matches!(a, HostAuthRef::PrivateKey { key_id, .. } if *key_id == key.id);
                 if let Some(pos) = editor.auth_items.iter().position(matches_key) {
                     editor.auth_items.remove(pos);
                 } else {
@@ -2111,25 +2512,29 @@ impl SeanceWorkspace {
                 self.credential_editor = None;
             }
             "tab" | "down" => {
-                editor.selected_field =
-                    (editor.selected_field + 1) % CredentialField::ALL.len();
+                editor.selected_field = (editor.selected_field + 1) % CredentialField::ALL.len();
             }
             "up" => {
                 editor.selected_field = (editor.selected_field + CredentialField::ALL.len() - 1)
                     % CredentialField::ALL.len();
             }
             "backspace" => match editor.field() {
-                CredentialField::Label => { editor.label.pop(); }
-                CredentialField::UsernameHint => { editor.username_hint.pop(); }
-                CredentialField::Secret => { editor.secret.pop(); }
+                CredentialField::Label => {
+                    editor.label.pop();
+                }
+                CredentialField::UsernameHint => {
+                    editor.username_hint.pop();
+                }
+                CredentialField::Secret => {
+                    editor.secret.pop();
+                }
             },
             "enter" => {
                 if matches!(editor.field(), CredentialField::Secret) {
                     self.save_credential_editor(cx);
                     return;
                 }
-                editor.selected_field =
-                    (editor.selected_field + 1) % CredentialField::ALL.len();
+                editor.selected_field = (editor.selected_field + 1) % CredentialField::ALL.len();
             }
             _ => {
                 if let Some(ch) = key_char {
@@ -2269,7 +2674,8 @@ impl SeanceWorkspace {
         let label = host.label.clone();
         let target = format!("{}@{}:{}", host.username, host.hostname, host.port);
 
-        let mut row = self.sidebar_row_shell(selected || is_connecting)
+        let mut row = self
+            .sidebar_row_shell(selected || is_connecting)
             .child(
                 div()
                     .font_family(SIDEBAR_FONT_MONO)
@@ -2392,7 +2798,10 @@ impl SeanceWorkspace {
         let sid = session.id();
         let title = self.session_display_title(session);
         let snapshot = session.snapshot();
-        let has_output = snapshot.rows.iter().any(|r| !r.plain_text().trim().is_empty());
+        let has_output = snapshot
+            .rows
+            .iter()
+            .any(|r| !r.plain_text().trim().is_empty());
         let preview = session_preview_text(&snapshot.rows).unwrap_or_else(|| {
             if has_output {
                 "interactive session".into()
@@ -2443,9 +2852,7 @@ impl SeanceWorkspace {
                                     .px(px(5.0))
                                     .py(px(1.0))
                                     .rounded(px(3.0))
-                                    .when(active, |el| {
-                                        el.bg(t.accent_glow).text_color(t.accent)
-                                    })
+                                    .when(active, |el| el.bg(t.accent_glow).text_color(t.accent))
                                     .when(!active, |el| {
                                         el.bg(t.glass_hover).text_color(t.sidebar_meta)
                                     })
@@ -2599,12 +3006,14 @@ impl SeanceWorkspace {
 
     fn render_sessions_section(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
-        let mut section =
-            div().flex().flex_col().gap(px(4.0)).child(
-                self.render_sidebar_section_heading("sessions", self.sessions.len().to_string()),
-            );
+        let sessions = self.sessions();
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(self.render_sidebar_section_heading("sessions", sessions.len().to_string()));
 
-        if self.sessions.is_empty() {
+        if sessions.is_empty() {
             section = section.child(
                 div()
                     .px(px(14.0))
@@ -2615,7 +3024,7 @@ impl SeanceWorkspace {
             );
         } else {
             let mut rows = div().flex().flex_col();
-            for session in &self.sessions {
+            for session in &sessions {
                 rows = rows.child(self.render_session_row(session, cx));
             }
             section = section.child(rows);
@@ -2770,9 +3179,7 @@ impl SeanceWorkspace {
                             .bg(accent_color)
                             .cursor_pointer()
                             .when(is_active, |el| {
-                                el.border_1()
-                                    .border_color(t.text_secondary)
-                                    .shadow_sm()
+                                el.border_1().border_color(t.text_secondary).shadow_sm()
                             })
                             .when(!is_active, |el| {
                                 el.hover(|s| s.border_1().border_color(t.sidebar_edge_bright))
@@ -2976,7 +3383,12 @@ impl SeanceWorkspace {
         content = content.child(self.render_vault_credentials_card(cx));
         content = content.child(self.render_vault_keys_card(cx));
 
-        div().flex_1().h_full().flex().child(shell_divider).child(content)
+        div()
+            .flex_1()
+            .h_full()
+            .flex()
+            .child(shell_divider)
+            .child(content)
     }
 
     fn render_vault_credentials_card(&self, cx: &mut Context<Self>) -> Div {
@@ -3039,24 +3451,15 @@ impl SeanceWorkspace {
 
         if self.cached_credentials.is_empty() {
             card = card.child(
-                div()
-                    .py_4()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(t.text_ghost)
-                            .child("No password credentials stored"),
-                    ),
+                div().py_4().flex().items_center().justify_center().child(
+                    div()
+                        .text_sm()
+                        .text_color(t.text_ghost)
+                        .child("No password credentials stored"),
+                ),
             );
         } else {
-            card = card.child(
-                div()
-                    .h(px(1.0))
-                    .bg(t.glass_border),
-            );
+            card = card.child(div().h(px(1.0)).bg(t.glass_border));
 
             let mut rows = div().flex().flex_col();
             for cred in &self.cached_credentials {
@@ -3068,18 +3471,11 @@ impl SeanceWorkspace {
         card
     }
 
-    fn render_credential_row(
-        &self,
-        cred: &CredentialSummary,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    fn render_credential_row(&self, cred: &CredentialSummary, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
         let cred_id = cred.id.clone();
         let cred_id_del = cred.id.clone();
-        let hint = cred
-            .username_hint
-            .as_deref()
-            .unwrap_or("--");
+        let hint = cred.username_hint.as_deref().unwrap_or("--");
         let truncated_id = if cred.id.len() > 8 {
             format!("{}...", &cred.id[..8])
         } else {
@@ -3221,13 +3617,15 @@ impl SeanceWorkspace {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
-                                        match this
-                                            .backend
-                                            .generate_ed25519_key(format!("ed25519-{}", now_ui_suffix()))
-                                        {
+                                        match this.backend.generate_ed25519_key(format!(
+                                            "ed25519-{}",
+                                            now_ui_suffix()
+                                        )) {
                                             Ok(summary) => {
-                                                this.status_message =
-                                                    Some(format!("Generated key '{}'.", summary.label));
+                                                this.status_message = Some(format!(
+                                                    "Generated key '{}'.",
+                                                    summary.label
+                                                ));
                                                 this.refresh_vault_cache();
                                             }
                                             Err(err) => this.status_message = Some(err.to_string()),
@@ -3255,8 +3653,10 @@ impl SeanceWorkspace {
                                             .generate_rsa_key(format!("rsa-{}", now_ui_suffix()))
                                         {
                                             Ok(summary) => {
-                                                this.status_message =
-                                                    Some(format!("Generated key '{}'.", summary.label));
+                                                this.status_message = Some(format!(
+                                                    "Generated key '{}'.",
+                                                    summary.label
+                                                ));
                                                 this.refresh_vault_cache();
                                             }
                                             Err(err) => this.status_message = Some(err.to_string()),
@@ -3270,24 +3670,15 @@ impl SeanceWorkspace {
 
         if self.cached_keys.is_empty() {
             card = card.child(
-                div()
-                    .py_4()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(t.text_ghost)
-                            .child("No SSH keys stored"),
-                    ),
+                div().py_4().flex().items_center().justify_center().child(
+                    div()
+                        .text_sm()
+                        .text_color(t.text_ghost)
+                        .child("No SSH keys stored"),
+                ),
             );
         } else {
-            card = card.child(
-                div()
-                    .h(px(1.0))
-                    .bg(t.glass_border),
-            );
+            card = card.child(div().h(px(1.0)).bg(t.glass_border));
 
             let mut rows = div().flex().flex_col();
             for key in &self.cached_keys {
@@ -3351,12 +3742,7 @@ impl SeanceWorkspace {
                                     .text_color(t.accent)
                                     .child(algo_label),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(t.text_muted)
-                                    .child(source_label),
-                            )
+                            .child(div().text_xs().text_color(t.text_muted).child(source_label))
                             .child(
                                 div()
                                     .text_xs()
@@ -3367,33 +3753,29 @@ impl SeanceWorkspace {
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .px_2()
-                            .py(px(3.0))
-                            .rounded(px(4.0))
-                            .text_xs()
-                            .text_color(t.text_ghost)
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(t.warning).bg(t.glass_hover))
-                            .child("del")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.delete_private_key(&key_id_del, cx);
-                                }),
-                            ),
-                    ),
+                div().flex().items_center().gap_2().child(
+                    div()
+                        .px_2()
+                        .py(px(3.0))
+                        .rounded(px(4.0))
+                        .text_xs()
+                        .text_color(t.text_ghost)
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(t.warning).bg(t.glass_hover))
+                        .child("del")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.delete_private_key(&key_id_del, cx);
+                            }),
+                        ),
+                ),
             )
     }
 
     fn open_sftp_browser(&mut self, session_id: u64, cx: &mut Context<Self>) {
         let label = self
-            .sessions
+            .sessions()
             .iter()
             .find(|s| s.id() == session_id)
             .map(|s| s.title().to_string())
@@ -3447,10 +3829,7 @@ impl SeanceWorkspace {
     }
 
     fn sftp_navigate_up(&mut self, cx: &mut Context<Self>) {
-        let parent = self
-            .sftp_browser
-            .as_ref()
-            .and_then(|b| b.parent_path());
+        let parent = self.sftp_browser.as_ref().and_then(|b| b.parent_path());
         if let Some(parent) = parent {
             self.sftp_navigate(parent, cx);
         }
@@ -3496,8 +3875,7 @@ impl SeanceWorkspace {
 
         match self.backend.sftp_read_file(session_id, &remote_path) {
             Ok(data) => {
-                let downloads = dirs::download_dir()
-                    .unwrap_or_else(|| PathBuf::from("."));
+                let downloads = dirs::download_dir().unwrap_or_else(|| PathBuf::from("."));
                 let dest = downloads.join(&file_name);
                 match fs::write(&dest, &data) {
                     Ok(()) => {
@@ -3509,19 +3887,18 @@ impl SeanceWorkspace {
                         ));
                     }
                     Err(err) => {
-                        self.status_message =
-                            Some(format!("Failed to save {file_name}: {err}"));
+                        self.status_message = Some(format!("Failed to save {file_name}: {err}"));
                     }
                 }
             }
             Err(err) => {
-                self.status_message =
-                    Some(format!("Download failed: {err}"));
+                self.status_message = Some(format!("Download failed: {err}"));
             }
         }
         cx.notify();
     }
 
+    #[allow(dead_code)]
     fn sftp_upload_file(&mut self, local_path: &std::path::Path, cx: &mut Context<Self>) {
         let Some(browser) = &self.sftp_browser else {
             return;
@@ -3550,14 +3927,12 @@ impl SeanceWorkspace {
                         return;
                     }
                     Err(err) => {
-                        self.status_message =
-                            Some(format!("Upload failed: {err}"));
+                        self.status_message = Some(format!("Upload failed: {err}"));
                     }
                 }
             }
             Err(err) => {
-                self.status_message =
-                    Some(format!("Failed to read local file: {err}"));
+                self.status_message = Some(format!("Failed to read local file: {err}"));
             }
         }
         cx.notify();
@@ -3774,8 +4149,7 @@ impl SeanceWorkspace {
             "down" | "j" if !mods.platform => {
                 if let Some(b) = &mut self.sftp_browser {
                     if !b.entries.is_empty() {
-                        b.selected_index =
-                            (b.selected_index + 1).min(b.entries.len() - 1);
+                        b.selected_index = (b.selected_index + 1).min(b.entries.len() - 1);
                     }
                 }
                 cx.notify();
@@ -4122,13 +4496,9 @@ impl SeanceWorkspace {
                     .items_center()
                     .cursor_pointer()
                     .when(selected, |el| {
-                        el.bg(t.glass_tint)
-                            .border_l_2()
-                            .border_color(t.accent)
+                        el.bg(t.glass_tint).border_l_2().border_color(t.accent)
                     })
-                    .when(!selected, |el| {
-                        el.hover(|s| s.bg(t.glass_hover))
-                    })
+                    .when(!selected, |el| el.hover(|s| s.bg(t.glass_hover)))
                     .child(
                         div()
                             .w(px(28.0))
@@ -4382,10 +4752,7 @@ impl SeanceWorkspace {
         cx: &mut Context<Self>,
     ) -> Div {
         let has_selection = browser.selected_entry().is_some();
-        let selected_is_file = browser
-            .selected_entry()
-            .map(|e| !e.is_dir)
-            .unwrap_or(false);
+        let selected_is_file = browser.selected_entry().map(|e| !e.is_dir).unwrap_or(false);
 
         div()
             .px_6()
@@ -4504,7 +4871,8 @@ impl SeanceWorkspace {
             })
             .on_key_down(cx.listener(Self::handle_key_down));
 
-        if self.sessions.is_empty() || self.active_session().is_none() {
+        let sessions = self.sessions();
+        if sessions.is_empty() || self.active_session().is_none() {
             self.perf_overlay.visible_line_count = 0;
             return base
                 .flex()
@@ -4606,8 +4974,9 @@ impl SeanceWorkspace {
         let t = self.theme();
         let session_labels = self.palette_session_labels();
         let remote_ids = self.remote_session_ids();
+        let sessions = self.sessions();
         let items = build_items(
-            &self.sessions,
+            &sessions,
             &session_labels,
             &self.saved_hosts,
             &self.cached_credentials,
@@ -5259,7 +5628,11 @@ impl SeanceWorkspace {
 
         let fields = [
             (CredentialField::Label, editor.label.clone(), false),
-            (CredentialField::UsernameHint, editor.username_hint.clone(), false),
+            (
+                CredentialField::UsernameHint,
+                editor.username_hint.clone(),
+                false,
+            ),
             (CredentialField::Secret, editor.secret.clone(), true),
         ];
 
@@ -6017,6 +6390,38 @@ mod tests {
     }
 
     #[test]
+    fn promote_unique_moves_item_to_front_without_duplicates() {
+        let mut ordered = vec![1_u8, 2, 3];
+        promote_unique(&mut ordered, 2);
+
+        assert_eq!(ordered, vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn promote_unique_inserts_new_item_at_front() {
+        let mut ordered = vec![1_u8, 2, 3];
+        promote_unique(&mut ordered, 4);
+
+        assert_eq!(ordered, vec![4, 1, 2, 3]);
+    }
+
+    #[test]
+    fn remove_item_removes_existing_item() {
+        let mut ordered = vec![1_u8, 2, 3];
+        remove_item(&mut ordered, 2);
+
+        assert_eq!(ordered, vec![1, 3]);
+    }
+
+    #[test]
+    fn remove_item_ignores_missing_item() {
+        let mut ordered = vec![1_u8, 2, 3];
+        remove_item(&mut ordered, 9);
+
+        assert_eq!(ordered, vec![1, 2, 3]);
+    }
+
+    #[test]
     fn local_display_number_is_one_for_single_local_session() {
         let session_kinds = session_kind_map(&[(7, SessionKind::Local)]);
 
@@ -6111,9 +6516,9 @@ mod tests {
         )
         .expect("geometry");
 
-        assert_eq!(geometry.pixel_size.width_px, 976);
+        assert_eq!(geometry.pixel_size.width_px, 988);
         assert_eq!(geometry.pixel_size.height_px, 788);
-        assert_eq!(geometry.size.cols, 122);
+        assert_eq!(geometry.size.cols, 123);
         assert_eq!(geometry.size.rows, 41);
     }
 
@@ -6739,6 +7144,35 @@ impl Render for SeanceWorkspace {
             .flex()
             .bg(t.bg_deep)
             .text_color(t.text_primary)
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
+                this.toggle_palette(cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
+                this.spawn_session(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenPreferences, _window, cx| {
+                this.open_vault_panel(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseActiveSession, _window, cx| {
+                if this.active_session_id != 0 {
+                    this.close_session(this.active_session_id, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &TogglePerfHud, window, cx| {
+                this.toggle_perf_mode(window, cx);
+            }))
+            .on_action(cx.listener(|this, action: &ConnectHost, window, cx| {
+                this.selected_host_id = Some(action.host_id.clone());
+                this.connect_saved_host(&action.host_id, window, cx);
+            }))
+            .on_action(cx.listener(|this, action: &SelectSession, _window, cx| {
+                if this.backend.session(action.session_id).is_some() {
+                    this.select_session(action.session_id, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, action: &SwitchTheme, _window, cx| {
+                this.apply_theme(action.theme_id, cx);
+            }))
             .child(self.render_sidebar(cx))
             .child(main_content);
 
@@ -6772,11 +7206,11 @@ fn sftp_toolbar_pill(
     t: &Theme,
     cx: &mut Context<SeanceWorkspace>,
     handler: impl Fn(
-            &mut SeanceWorkspace,
-            &gpui::MouseDownEvent,
-            &mut Window,
-            &mut Context<SeanceWorkspace>,
-        ) + 'static,
+        &mut SeanceWorkspace,
+        &gpui::MouseDownEvent,
+        &mut Window,
+        &mut Context<SeanceWorkspace>,
+    ) + 'static,
 ) -> Div {
     let pill = div()
         .font_family(SIDEBAR_FONT_MONO)
@@ -6805,9 +7239,9 @@ fn sftp_toolbar_pill(
 fn sftp_file_glyph(name: &str) -> &'static str {
     let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
     match ext.as_str() {
-        "rs" | "py" | "js" | "ts" | "c" | "cpp" | "h" | "go" | "rb" | "java" | "swift"
-        | "kt" | "zig" | "hs" | "ml" | "ex" | "exs" | "sh" | "bash" | "zsh" | "fish"
-        | "lua" | "pl" | "php" => "\u{2022}",
+        "rs" | "py" | "js" | "ts" | "c" | "cpp" | "h" | "go" | "rb" | "java" | "swift" | "kt"
+        | "zig" | "hs" | "ml" | "ex" | "exs" | "sh" | "bash" | "zsh" | "fish" | "lua" | "pl"
+        | "php" => "\u{2022}",
         "toml" | "yaml" | "yml" | "json" | "xml" | "ini" | "cfg" | "conf" | "env" => "\u{2261}",
         "md" | "txt" | "rst" | "org" | "tex" | "log" => "\u{2630}",
         "png" | "jpg" | "jpeg" | "gif" | "svg" | "bmp" | "webp" | "ico" => "\u{25a3}",

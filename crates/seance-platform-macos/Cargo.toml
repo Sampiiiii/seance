@@ -1,14 +1,19 @@
 [package]
-name = "seance-app"
+name = "seance-platform-macos"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+gpui = "0.2.2"
 seance-core = { path = "../seance-core" }
 seance-platform = { path = "../seance-platform" }
 seance-ui = { path = "../seance-ui" }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-seance-platform-macos = { path = "../seance-platform-macos" }
+cocoa = "0.26"
+objc = "0.2"
+
+[dev-dependencies]
+seance-vault = { path = "../seance-vault" }
+tempfile = "3.14"

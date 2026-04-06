@@ -19,16 +19,27 @@ An open-source, cross-platform SSH terminal client built with Rust, [GPUI](https
 
 ## Architecture
 
-Cargo workspace with six crates:
+Cargo workspace with resident lifecycle support and nine crates:
 
 | Crate | Role |
 |---|---|
-| `seance-app` | Binary entry point. Wires vault and UI together. |
+| `seance-app` | Binary entry point. Elects the primary instance, starts IPC, and launches the UI host. |
+| `seance-core` | Resident app state: session registry, lifecycle policy, vault/SSH service orchestration. |
 | `seance-terminal` | libghostty-vt integration, terminal state, local shell via `portable-pty`. |
 | `seance-ssh` | SSH client built on `russh`. Password/key auth, PTY session, resize, SFTP bootstrap. |
-| `seance-ui` | GPUI-based UI. Terminal canvas, session list, vault management, command palette, themes. |
+| `seance-ui` | GPUI window host. Terminal canvas, session list, vault management, command palette, themes. |
 | `seance-vault` | Encrypted SQLite storage for hosts, credentials, and SSH keys. |
+| `seance-platform` | Cross-platform resident-app contracts, IPC protocol, and single-instance plumbing. |
+| `seance-platform-macos` | macOS runtime shim for resident lifecycle integration. |
+| `seance-platform-linux` | Linux runtime shim for resident lifecycle integration. |
 | `seance-config` | App configuration. (Stub — not yet implemented.) |
+
+Resident lifecycle behavior now works like this:
+
+- the first launch becomes the primary resident process
+- later launches signal the primary process over a local Unix socket instead of starting a second app instance
+- sessions are owned by the resident controller, not by an individual window
+- when the last window closes, the process stays alive and can reopen a new window on demand
 
 ## Prerequisites
 
