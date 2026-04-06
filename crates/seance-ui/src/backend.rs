@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Receiver};
 
 use anyhow::Result;
+use seance_config::{AppConfig, PerfHudDefault, TerminalConfig, WindowConfig};
 use seance_core::{AppControllerHandle, SessionId, SessionKind};
 use seance_ssh::{SftpEntry, SshConnectRequest, SshSessionManager};
 use seance_terminal::TerminalSession;
@@ -21,6 +22,38 @@ impl UiBackend {
 
     pub fn controller(&self) -> &AppControllerHandle {
         &self.controller
+    }
+
+    pub fn subscribe_config_changes(&self) -> Receiver<AppConfig> {
+        self.controller.subscribe_config_changes()
+    }
+
+    pub fn set_theme(&self, theme: String) -> Result<AppConfig> {
+        self.controller.update_config(|config| {
+            config.appearance.theme = theme;
+        })
+    }
+
+    pub fn set_window_settings(&self, window: WindowConfig) -> Result<AppConfig> {
+        self.controller.update_config(|config| {
+            config.window = window;
+        })
+    }
+
+    pub fn set_terminal_settings(&self, terminal: TerminalConfig) -> Result<AppConfig> {
+        self.controller.update_config(|config| {
+            config.terminal = terminal;
+        })
+    }
+
+    pub fn set_perf_hud_default(&self, perf_hud_default: PerfHudDefault) -> Result<AppConfig> {
+        self.controller.update_config(|config| {
+            config.debug.perf_hud_default = perf_hud_default;
+        })
+    }
+
+    pub fn reset_settings_to_defaults(&self) -> Result<AppConfig> {
+        self.controller.reset_config_to_defaults()
     }
 
     pub fn ssh_manager(&self) -> Arc<SshSessionManager> {

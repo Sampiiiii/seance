@@ -5889,6 +5889,12 @@ dependencies = [
 [[package]]
 name = "seance-config"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.9.12+spec-1.1.0",
+]
 
 [[package]]
 name = "seance-core"
@@ -5896,9 +5902,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
+ "seance-config",
  "seance-ssh",
  "seance-terminal",
  "seance-vault",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -5967,6 +5976,7 @@ dependencies = [
  "anyhow",
  "dirs 6.0.0",
  "gpui",
+ "seance-config",
  "seance-core",
  "seance-platform",
  "seance-ssh",

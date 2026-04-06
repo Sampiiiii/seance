@@ -17,11 +17,12 @@ use std::{
 
 use anyhow::Result;
 use gpui::{
-    AnyWindowHandle, App, Application, Bounds, Context, Div, FocusHandle, Focusable, FontWeight,
-    Global, KeyBinding, KeyDownEvent, MouseButton, Pixels, ShapedLine, SharedString, TextRun,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, canvas, deferred, div, fill,
-    font, point, prelude::*, px, size,
+    AnyWindowHandle, App, AppContext, Application, BorrowAppContext, Bounds, Context, Div,
+    FocusHandle, Focusable, FontWeight, Global, KeyBinding, KeyDownEvent, MouseButton, Pixels,
+    ShapedLine, SharedString, TextRun, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, canvas, deferred, div, fill, font, point, prelude::*, px, size,
 };
+use seance_config::{AppConfig, PerfHudDefault, TerminalConfig, WindowConfig};
 use seance_core::{AppControllerHandle, PlatformCloseAction, SessionKind, WindowTarget};
 use seance_terminal::{
     SessionPerfSnapshot, TerminalCell, TerminalCellStyle, TerminalColor, TerminalGeometry,
@@ -50,9 +51,6 @@ const SIDEBAR_FONT_MONO: &str = "JetBrains Mono";
 const SIDEBAR_MONO_SIZE_PX: f32 = 11.0;
 const PERF_HISTORY_LIMIT: usize = 120;
 const PERF_WINDOW: Duration = Duration::from_secs(1);
-const TERMINAL_FONT_FAMILY: &str = "Menlo";
-const TERMINAL_FONT_SIZE_PX: f32 = 13.0;
-const TERMINAL_LINE_HEIGHT_PX: f32 = 19.0;
 const TERMINAL_PANE_PADDING_PX: f32 = 16.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,7 +212,6 @@ enum InitialWorkspaceAction {
     OpenPreferences,
     OpenCommandPalette,
     TogglePerfHud,
-    SwitchTheme(ThemeId),
 }
 
 fn refresh_app_menus(cx: &mut App) {
@@ -235,14 +232,42 @@ fn remove_item<H: PartialEq>(ordered: &mut Vec<H>, item: H) {
     }
 }
 
+fn push_unique_handle(handles: &mut Vec<AnyWindowHandle>, handle: AnyWindowHandle) {
+    if !handles.contains(&handle) {
+        handles.push(handle);
+    }
+}
+
+fn workspace_window_candidates(cx: &App) -> Vec<AnyWindowHandle> {
+    let active_window = cx.active_window();
+    let window_stack = cx.window_stack().unwrap_or_default();
+    let registered = cx
+        .try_global::<WorkspaceWindowRegistry>()
+        .map(WorkspaceWindowRegistry::ordered_handles)
+        .unwrap_or_default();
+    let live_windows = cx.windows();
+
+    let mut candidates = Vec::new();
+    if let Some(active_window) = active_window {
+        push_unique_handle(&mut candidates, active_window);
+    }
+    for window_handle in window_stack {
+        push_unique_handle(&mut candidates, window_handle);
+    }
+    for window_handle in registered {
+        push_unique_handle(&mut candidates, window_handle);
+    }
+    for window_handle in live_windows {
+        push_unique_handle(&mut candidates, window_handle);
+    }
+    candidates
+}
+
 fn with_registered_workspace(
     cx: &mut App,
     mut update: impl FnMut(&mut SeanceWorkspace, &mut Window, &mut Context<SeanceWorkspace>),
 ) -> bool {
-    let candidates = cx
-        .try_global::<WorkspaceWindowRegistry>()
-        .map(WorkspaceWindowRegistry::ordered_handles)
-        .unwrap_or_default();
+    let candidates = workspace_window_candidates(cx);
 
     if candidates.is_empty() {
         trace!("with_registered_workspace: no candidate windows in registry");
@@ -253,7 +278,10 @@ fn with_registered_workspace(
     for window_handle in candidates {
         match window_handle.update(cx, |root, window, cx| {
             let Ok(workspace) = root.downcast::<SeanceWorkspace>() else {
-                trace!("with_registered_workspace: downcast failed for window {:?}", window_handle.window_id());
+                trace!(
+                    "with_registered_workspace: downcast failed for window {:?}",
+                    window_handle.window_id()
+                );
                 return false;
             };
             cx.activate(false);
@@ -269,7 +297,10 @@ fn with_registered_workspace(
             }
             Ok(false) => stale_handles.push(window_handle),
             Err(err) => {
-                trace!("with_registered_workspace: window update failed for {:?}: {err}", window_handle.window_id());
+                trace!(
+                    "with_registered_workspace: window update failed for {:?}: {err}",
+                    window_handle.window_id()
+                );
                 stale_handles.push(window_handle);
             }
         }
@@ -321,7 +352,9 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
 
     let backend_for_preferences = backend.clone();
     cx.on_action(move |_: &OpenPreferences, cx| {
-        if !with_registered_workspace(cx, |this, _window, cx| this.open_vault_panel(cx)) {
+        if !with_registered_workspace(cx, |this, _window, cx| {
+            this.open_settings_panel(SettingsSection::General, cx)
+        }) {
             let _ = open_workspace_window(
                 cx,
                 backend_for_preferences.clone(),
@@ -417,12 +450,15 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
     let backend_for_switch_theme = backend;
     cx.on_action(move |action: &SwitchTheme, cx| {
         let theme_id = action.theme_id;
-        if !with_registered_workspace(cx, |this, _window, cx| this.apply_theme(theme_id, cx)) {
+        if !with_registered_workspace(cx, |this, window, cx| {
+            this.persist_theme(theme_id, window, cx)
+        }) {
+            let _ = backend_for_switch_theme.set_theme(theme_id.key().to_string());
             let _ = open_workspace_window(
                 cx,
                 backend_for_switch_theme.clone(),
                 WindowTarget::MostRecentOrNew,
-                Some(InitialWorkspaceAction::SwitchTheme(theme_id)),
+                None,
             );
         }
         refresh_app_menus(cx);
@@ -470,6 +506,7 @@ fn open_workspace_window(
                     focus_handle,
                     active_session_id: bootstrap.attached_session_id,
                     backend: backend.clone(),
+                    config: bootstrap.config.clone(),
                     saved_hosts: bootstrap.saved_hosts.clone(),
                     selected_host_id: None,
                     connecting_host_id: None,
@@ -480,12 +517,12 @@ fn open_workspace_window(
                     ),
                     host_editor: None,
                     credential_editor: None,
-                    vault_panel_open: false,
+                    settings_panel: SettingsPanelState::default(),
                     sftp_browser: None,
                     cached_credentials: bootstrap.cached_credentials.clone(),
                     cached_keys: bootstrap.cached_keys.clone(),
                     status_message: None,
-                    active_theme: ThemeId::ObsidianSmoke,
+                    active_theme: theme_id_from_config(&bootstrap.config),
                     palette_open: false,
                     palette_query: String::new(),
                     palette_selected: 0,
@@ -493,10 +530,11 @@ fn open_workspace_window(
                     last_applied_geometry: None,
                     active_terminal_rows: TerminalGeometry::default().size.rows as usize,
                     terminal_surface: TerminalSurfaceState {
-                        theme_id: ThemeId::ObsidianSmoke,
+                        theme_id: theme_id_from_config(&bootstrap.config),
                         ..Default::default()
                     },
-                    perf_overlay: PerfOverlayState::new(perf_mode_from_env()),
+                    perf_mode_env_override: perf_mode_override_from_env(),
+                    perf_overlay: PerfOverlayState::new(perf_mode_from_config(&bootstrap.config)),
                 };
                 cx.observe_window_bounds(window, |this: &mut SeanceWorkspace, window, cx| {
                     this.apply_active_terminal_geometry(window);
@@ -514,6 +552,12 @@ fn open_workspace_window(
                         notify_rx,
                     );
                 }
+                SeanceWorkspace::schedule_config_watcher(
+                    window,
+                    cx,
+                    entity.clone(),
+                    backend.subscribe_config_changes(),
+                );
                 if let Some(initial_action) = initial_action.as_ref() {
                     ws.apply_initial_action(initial_action.clone(), window, cx);
                 }
@@ -528,13 +572,14 @@ struct SeanceWorkspace {
     focus_handle: FocusHandle,
     active_session_id: u64,
     backend: UiBackend,
+    config: AppConfig,
     saved_hosts: Vec<HostSummary>,
     selected_host_id: Option<String>,
     connecting_host_id: Option<String>,
     unlock_form: UnlockFormState,
     host_editor: Option<HostEditorState>,
     credential_editor: Option<CredentialEditorState>,
-    vault_panel_open: bool,
+    settings_panel: SettingsPanelState,
     sftp_browser: Option<SftpBrowserState>,
     cached_credentials: Vec<CredentialSummary>,
     cached_keys: Vec<KeySummary>,
@@ -547,6 +592,7 @@ struct SeanceWorkspace {
     last_applied_geometry: Option<TerminalGeometry>,
     active_terminal_rows: usize,
     terminal_surface: TerminalSurfaceState,
+    perf_mode_env_override: Option<UiPerfMode>,
     perf_overlay: PerfOverlayState,
 }
 
@@ -723,6 +769,7 @@ struct CachedShapeLine {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ShapeCacheKey {
     text: String,
+    font_family: String,
     font_size_bits: u32,
     bold: bool,
     italic: bool,
@@ -949,6 +996,62 @@ impl CredentialEditorState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsSection {
+    General,
+    Appearance,
+    Terminal,
+    Debug,
+    Vault,
+}
+
+impl SettingsSection {
+    const ALL: [Self; 5] = [
+        Self::General,
+        Self::Appearance,
+        Self::Terminal,
+        Self::Debug,
+        Self::Vault,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Appearance => "Appearance",
+            Self::Terminal => "Terminal",
+            Self::Debug => "Debug",
+            Self::Vault => "Vault",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Self::General => "Resident app and window lifecycle",
+            Self::Appearance => "Themes and overall look",
+            Self::Terminal => "Shell and terminal rendering defaults",
+            Self::Debug => "Performance HUD defaults",
+            Self::Vault => "Encrypted credentials and SSH keys",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SettingsPanelState {
+    open: bool,
+    section: SettingsSection,
+    message: Option<String>,
+}
+
+impl Default for SettingsPanelState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            section: SettingsSection::General,
+            message: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum UiPerfMode {
     #[default]
@@ -968,6 +1071,16 @@ impl UiPerfMode {
 
     fn is_enabled(self) -> bool {
         !matches!(self, Self::Off)
+    }
+}
+
+impl From<PerfHudDefault> for UiPerfMode {
+    fn from(value: PerfHudDefault) -> Self {
+        match value {
+            PerfHudDefault::Off => Self::Off,
+            PerfHudDefault::Compact => Self::Compact,
+            PerfHudDefault::Expanded => Self::Expanded,
+        }
     }
 }
 
@@ -1128,18 +1241,26 @@ impl PerfOverlayState {
     }
 }
 
-fn perf_mode_from_env() -> UiPerfMode {
+fn perf_mode_override_from_env() -> Option<UiPerfMode> {
     match env::var("SEANCE_PERF_HUD") {
-        Ok(value) if value.eq_ignore_ascii_case("expanded") => UiPerfMode::Expanded,
+        Ok(value) if value.eq_ignore_ascii_case("expanded") => Some(UiPerfMode::Expanded),
         Ok(value)
             if value == "1"
                 || value.eq_ignore_ascii_case("true")
                 || value.eq_ignore_ascii_case("compact") =>
         {
-            UiPerfMode::Compact
+            Some(UiPerfMode::Compact)
         }
-        _ => UiPerfMode::Off,
+        _ => None,
     }
+}
+
+fn perf_mode_from_config(config: &AppConfig) -> UiPerfMode {
+    perf_mode_override_from_env().unwrap_or(config.debug.perf_hud_default.into())
+}
+
+fn theme_id_from_config(config: &AppConfig) -> ThemeId {
+    ThemeId::from_key(&config.appearance.theme).unwrap_or(ThemeId::ObsidianSmoke)
 }
 
 fn trim_instants(samples: &mut VecDeque<Instant>, now: Instant, window: Duration) {
@@ -1409,15 +1530,147 @@ impl SeanceWorkspace {
                 self.selected_host_id = Some(host_id.clone());
                 self.connect_saved_host(&host_id, window, cx);
             }
-            InitialWorkspaceAction::OpenPreferences => self.open_vault_panel(cx),
+            InitialWorkspaceAction::OpenPreferences => {
+                self.open_settings_panel(SettingsSection::General, cx)
+            }
             InitialWorkspaceAction::OpenCommandPalette => self.toggle_palette(cx),
             InitialWorkspaceAction::TogglePerfHud => self.toggle_perf_mode(window, cx),
-            InitialWorkspaceAction::SwitchTheme(theme_id) => self.apply_theme(theme_id, cx),
         }
     }
 
     fn theme(&self) -> Theme {
         self.active_theme.theme()
+    }
+
+    fn terminal_font_size_px(&self) -> f32 {
+        self.config.terminal.font_size_px
+    }
+
+    fn terminal_line_height_px(&self) -> f32 {
+        self.config.terminal.line_height_px
+    }
+
+    fn is_settings_panel_open(&self) -> bool {
+        self.settings_panel.open
+    }
+
+    fn open_settings_panel(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if matches!(section, SettingsSection::Vault) && !self.vault_unlocked() {
+            self.unlock_form.reset_for_unlock();
+            self.unlock_form.message =
+                Some("Unlock the vault to manage credentials and keys.".into());
+            cx.notify();
+            return;
+        }
+        if matches!(section, SettingsSection::Vault) {
+            self.refresh_vault_cache();
+        }
+        self.settings_panel.open = true;
+        self.settings_panel.section = section;
+        self.settings_panel.message = None;
+        self.palette_open = false;
+        cx.notify();
+    }
+
+    fn close_settings_panel(&mut self, cx: &mut Context<Self>) {
+        self.settings_panel.open = false;
+        self.settings_panel.message = None;
+        cx.notify();
+    }
+
+    fn apply_config_snapshot(
+        &mut self,
+        config: AppConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_theme = self.active_theme;
+        let previous_font_family = self.config.terminal.font_family.clone();
+        let previous_font_size = self.config.terminal.font_size_px;
+        let previous_line_height = self.config.terminal.line_height_px;
+
+        self.config = config;
+        self.active_theme = theme_id_from_config(&self.config);
+
+        if self.active_theme != previous_theme {
+            self.invalidate_terminal_surface();
+            refresh_app_menus(cx);
+        }
+
+        if previous_font_family != self.config.terminal.font_family
+            || (previous_font_size - self.config.terminal.font_size_px).abs() > f32::EPSILON
+            || (previous_line_height - self.config.terminal.line_height_px).abs() > f32::EPSILON
+        {
+            self.terminal_metrics = None;
+            self.terminal_surface.shape_cache = ShapeCache::default();
+            self.invalidate_terminal_surface();
+            self.apply_active_terminal_geometry(window);
+        }
+
+        if self.perf_mode_env_override.is_none() {
+            self.perf_overlay.mode = self.config.debug.perf_hud_default.into();
+        }
+
+        cx.notify();
+    }
+
+    fn persist_theme(&mut self, theme_id: ThemeId, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.backend.set_theme(theme_id.key().to_string()) {
+            Ok(_) => {
+                self.settings_panel.message = None;
+                self.status_message = Some(format!("Theme set to {}.", theme_id.display_name()));
+            }
+            Err(error) => {
+                self.settings_panel.message = Some(error.to_string());
+                self.status_message = Some(error.to_string());
+            }
+        }
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
+    }
+
+    fn persist_window_settings(&mut self, window_settings: WindowConfig, cx: &mut Context<Self>) {
+        match self.backend.set_window_settings(window_settings) {
+            Ok(_) => self.settings_panel.message = None,
+            Err(error) => self.settings_panel.message = Some(error.to_string()),
+        }
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
+    }
+
+    fn persist_terminal_settings(
+        &mut self,
+        terminal_settings: TerminalConfig,
+        cx: &mut Context<Self>,
+    ) {
+        match self.backend.set_terminal_settings(terminal_settings) {
+            Ok(_) => self.settings_panel.message = None,
+            Err(error) => self.settings_panel.message = Some(error.to_string()),
+        }
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
+    }
+
+    fn persist_perf_hud_default(
+        &mut self,
+        perf_hud_default: PerfHudDefault,
+        cx: &mut Context<Self>,
+    ) {
+        match self.backend.set_perf_hud_default(perf_hud_default) {
+            Ok(_) => self.settings_panel.message = None,
+            Err(error) => self.settings_panel.message = Some(error.to_string()),
+        }
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
+    }
+
+    fn reset_settings_to_defaults(&mut self, cx: &mut Context<Self>) {
+        match self.backend.reset_settings_to_defaults() {
+            Ok(_) => self.settings_panel.message = Some("Settings reset to defaults.".into()),
+            Err(error) => self.settings_panel.message = Some(error.to_string()),
+        }
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
     }
 
     fn session_kind(&self, id: u64) -> Option<SessionKind> {
@@ -1482,10 +1735,11 @@ impl SeanceWorkspace {
             return metrics;
         }
 
-        let font_size = px(TERMINAL_FONT_SIZE_PX);
-        let font_id = window
-            .text_system()
-            .resolve_font(&font(TERMINAL_FONT_FAMILY));
+        let font_family = self.config.terminal.font_family.clone();
+        let font_size_px = self.terminal_font_size_px();
+        let line_height_px = self.terminal_line_height_px();
+        let font_size = px(font_size_px);
+        let font_id = window.text_system().resolve_font(&font(font_family));
         let cell_width_px = window
             .text_system()
             .ch_advance(font_id, font_size)
@@ -1493,12 +1747,12 @@ impl SeanceWorkspace {
             .unwrap_or(8.0)
             .ceil()
             .max(1.0);
-        let line_height_px = TERMINAL_LINE_HEIGHT_PX.ceil().max(1.0);
+        let line_height_px = line_height_px.ceil().max(1.0);
         let metrics = TerminalMetrics {
             cell_width_px,
             cell_height_px: line_height_px,
             line_height_px,
-            font_size_px: TERMINAL_FONT_SIZE_PX,
+            font_size_px,
         };
         trace!(?metrics, "measured terminal metrics");
         self.terminal_metrics = Some(metrics);
@@ -1571,6 +1825,39 @@ impl SeanceWorkspace {
             .detach();
     }
 
+    fn schedule_config_watcher(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        entity: gpui::Entity<Self>,
+        config_rx: std::sync::mpsc::Receiver<AppConfig>,
+    ) {
+        let config_rx = Arc::new(std::sync::Mutex::new(config_rx));
+        window
+            .spawn(cx, async move |cx| {
+                loop {
+                    let rx = Arc::clone(&config_rx);
+                    let next_config = cx
+                        .background_executor()
+                        .spawn(async move { rx.lock().unwrap().recv().ok() })
+                        .await;
+                    let Some(mut next_config) = next_config else {
+                        break;
+                    };
+                    while let Ok(config) = config_rx.lock().unwrap().try_recv() {
+                        next_config = config;
+                    }
+                    let entity = entity.clone();
+                    let _ = cx.update(move |window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.apply_config_snapshot(next_config, window, cx);
+                        });
+                        window.refresh();
+                    });
+                }
+            })
+            .detach();
+    }
+
     fn take_terminal_refresh_request(&mut self) -> bool {
         let Some(session) = self.active_session() else {
             return false;
@@ -1625,12 +1912,14 @@ impl SeanceWorkspace {
         }
 
         let snapshot = session.snapshot();
+        let font_family = self.config.terminal.font_family.clone();
         let (rows, metrics_report) = build_terminal_surface_rows(
             &snapshot.rows,
             geometry,
             metrics,
             self.active_theme,
             &self.theme(),
+            font_family,
             &mut self.terminal_surface.shape_cache,
             window,
         );
@@ -1652,14 +1941,6 @@ impl SeanceWorkspace {
         self.perf_overlay
             .mark_ui_refresh_request(Instant::now(), RedrawReason::UiRefresh);
         window.refresh();
-        cx.notify();
-    }
-
-    fn apply_theme(&mut self, theme_id: ThemeId, cx: &mut Context<Self>) {
-        self.active_theme = theme_id;
-        self.invalidate_terminal_surface();
-        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
-        refresh_app_menus(cx);
         cx.notify();
     }
 
@@ -1744,7 +2025,7 @@ impl SeanceWorkspace {
         self.selected_host_id = None;
         self.host_editor = None;
         self.credential_editor = None;
-        self.vault_panel_open = false;
+        self.settings_panel.open = false;
         self.unlock_form.reset_for_unlock();
         self.unlock_form.message =
             Some("Vault locked. Decrypted records were cleared from memory.".into());
@@ -1865,7 +2146,7 @@ impl SeanceWorkspace {
                     Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
                 }
                 self.backend.touch_session(session.id());
-                self.vault_panel_open = false;
+                self.settings_panel.open = false;
                 self.status_message = Some("SSH session connected.".into());
                 self.invalidate_terminal_surface();
             }
@@ -1922,17 +2203,7 @@ impl SeanceWorkspace {
     }
 
     fn open_vault_panel(&mut self, cx: &mut Context<Self>) {
-        if !self.vault_unlocked() {
-            self.unlock_form.reset_for_unlock();
-            self.unlock_form.message =
-                Some("Unlock the vault to manage credentials and keys.".into());
-            cx.notify();
-            return;
-        }
-        self.refresh_vault_cache();
-        self.vault_panel_open = true;
-        self.palette_open = false;
-        cx.notify();
+        self.open_settings_panel(SettingsSection::Vault, cx);
     }
 
     fn begin_edit_credential(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -2093,7 +2364,7 @@ impl SeanceWorkspace {
                 self.close_session(id, cx);
             }
             PaletteAction::SwitchTheme(tid) => {
-                self.apply_theme(tid, cx);
+                self.persist_theme(tid, window, cx);
             }
             PaletteAction::UnlockVault => {
                 self.unlock_form.reset_for_unlock();
@@ -2213,10 +2484,9 @@ impl SeanceWorkspace {
             return;
         }
 
-        if self.vault_panel_open && key == "escape" {
-            self.vault_panel_open = false;
+        if self.is_settings_panel_open() && key == "escape" {
+            self.close_settings_panel(cx);
             self.perf_overlay.mark_input(RedrawReason::Input);
-            cx.notify();
             return;
         }
 
@@ -3081,20 +3351,25 @@ impl SeanceWorkspace {
                 .flex()
                 .flex_col()
                 .child(
-                    vault_action(if self.vault_panel_open {
-                        "\u{25c9} manage vault"
-                    } else {
-                        "\u{25cb} manage vault"
-                    })
+                    vault_action(
+                        if self.is_settings_panel_open()
+                            && self.settings_panel.section == SettingsSection::Vault
+                        {
+                            "\u{25c9} manage vault"
+                        } else {
+                            "\u{25cb} manage vault"
+                        },
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
-                            if this.vault_panel_open {
-                                this.vault_panel_open = false;
+                            if this.is_settings_panel_open()
+                                && this.settings_panel.section == SettingsSection::Vault
+                            {
+                                this.close_settings_panel(cx);
                             } else {
                                 this.open_vault_panel(cx);
                             }
-                            cx.notify();
                         }),
                     ),
                 )
@@ -3181,18 +3456,16 @@ impl SeanceWorkspace {
                             .when(is_active, |el| {
                                 el.border_1().border_color(t.text_secondary).shadow_sm()
                             })
-                            .when(!is_active, |el| {
-                                el.hover(|s| s.border_1().border_color(t.sidebar_edge_bright))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.active_theme = tid;
-                                            this.invalidate_terminal_surface();
-                                            this.perf_overlay.mark_input(RedrawReason::Input);
-                                            cx.notify();
-                                        }),
-                                    )
-                            }),
+                            .hover(|s| s.border_1().border_color(t.sidebar_edge_bright))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.open_settings_panel(SettingsSection::Appearance, cx);
+                                    this.settings_panel.message =
+                                        Some(format!("Current theme: {}", tid.display_name()));
+                                    this.perf_overlay.mark_input(RedrawReason::Input);
+                                }),
+                            ),
                     );
                 }
                 theme_row
@@ -3305,8 +3578,9 @@ impl SeanceWorkspace {
             .child(self.render_sidebar_footer(cx))
     }
 
-    fn render_vault_panel(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+    fn render_settings_panel(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
+        let section = self.settings_panel.section;
 
         let shell_divider = div()
             .w(px(2.0))
@@ -3314,6 +3588,48 @@ impl SeanceWorkspace {
             .border_l_1()
             .border_color(t.sidebar_edge_bright)
             .bg(t.shell_divider_glow);
+
+        let mut nav = div()
+            .w(px(190.0))
+            .h_full()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .bg(t.sidebar_bg_elevated)
+            .border_r_1()
+            .border_color(t.sidebar_edge)
+            .child(
+                div()
+                    .pb(px(10.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(18.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(t.text_primary)
+                            .child("Preferences"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(t.text_muted)
+                            .child("Live config backed by config.toml"),
+                    ),
+            );
+
+        for item in SettingsSection::ALL {
+            nav = nav.child(
+                settings_nav_button(item, section == item, &t).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_settings_panel(item, cx);
+                    }),
+                ),
+            );
+        }
 
         let mut content = div()
             .flex_1()
@@ -3333,6 +3649,8 @@ impl SeanceWorkspace {
             .flex_col()
             .gap_6();
 
+        let title = section.title();
+        let subtitle = section.subtitle();
         content = content.child(
             div()
                 .flex()
@@ -3348,13 +3666,13 @@ impl SeanceWorkspace {
                                 .text_size(px(20.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(t.text_primary)
-                                .child("Vault"),
+                                .child(title),
                         )
                         .child(
                             div()
                                 .text_size(px(12.0))
                                 .text_color(t.text_muted)
-                                .child("Manage encrypted credentials and SSH keys"),
+                                .child(subtitle),
                         ),
                 )
                 .child(
@@ -3373,20 +3691,333 @@ impl SeanceWorkspace {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
-                                this.vault_panel_open = false;
-                                cx.notify();
+                                this.close_settings_panel(cx);
                             }),
                         ),
                 ),
         );
 
-        content = content.child(self.render_vault_credentials_card(cx));
-        content = content.child(self.render_vault_keys_card(cx));
+        if let Some(message) = self.settings_panel.message.clone() {
+            content = content.child(
+                div()
+                    .px_4()
+                    .py(px(10.0))
+                    .rounded_lg()
+                    .bg(t.glass_tint)
+                    .border_1()
+                    .border_color(t.glass_border)
+                    .text_sm()
+                    .text_color(t.text_secondary)
+                    .child(message),
+            );
+        }
+
+        content = match section {
+            SettingsSection::General => {
+                let window_settings = self.config.window;
+                content
+                    .child(
+                        settings_toggle_card(
+                            "Resident process",
+                            "Keep Seance running after the last window closes.",
+                            window_settings.keep_running_without_windows,
+                            &t,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let mut next = window_settings;
+                                next.keep_running_without_windows =
+                                    !next.keep_running_without_windows;
+                                this.persist_window_settings(next, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        settings_toggle_card(
+                            "Hide on last close",
+                            "Hide the app instead of exiting when the last window closes.",
+                            window_settings.hide_on_last_window_close,
+                            &t,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let mut next = window_settings;
+                                next.hide_on_last_window_close =
+                                    !next.hide_on_last_window_close;
+                                this.persist_window_settings(next, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        settings_toggle_card(
+                            "Keep sessions alive",
+                            "Allow sessions to survive while the resident app stays open.",
+                            window_settings.keep_sessions_alive_without_windows,
+                            &t,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let mut next = window_settings;
+                                next.keep_sessions_alive_without_windows =
+                                    !next.keep_sessions_alive_without_windows;
+                                this.persist_window_settings(next, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .p_4()
+                            .rounded_xl()
+                            .bg(t.glass_tint)
+                            .border_1()
+                            .border_color(t.glass_border)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(t.text_primary)
+                                            .child("Keybindings"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(t.text_muted)
+                                            .child("Override schema is persisted, but runtime rebinding UI is still deferred."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py(px(6.0))
+                                    .rounded_md()
+                                    .bg(t.accent_glow)
+                                    .text_xs()
+                                    .text_color(t.text_primary)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.accent))
+                                    .child("reset defaults")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.reset_settings_to_defaults(cx);
+                                        }),
+                                    ),
+                            ),
+                    )
+            }
+            SettingsSection::Appearance => {
+                let themes = div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(t.text_primary)
+                            .child("Bundled Themes"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(t.text_muted)
+                            .child("Choose a theme and apply it live across all open windows."),
+                    );
+
+                let mut theme_grid = div().flex().flex_wrap().gap(px(8.0));
+                for &theme_id in ThemeId::ALL {
+                    let is_active = theme_id == self.active_theme;
+                    let swatch = theme_id.theme().accent;
+                    theme_grid = theme_grid.child(
+                        settings_choice_chip(theme_id.display_name(), is_active, &t)
+                            .child(div().w(px(9.0)).h(px(9.0)).rounded_full().bg(swatch))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.persist_theme(theme_id, window, cx);
+                                }),
+                            ),
+                    );
+                }
+
+                content.child(
+                    div()
+                        .p_4()
+                        .rounded_xl()
+                        .bg(t.glass_tint)
+                        .border_1()
+                        .border_color(t.glass_border)
+                        .child(themes.child(theme_grid)),
+                )
+            }
+            SettingsSection::Terminal => {
+                let terminal = self.config.terminal.clone();
+                let shell_choices = [
+                    ("default", None),
+                    ("/bin/zsh", Some("/bin/zsh")),
+                    ("/bin/bash", Some("/bin/bash")),
+                    ("/bin/sh", Some("/bin/sh")),
+                ];
+                let font_choices = ["Menlo", "JetBrains Mono", "SF Mono", "Monaco"];
+
+                let mut shell_row = div().flex().flex_wrap().gap(px(8.0));
+                for (label, shell) in shell_choices {
+                    let is_active = terminal.local_shell.as_deref() == shell;
+                    shell_row =
+                        shell_row.child(settings_choice_chip(label, is_active, &t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let mut next = this.config.terminal.clone();
+                                next.local_shell = shell.map(str::to_string);
+                                this.persist_terminal_settings(next, cx);
+                            }),
+                        ));
+                }
+
+                let mut font_row = div().flex().flex_wrap().gap(px(8.0));
+                for font_family in font_choices {
+                    let is_active = terminal.font_family == font_family;
+                    font_row = font_row.child(
+                        settings_choice_chip(font_family, is_active, &t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let mut next = this.config.terminal.clone();
+                                next.font_family = font_family.to_string();
+                                this.persist_terminal_settings(next, cx);
+                            }),
+                        ),
+                    );
+                }
+
+                content
+                    .child(
+                        settings_info_card(
+                            "Local shell",
+                            terminal
+                                .local_shell
+                                .clone()
+                                .unwrap_or_else(|| "default ($SHELL or /bin/bash)".into()),
+                            "These defaults only affect newly created local sessions.",
+                            &t,
+                        )
+                        .child(shell_row),
+                    )
+                    .child(
+                        settings_info_card(
+                            "Font family",
+                            terminal.font_family.clone(),
+                            "Preset terminal font families.",
+                            &t,
+                        )
+                        .child(font_row),
+                    )
+                    .child(
+                        settings_stepper_card(
+                            "Font size",
+                            format!("{:.1}px", terminal.font_size_px),
+                            "Resize the terminal text rendering baseline.",
+                            &t,
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(8.0))
+                                .child(settings_action_chip("-0.5", &t).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        let mut next = this.config.terminal.clone();
+                                        next.font_size_px = (next.font_size_px - 0.5).max(8.0);
+                                        this.persist_terminal_settings(next, cx);
+                                    }),
+                                ))
+                                .child(settings_action_chip("+0.5", &t).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        let mut next = this.config.terminal.clone();
+                                        next.font_size_px = (next.font_size_px + 0.5).min(32.0);
+                                        this.persist_terminal_settings(next, cx);
+                                    }),
+                                )),
+                        ),
+                    )
+                    .child(
+                        settings_stepper_card(
+                            "Line height",
+                            format!("{:.1}px", terminal.line_height_px),
+                            "Controls row spacing and terminal geometry.",
+                            &t,
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(8.0))
+                                .child(settings_action_chip("-0.5", &t).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        let mut next = this.config.terminal.clone();
+                                        next.line_height_px = (next.line_height_px - 0.5).max(10.0);
+                                        this.persist_terminal_settings(next, cx);
+                                    }),
+                                ))
+                                .child(settings_action_chip("+0.5", &t).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        let mut next = this.config.terminal.clone();
+                                        next.line_height_px = (next.line_height_px + 0.5).min(40.0);
+                                        this.persist_terminal_settings(next, cx);
+                                    }),
+                                )),
+                        ),
+                    )
+            }
+            SettingsSection::Debug => {
+                let mut choices = div().flex().gap(px(8.0));
+                for (label, mode) in [
+                    ("off", PerfHudDefault::Off),
+                    ("compact", PerfHudDefault::Compact),
+                    ("expanded", PerfHudDefault::Expanded),
+                ] {
+                    let is_active = self.config.debug.perf_hud_default == mode;
+                    choices =
+                        choices.child(settings_choice_chip(label, is_active, &t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.persist_perf_hud_default(mode, cx);
+                            }),
+                        ));
+                }
+
+                content.child(
+                    settings_info_card(
+                        "Performance HUD",
+                        perf_mode_label(self.config.debug.perf_hud_default.into()).to_string(),
+                        "The SEANCE_PERF_HUD env var still overrides this for the current process.",
+                        &t,
+                    )
+                    .child(choices),
+                )
+            }
+            SettingsSection::Vault => content
+                .child(self.render_vault_credentials_card(cx))
+                .child(self.render_vault_keys_card(cx)),
+        };
 
         div()
             .flex_1()
             .h_full()
             .flex()
+            .child(nav)
             .child(shell_divider)
             .child(content)
     }
@@ -3789,7 +4420,7 @@ impl SeanceWorkspace {
         let mut browser = SftpBrowserState::new(session_id, label, home);
         self.refresh_sftp_listing(&mut browser);
         self.sftp_browser = Some(browser);
-        self.vault_panel_open = false;
+        self.settings_panel.open = false;
         self.palette_open = false;
         cx.notify();
     }
@@ -4926,9 +5557,9 @@ impl SeanceWorkspace {
                 .terminal_metrics
                 .unwrap_or(TerminalMetrics {
                     cell_width_px: 8.0,
-                    cell_height_px: TERMINAL_LINE_HEIGHT_PX,
-                    line_height_px: TERMINAL_LINE_HEIGHT_PX,
-                    font_size_px: TERMINAL_FONT_SIZE_PX,
+                    cell_height_px: self.terminal_line_height_px(),
+                    line_height_px: self.terminal_line_height_px(),
+                    font_size_px: self.terminal_font_size_px(),
                 })
                 .line_height_px,
         };
@@ -5808,6 +6439,209 @@ fn perf_row(
         .child(div().text_color(value_color).child(value))
 }
 
+fn settings_nav_button(section: SettingsSection, active: bool, theme: &Theme) -> Div {
+    div()
+        .px(px(12.0))
+        .py(px(10.0))
+        .rounded_lg()
+        .border_1()
+        .border_color(if active {
+            theme.accent
+        } else {
+            theme.glass_border
+        })
+        .bg(if active {
+            theme.accent_glow
+        } else {
+            theme.glass_tint
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.glass_hover))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if active {
+                            theme.text_primary
+                        } else {
+                            theme.text_secondary
+                        })
+                        .child(section.title()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.text_muted)
+                        .child(section.subtitle()),
+                ),
+        )
+}
+
+fn settings_choice_chip(label: impl Into<SharedString>, active: bool, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded_md()
+        .border_1()
+        .border_color(if active {
+            theme.accent
+        } else {
+            theme.glass_border
+        })
+        .bg(if active {
+            theme.accent_glow
+        } else {
+            theme.glass_tint
+        })
+        .text_xs()
+        .text_color(if active {
+            theme.text_primary
+        } else {
+            theme.text_secondary
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.glass_hover))
+        .child(label.into())
+}
+
+fn settings_action_chip(label: impl Into<SharedString>, theme: &Theme) -> Div {
+    div()
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded_md()
+        .border_1()
+        .border_color(theme.glass_border)
+        .bg(theme.glass_tint)
+        .text_xs()
+        .text_color(theme.text_secondary)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.glass_hover).text_color(theme.text_primary))
+        .child(label.into())
+}
+
+fn settings_toggle_card(
+    title: &'static str,
+    description: &'static str,
+    enabled: bool,
+    theme: &Theme,
+) -> Div {
+    div()
+        .p_4()
+        .rounded_xl()
+        .bg(theme.glass_tint)
+        .border_1()
+        .border_color(if enabled {
+            theme.accent
+        } else {
+            theme.glass_border
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.glass_hover))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme.text_primary)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.text_muted)
+                                .child(description),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .rounded_md()
+                        .bg(if enabled {
+                            theme.accent_glow
+                        } else {
+                            theme.glass_hover
+                        })
+                        .text_xs()
+                        .text_color(if enabled {
+                            theme.accent
+                        } else {
+                            theme.text_ghost
+                        })
+                        .child(if enabled { "on" } else { "off" }),
+                ),
+        )
+}
+
+fn settings_info_card(
+    title: &'static str,
+    value: String,
+    description: &'static str,
+    theme: &Theme,
+) -> Div {
+    div()
+        .p_4()
+        .rounded_xl()
+        .bg(theme.glass_tint)
+        .border_1()
+        .border_color(theme.glass_border)
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.text_primary)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.text_secondary)
+                        .child(value),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.text_muted)
+                        .child(description),
+                ),
+        )
+}
+
+fn settings_stepper_card(
+    title: &'static str,
+    value: String,
+    description: &'static str,
+    theme: &Theme,
+) -> Div {
+    settings_info_card(title, value, description, theme)
+}
+
 fn unlock_field_card(
     label: &'static str,
     value: String,
@@ -5926,6 +6760,7 @@ fn build_terminal_surface_rows(
     metrics: TerminalMetrics,
     theme_id: ThemeId,
     theme: &Theme,
+    font_family: String,
     shape_cache: &mut ShapeCache,
     window: &mut Window,
 ) -> (Vec<TerminalPaintRow>, TerminalRendererMetrics) {
@@ -5948,6 +6783,7 @@ fn build_terminal_surface_rows(
             metrics,
             theme_id,
             theme,
+            font_family.as_str(),
             shape_cache,
             window,
             &mut renderer_metrics,
@@ -5964,6 +6800,7 @@ fn build_terminal_paint_row(
     metrics: TerminalMetrics,
     theme_id: ThemeId,
     theme: &Theme,
+    font_family: &str,
     shape_cache: &mut ShapeCache,
     window: &mut Window,
     renderer_metrics: &mut TerminalRendererMetrics,
@@ -5982,6 +6819,7 @@ fn build_terminal_paint_row(
             metrics,
             theme_id,
             theme,
+            font_family,
             shape_cache,
             window,
             renderer_metrics,
@@ -6188,6 +7026,7 @@ fn shape_terminal_fragment(
     metrics: TerminalMetrics,
     theme_id: ThemeId,
     theme: &Theme,
+    font_family: &str,
     shape_cache: &mut ShapeCache,
     window: &mut Window,
     renderer_metrics: &mut TerminalRendererMetrics,
@@ -6195,6 +7034,7 @@ fn shape_terminal_fragment(
     let color = resolve_terminal_foreground(plan.style, theme);
     let key = ShapeCacheKey {
         text: plan.text.clone(),
+        font_family: font_family.to_string(),
         font_size_bits: metrics.font_size_px.to_bits(),
         bold: plan.style.bold,
         italic: plan.style.italic,
@@ -6209,7 +7049,7 @@ fn shape_terminal_fragment(
     }
 
     renderer_metrics.shape_misses += 1;
-    let mut terminal_font = font(TERMINAL_FONT_FAMILY);
+    let mut terminal_font = font(font_family.to_string());
     if plan.style.bold {
         terminal_font = terminal_font.bold();
     }
@@ -7131,10 +7971,10 @@ impl Render for SeanceWorkspace {
 
         let t = self.theme();
 
-        let main_content = if self.sftp_browser.is_some() {
+        let main_content = if self.is_settings_panel_open() {
+            self.render_settings_panel(window, cx)
+        } else if self.sftp_browser.is_some() {
             self.render_sftp_panel(window, cx)
-        } else if self.vault_panel_open {
-            self.render_vault_panel(window, cx)
         } else {
             self.render_terminal_shell(window, cx)
         };
@@ -7151,7 +7991,7 @@ impl Render for SeanceWorkspace {
                 this.spawn_session(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenPreferences, _window, cx| {
-                this.open_vault_panel(cx);
+                this.open_settings_panel(SettingsSection::General, cx);
             }))
             .on_action(cx.listener(|this, _: &CloseActiveSession, _window, cx| {
                 if this.active_session_id != 0 {
@@ -7170,8 +8010,8 @@ impl Render for SeanceWorkspace {
                     this.select_session(action.session_id, cx);
                 }
             }))
-            .on_action(cx.listener(|this, action: &SwitchTheme, _window, cx| {
-                this.apply_theme(action.theme_id, cx);
+            .on_action(cx.listener(|this, action: &SwitchTheme, window, cx| {
+                this.persist_theme(action.theme_id, window, cx);
             }))
             .child(self.render_sidebar(cx))
             .child(main_content);

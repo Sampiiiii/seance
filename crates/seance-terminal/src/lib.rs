@@ -439,10 +439,10 @@ impl TerminalSession for LocalSessionHandle {
 pub struct LocalSessionFactory;
 
 impl LocalSessionFactory {
-    pub fn spawn(&self) -> Result<LocalSessionHandle> {
+    pub fn spawn(&self, shell_override: Option<&str>) -> Result<LocalSessionHandle> {
         let id = next_session_id();
         let title: Arc<str> = format!("local-{id}").into();
-        spawn_local_session(id, title)
+        spawn_local_session(id, title, shell_override.map(ToOwned::to_owned))
     }
 }
 
@@ -465,7 +465,11 @@ struct RenderedSnapshot {
     truncated_row_count: usize,
 }
 
-fn spawn_local_session(id: u64, title: Arc<str>) -> Result<LocalSessionHandle> {
+fn spawn_local_session(
+    id: u64,
+    title: Arc<str>,
+    shell_override: Option<String>,
+) -> Result<LocalSessionHandle> {
     let (state, notify_rx) = SharedSessionState::new("Launching local shell...");
     let (command_tx, command_rx) = mpsc::channel();
 
@@ -474,7 +478,8 @@ fn spawn_local_session(id: u64, title: Arc<str>) -> Result<LocalSessionHandle> {
     thread::Builder::new()
         .name(format!("seance-local-session-{id}"))
         .spawn(move || {
-            if let Err(error) = run_local_session(thread_state.clone(), command_rx) {
+            if let Err(error) = run_local_session(thread_state.clone(), command_rx, shell_override)
+            {
                 thread_state.set_error(&error);
             }
         })
@@ -492,6 +497,7 @@ fn spawn_local_session(id: u64, title: Arc<str>) -> Result<LocalSessionHandle> {
 fn run_local_session(
     state: SharedSessionState,
     command_rx: mpsc::Receiver<SessionCommand>,
+    shell_override: Option<String>,
 ) -> Result<()> {
     let mut current_geometry = TerminalGeometry::default();
     let pty_system = native_pty_system();
@@ -504,7 +510,9 @@ fn run_local_session(
         })
         .context("failed to open PTY")?;
 
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let shell = shell_override
+        .or_else(|| env::var("SHELL").ok())
+        .unwrap_or_else(|| "/bin/bash".to_string());
     let mut command = CommandBuilder::new(shell);
     command.env("TERM", "xterm-256color");
 

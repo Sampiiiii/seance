@@ -2,10 +2,14 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
 };
 
 use anyhow::{Context, Result, anyhow};
+use seance_config::{AppConfig, ConfigStore};
 use seance_ssh::{
     ResolvedAuthMethod, SftpEntry, SshConnectRequest, SshConnectionConfig, SshSessionManager,
 };
@@ -20,6 +24,7 @@ pub type SessionId = u64;
 #[derive(Clone, Debug)]
 pub struct AppPaths {
     pub app_root: PathBuf,
+    pub config_path: PathBuf,
     pub vault_db_path: PathBuf,
     pub ipc_socket_path: PathBuf,
     pub instance_lock_path: PathBuf,
@@ -31,6 +36,7 @@ impl AppPaths {
         let app_root = data_root.join("seance");
         fs::create_dir_all(&app_root).context("failed to create app data directory")?;
         Ok(Self {
+            config_path: app_root.join("config.toml"),
             vault_db_path: app_root.join("vault.sqlite"),
             ipc_socket_path: app_root.join("resident.sock"),
             instance_lock_path: app_root.join("resident.lock"),
@@ -41,6 +47,7 @@ impl AppPaths {
 
 pub struct AppContext {
     pub paths: AppPaths,
+    pub config: ConfigStore,
     pub vault: VaultStore,
     pub ssh: Arc<SshSessionManager>,
     pub local: LocalSessionFactory,
@@ -48,11 +55,23 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn open(paths: AppPaths) -> Result<Self> {
+        let config = match ConfigStore::load_or_default(&paths.config_path) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    path = %paths.config_path.display(),
+                    error = %error,
+                    "failed to load config, falling back to defaults"
+                );
+                ConfigStore::with_defaults(&paths.config_path)
+            }
+        };
         let vault =
             VaultStore::open(&paths.vault_db_path).context("failed to open the encrypted vault")?;
         let ssh = Arc::new(SshSessionManager::new()?);
         Ok(Self {
             paths,
+            config,
             vault,
             ssh,
             local: LocalSessionFactory::default(),
@@ -88,10 +107,16 @@ pub struct LifecyclePolicy {
 
 impl Default for LifecyclePolicy {
     fn default() -> Self {
+        Self::from(&AppConfig::default())
+    }
+}
+
+impl From<&AppConfig> for LifecyclePolicy {
+    fn from(config: &AppConfig) -> Self {
         Self {
-            keep_running_without_windows: true,
-            hide_on_last_window_close: true,
-            keep_sessions_alive_without_windows: true,
+            keep_running_without_windows: config.window.keep_running_without_windows,
+            hide_on_last_window_close: config.window.hide_on_last_window_close,
+            keep_sessions_alive_without_windows: config.window.keep_sessions_alive_without_windows,
         }
     }
 }
@@ -104,6 +129,7 @@ pub struct WindowBootstrap {
     pub cached_keys: Vec<KeySummary>,
     pub vault_status: VaultStatus,
     pub device_unlock_attempted: bool,
+    pub config: AppConfig,
 }
 
 #[derive(Default)]
@@ -193,6 +219,7 @@ pub struct AppController {
     sessions: SessionRegistry,
     windows: WindowRegistry,
     lifecycle_policy: LifecyclePolicy,
+    config_subscribers: Vec<Sender<AppConfig>>,
     access_seq: u64,
     device_unlock_attempted: bool,
 }
@@ -202,11 +229,13 @@ pub struct AppControllerHandle(Arc<Mutex<AppController>>);
 
 impl AppControllerHandle {
     pub fn new(context: AppContext) -> Self {
+        let lifecycle_policy = LifecyclePolicy::from(&context.config.snapshot());
         Self(Arc::new(Mutex::new(AppController {
             context,
             sessions: SessionRegistry::default(),
             windows: WindowRegistry::default(),
-            lifecycle_policy: LifecyclePolicy::default(),
+            lifecycle_policy,
+            config_subscribers: Vec::new(),
             access_seq: 0,
             device_unlock_attempted: false,
         })))
@@ -219,6 +248,22 @@ impl AppControllerHandle {
 
     pub fn app_paths(&self) -> AppPaths {
         self.with_lock(|controller| controller.context.paths.clone())
+    }
+
+    pub fn config_snapshot(&self) -> AppConfig {
+        self.with_lock(|controller| controller.context.config.snapshot())
+    }
+
+    pub fn update_config(&self, f: impl FnOnce(&mut AppConfig)) -> Result<AppConfig> {
+        self.with_lock(|controller| controller.update_config(f))
+    }
+
+    pub fn reset_config_to_defaults(&self) -> Result<AppConfig> {
+        self.with_lock(|controller| controller.reset_config_to_defaults())
+    }
+
+    pub fn subscribe_config_changes(&self) -> Receiver<AppConfig> {
+        self.with_lock(|controller| controller.subscribe_config_changes())
     }
 
     pub fn bootstrap(&self) -> Result<()> {
@@ -542,13 +587,50 @@ impl AppController {
             },
             vault_status: self.context.vault.status(),
             device_unlock_attempted: self.device_unlock_attempted,
+            config: self.context.config.snapshot(),
         })
     }
 
     fn spawn_local_session(&mut self) -> Result<Arc<dyn TerminalSession>> {
-        let session: Arc<dyn TerminalSession> = Arc::new(self.context.local.spawn()?);
+        let shell_override = self.context.config.snapshot().terminal.local_shell;
+        let session: Arc<dyn TerminalSession> =
+            Arc::new(self.context.local.spawn(shell_override.as_deref())?);
         self.register_session(Arc::clone(&session), SessionKind::Local);
         Ok(session)
+    }
+
+    fn update_config(&mut self, f: impl FnOnce(&mut AppConfig)) -> Result<AppConfig> {
+        let snapshot = self
+            .context
+            .config
+            .update(f)
+            .context("failed to persist app config")?;
+        self.lifecycle_policy = LifecyclePolicy::from(&snapshot);
+        self.publish_config_update(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    fn reset_config_to_defaults(&mut self) -> Result<AppConfig> {
+        let defaults = AppConfig::default();
+        self.context
+            .config
+            .replace(defaults)
+            .context("failed to reset app config to defaults")?;
+        let snapshot = self.context.config.snapshot();
+        self.lifecycle_policy = LifecyclePolicy::from(&snapshot);
+        self.publish_config_update(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    fn subscribe_config_changes(&mut self) -> Receiver<AppConfig> {
+        let (tx, rx) = mpsc::channel();
+        self.config_subscribers.push(tx);
+        rx
+    }
+
+    fn publish_config_update(&mut self, snapshot: AppConfig) {
+        self.config_subscribers
+            .retain(|subscriber| subscriber.send(snapshot.clone()).is_ok());
     }
 
     fn register_session(&mut self, session: Arc<dyn TerminalSession>, kind: SessionKind) {
@@ -564,14 +646,21 @@ impl AppController {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, mpsc};
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
 
     use anyhow::Result;
     use seance_terminal::{
         SessionPerfSnapshot, SessionSnapshot, TerminalGeometry, TerminalSession,
     };
+    use tempfile::tempdir;
 
-    use super::{LifecyclePolicy, PlatformCloseAction, SessionKind, SessionRegistry};
+    use super::{
+        AppContext, AppControllerHandle, AppPaths, LifecyclePolicy, PlatformCloseAction,
+        SessionKind, SessionRegistry,
+    };
 
     struct FakeSession(u64);
 
@@ -618,5 +707,116 @@ mod tests {
             PlatformCloseAction::Exit
         };
         assert_eq!(action, PlatformCloseAction::Hide);
+    }
+
+    #[test]
+    fn detected_paths_include_config_toml() {
+        let paths = AppPaths::detect().unwrap();
+        assert_eq!(paths.config_path.file_name().unwrap(), "config.toml");
+    }
+
+    #[test]
+    fn updating_config_changes_lifecycle_behavior_immediately() {
+        let controller = make_test_controller();
+        assert_eq!(
+            controller.on_last_window_closed(),
+            PlatformCloseAction::Hide
+        );
+
+        let config = controller
+            .update_config(|config| {
+                config.window.keep_running_without_windows = false;
+            })
+            .unwrap();
+
+        assert!(!config.window.keep_running_without_windows);
+        assert_eq!(
+            controller.on_last_window_closed(),
+            PlatformCloseAction::Exit
+        );
+    }
+
+    #[test]
+    fn reset_config_restores_defaults() {
+        let controller = make_test_controller();
+        controller
+            .update_config(|config| {
+                config.appearance.theme = "bone".into();
+                config.window.keep_running_without_windows = false;
+            })
+            .unwrap();
+
+        let reset = controller.reset_config_to_defaults().unwrap();
+
+        assert_eq!(reset.appearance.theme, "obsidian-smoke");
+        assert!(reset.window.keep_running_without_windows);
+        assert_eq!(
+            controller.on_last_window_closed(),
+            PlatformCloseAction::Hide
+        );
+    }
+
+    #[test]
+    fn update_config_broadcasts_new_snapshot() {
+        let controller = make_test_controller();
+        let rx = controller.subscribe_config_changes();
+
+        let updated = controller
+            .update_config(|config| {
+                config.appearance.theme = "bone".into();
+            })
+            .unwrap();
+
+        let broadcast = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(broadcast, updated);
+        assert_eq!(broadcast.appearance.theme, "bone");
+    }
+
+    #[test]
+    fn reset_config_broadcasts_defaults() {
+        let controller = make_test_controller();
+        controller
+            .update_config(|config| {
+                config.appearance.theme = "bone".into();
+            })
+            .unwrap();
+        let rx = controller.subscribe_config_changes();
+
+        let reset = controller.reset_config_to_defaults().unwrap();
+
+        let broadcast = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(broadcast, reset);
+        assert_eq!(broadcast.appearance.theme, "obsidian-smoke");
+    }
+
+    #[test]
+    fn dead_config_subscribers_do_not_break_broadcasts() {
+        let controller = make_test_controller();
+        let rx = controller.subscribe_config_changes();
+        drop(rx);
+
+        let active_rx = controller.subscribe_config_changes();
+        controller
+            .update_config(|config| {
+                config.appearance.theme = "nord".into();
+            })
+            .unwrap();
+
+        let broadcast = active_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(broadcast.appearance.theme, "nord");
+    }
+
+    fn make_test_controller() -> AppControllerHandle {
+        let dir = tempdir().unwrap();
+        let root = dir.keep();
+        let context = AppContext::open(AppPaths {
+            app_root: root.clone(),
+            config_path: root.join("config.toml"),
+            vault_db_path: root.join("vault.sqlite"),
+            ipc_socket_path: root.join("resident.sock"),
+            instance_lock_path: root.join("resident.lock"),
+        })
+        .unwrap();
+        AppControllerHandle::new(context)
     }
 }

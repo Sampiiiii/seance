@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.14"
+thiserror = "2.0"
+toml = "0.9"
