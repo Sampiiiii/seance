@@ -1,18 +1,29 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::items_after_test_module,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_map_or,
+    clippy::unwrap_or_default
+)]
+
 mod actions;
 mod backend;
+mod forms;
 mod palette;
+mod perf;
 mod theme;
 
 use std::{
-    collections::{HashMap, VecDeque},
-    env, fs,
+    collections::HashMap,
+    fs,
     path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::Receiver,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::Result;
@@ -23,25 +34,37 @@ use gpui::{
     WindowOptions, canvas, deferred, div, fill, font, point, prelude::*, px, size,
 };
 use seance_config::{AppConfig, PerfHudDefault, TerminalConfig, WindowConfig};
-use seance_core::{AppControllerHandle, PlatformCloseAction, SessionKind, WindowTarget};
+use seance_core::{
+    AppControllerHandle, PlatformCloseAction, SessionKind, UpdateState, WindowTarget,
+};
 use seance_terminal::{
-    SessionPerfSnapshot, TerminalCell, TerminalCellStyle, TerminalColor, TerminalGeometry,
-    TerminalRow, TerminalSession,
+    TerminalCell, TerminalCellStyle, TerminalColor, TerminalGeometry, TerminalRow, TerminalSession,
 };
 use seance_vault::{
     CredentialSummary, HostAuthRef, HostSummary, KeySummary, PrivateKeyAlgorithm, PrivateKeySource,
     SecretString, VaultHostProfile, VaultPasswordCredential,
 };
 use tracing::trace;
-use zeroize::Zeroizing;
 
 pub use actions::{
-    CloseActiveSession, ConnectHost, HideOtherApps, HideSeance, NewTerminal, OpenCommandPalette,
-    OpenNewWindow, OpenPreferences, QuitSeance, SelectSession, ShowAllApps, SwitchTheme,
-    TogglePerfHud,
+    CheckForUpdates, CloseActiveSession, ConnectHost, HideOtherApps, HideSeance, NewTerminal,
+    OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance, SelectSession, ShowAllApps,
+    SwitchTheme, TogglePerfHud,
 };
 use backend::UiBackend;
+use forms::{
+    CredentialEditorState, CredentialField, HostEditorState, HostField, SettingsPanelState,
+    SettingsSection, UnlockFormState, UnlockMode,
+};
 use palette::{PaletteAction, PaletteGroup, build_items};
+#[cfg(test)]
+use perf::{
+    PERF_WINDOW, average_duration_ms, build_frame_stats, normalized_fps_1s, percentile_duration_ms,
+    trim_timed_durations,
+};
+use perf::{
+    PerfOverlayState, RedrawReason, UiPerfMode, perf_mode_from_config, perf_mode_override_from_env,
+};
 use seance_ssh::{SftpEntry, SshConnectResult, SshError};
 use theme::Theme;
 pub use theme::ThemeId;
@@ -49,8 +72,6 @@ pub use theme::ThemeId;
 const SIDEBAR_WIDTH: f32 = 260.0;
 const SIDEBAR_FONT_MONO: &str = "JetBrains Mono";
 const SIDEBAR_MONO_SIZE_PX: f32 = 11.0;
-const PERF_HISTORY_LIMIT: usize = 120;
-const PERF_WINDOW: Duration = Duration::from_secs(1);
 const TERMINAL_PANE_PADDING_PX: f32 = 16.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,6 +230,7 @@ impl WorkspaceWindowRegistry {
 #[derive(Clone, Debug)]
 enum InitialWorkspaceAction {
     ConnectHost(String),
+    CheckForUpdates,
     OpenPreferences,
     OpenCommandPalette,
     TogglePerfHud,
@@ -333,6 +355,19 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
                 backend_for_new_terminal.clone(),
                 WindowTarget::NewLocal,
                 None,
+            );
+        }
+        refresh_app_menus(cx);
+    });
+
+    let backend_for_updates = backend.clone();
+    cx.on_action(move |_: &CheckForUpdates, cx| {
+        if !with_registered_workspace(cx, |this, _window, cx| this.check_for_updates(cx)) {
+            let _ = open_workspace_window(
+                cx,
+                backend_for_updates.clone(),
+                WindowTarget::MostRecentOrNew,
+                Some(InitialWorkspaceAction::CheckForUpdates),
             );
         }
         refresh_app_menus(cx);
@@ -522,6 +557,7 @@ fn open_workspace_window(
                     cached_credentials: bootstrap.cached_credentials.clone(),
                     cached_keys: bootstrap.cached_keys.clone(),
                     status_message: None,
+                    update_state: bootstrap.update_state.clone(),
                     active_theme: theme_id_from_config(&bootstrap.config),
                     palette_open: false,
                     palette_query: String::new(),
@@ -558,6 +594,12 @@ fn open_workspace_window(
                     entity.clone(),
                     backend.subscribe_config_changes(),
                 );
+                SeanceWorkspace::schedule_update_watcher(
+                    window,
+                    cx,
+                    entity.clone(),
+                    backend.subscribe_update_changes(),
+                );
                 if let Some(initial_action) = initial_action.as_ref() {
                     ws.apply_initial_action(initial_action.clone(), window, cx);
                 }
@@ -584,6 +626,7 @@ struct SeanceWorkspace {
     cached_credentials: Vec<CredentialSummary>,
     cached_keys: Vec<KeySummary>,
     status_message: Option<String>,
+    update_state: UpdateState,
     active_theme: ThemeId,
     palette_open: bool,
     palette_query: String,
@@ -799,554 +842,8 @@ struct PreparedTerminalSurface {
     line_height_px: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UnlockMode {
-    Create,
-    Unlock,
-}
-
-#[derive(Debug)]
-struct UnlockFormState {
-    mode: UnlockMode,
-    passphrase: Zeroizing<String>,
-    confirm_passphrase: Zeroizing<String>,
-    selected_field: usize,
-    message: Option<String>,
-    completed: bool,
-}
-
-impl UnlockFormState {
-    fn new(initialized: bool, unlocked: bool, device_unlock_attempted: bool) -> Self {
-        let mode = if initialized {
-            UnlockMode::Unlock
-        } else {
-            UnlockMode::Create
-        };
-        let message = if unlocked {
-            Some("Vault unlocked from the local device key store.".into())
-        } else if initialized && device_unlock_attempted {
-            Some("Device unlock unavailable. Enter your recovery passphrase.".into())
-        } else if initialized {
-            Some("Unlock the vault to decrypt saved hosts.".into())
-        } else {
-            Some("Create a recovery passphrase for the encrypted vault.".into())
-        };
-
-        Self {
-            mode,
-            passphrase: Zeroizing::new(String::new()),
-            confirm_passphrase: Zeroizing::new(String::new()),
-            selected_field: 0,
-            message,
-            completed: unlocked,
-        }
-    }
-
-    fn reset_for_unlock(&mut self) {
-        self.mode = UnlockMode::Unlock;
-        self.passphrase.clear();
-        self.confirm_passphrase.clear();
-        self.selected_field = 0;
-        self.completed = false;
-    }
-
-    fn is_visible(&self) -> bool {
-        !self.completed
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HostField {
-    Label,
-    Hostname,
-    Username,
-    Port,
-    Notes,
-    Auth,
-}
-
-impl HostField {
-    const ALL: [Self; 6] = [
-        Self::Label,
-        Self::Hostname,
-        Self::Username,
-        Self::Port,
-        Self::Notes,
-        Self::Auth,
-    ];
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Label => "Label",
-            Self::Hostname => "Hostname",
-            Self::Username => "Username",
-            Self::Port => "Port",
-            Self::Notes => "Notes",
-            Self::Auth => "Authentication",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct HostEditorState {
-    host_id: Option<String>,
-    label: String,
-    hostname: String,
-    username: String,
-    port: String,
-    notes: String,
-    auth_items: Vec<HostAuthRef>,
-    auth_cursor: usize,
-    selected_field: usize,
-    message: Option<String>,
-}
-
-impl HostEditorState {
-    fn blank() -> Self {
-        Self {
-            host_id: None,
-            label: String::new(),
-            hostname: String::new(),
-            username: String::new(),
-            port: "22".into(),
-            notes: String::new(),
-            auth_items: Vec::new(),
-            auth_cursor: 0,
-            selected_field: 0,
-            message: Some(
-                "Create an encrypted SSH host. Use the Auth section to select credentials.".into(),
-            ),
-        }
-    }
-
-    fn from_host(host: VaultHostProfile) -> Self {
-        Self {
-            host_id: Some(host.id),
-            label: host.label,
-            hostname: host.hostname,
-            username: host.username,
-            port: host.port.to_string(),
-            notes: host.notes.unwrap_or_default(),
-            auth_items: host.auth_order,
-            auth_cursor: 0,
-            selected_field: 0,
-            message: Some("Edit the host record. Tab to Auth and toggle credentials.".into()),
-        }
-    }
-
-    fn field(&self) -> HostField {
-        HostField::ALL[self.selected_field.min(HostField::ALL.len() - 1)]
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CredentialField {
-    Label,
-    UsernameHint,
-    Secret,
-}
-
-impl CredentialField {
-    const ALL: [Self; 3] = [Self::Label, Self::UsernameHint, Self::Secret];
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Label => "Label",
-            Self::UsernameHint => "Username Hint",
-            Self::Secret => "Password",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct CredentialEditorState {
-    credential_id: Option<String>,
-    label: String,
-    username_hint: String,
-    secret: String,
-    selected_field: usize,
-    message: Option<String>,
-}
-
-impl CredentialEditorState {
-    fn blank() -> Self {
-        Self {
-            credential_id: None,
-            label: String::new(),
-            username_hint: String::new(),
-            secret: String::new(),
-            selected_field: 0,
-            message: Some("Store an encrypted password credential in the vault.".into()),
-        }
-    }
-
-    fn from_credential(cred: VaultPasswordCredential) -> Self {
-        Self {
-            credential_id: Some(cred.id),
-            label: cred.label,
-            username_hint: cred.username_hint.unwrap_or_default(),
-            secret: cred.secret,
-            selected_field: 0,
-            message: Some("Edit the credential. Tab to move, Enter on Password to save.".into()),
-        }
-    }
-
-    fn field(&self) -> CredentialField {
-        CredentialField::ALL[self.selected_field.min(CredentialField::ALL.len() - 1)]
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SettingsSection {
-    General,
-    Appearance,
-    Terminal,
-    Debug,
-    Vault,
-}
-
-impl SettingsSection {
-    const ALL: [Self; 5] = [
-        Self::General,
-        Self::Appearance,
-        Self::Terminal,
-        Self::Debug,
-        Self::Vault,
-    ];
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::General => "General",
-            Self::Appearance => "Appearance",
-            Self::Terminal => "Terminal",
-            Self::Debug => "Debug",
-            Self::Vault => "Vault",
-        }
-    }
-
-    fn subtitle(self) -> &'static str {
-        match self {
-            Self::General => "Resident app and window lifecycle",
-            Self::Appearance => "Themes and overall look",
-            Self::Terminal => "Shell and terminal rendering defaults",
-            Self::Debug => "Performance HUD defaults",
-            Self::Vault => "Encrypted credentials and SSH keys",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct SettingsPanelState {
-    open: bool,
-    section: SettingsSection,
-    message: Option<String>,
-}
-
-impl Default for SettingsPanelState {
-    fn default() -> Self {
-        Self {
-            open: false,
-            section: SettingsSection::General,
-            message: None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum UiPerfMode {
-    #[default]
-    Off,
-    Compact,
-    Expanded,
-}
-
-impl UiPerfMode {
-    fn next(self) -> Self {
-        match self {
-            Self::Off => Self::Compact,
-            Self::Compact => Self::Expanded,
-            Self::Expanded => Self::Off,
-        }
-    }
-
-    fn is_enabled(self) -> bool {
-        !matches!(self, Self::Off)
-    }
-}
-
-impl From<PerfHudDefault> for UiPerfMode {
-    fn from(value: PerfHudDefault) -> Self {
-        match value {
-            PerfHudDefault::Off => Self::Off,
-            PerfHudDefault::Compact => Self::Compact,
-            PerfHudDefault::Expanded => Self::Expanded,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum RedrawReason {
-    Input,
-    TerminalUpdate,
-    Palette,
-    UiRefresh,
-    #[default]
-    Unknown,
-}
-
-impl RedrawReason {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Input => "input",
-            Self::TerminalUpdate => "terminal",
-            Self::Palette => "palette",
-            Self::UiRefresh => "ui",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct FrameStats {
-    frame_count_total: u64,
-    fps_1s: f32,
-    frame_time_last_ms: f32,
-    frame_time_avg_ms: f32,
-    frame_time_p95_ms: f32,
-    present_interval_last_ms: f32,
-    present_interval_avg_ms: f32,
-    present_interval_p95_ms: f32,
-    redraw_reason: RedrawReason,
-}
-
-#[derive(Debug)]
-struct PerfOverlayState {
-    mode: UiPerfMode,
-    last_present_timestamp: Option<Instant>,
-    present_timestamps: VecDeque<Instant>,
-    present_intervals: VecDeque<(Instant, Duration)>,
-    render_cost_samples: VecDeque<(Instant, Duration)>,
-    ui_refresh_timestamps: VecDeque<Instant>,
-    terminal_refresh_timestamps: VecDeque<Instant>,
-    active_session_perf_snapshot: Option<SessionPerfSnapshot>,
-    frame_stats: FrameStats,
-    visible_line_count: usize,
-    pending_redraw_reason: RedrawReason,
-}
-
-impl PerfOverlayState {
-    fn new(mode: UiPerfMode) -> Self {
-        Self {
-            mode,
-            last_present_timestamp: None,
-            present_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
-            present_intervals: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
-            render_cost_samples: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
-            ui_refresh_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
-            terminal_refresh_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
-            active_session_perf_snapshot: None,
-            frame_stats: FrameStats::default(),
-            visible_line_count: 0,
-            pending_redraw_reason: RedrawReason::Unknown,
-        }
-    }
-
-    fn reset_sampling_window(&mut self) {
-        self.last_present_timestamp = None;
-        self.present_timestamps.clear();
-        self.present_intervals.clear();
-        self.render_cost_samples.clear();
-        self.ui_refresh_timestamps.clear();
-        self.terminal_refresh_timestamps.clear();
-        self.frame_stats = FrameStats::default();
-        self.pending_redraw_reason = RedrawReason::Unknown;
-    }
-
-    fn mark_terminal_refresh_request(
-        &mut self,
-        now: Instant,
-        reason: RedrawReason,
-        session_perf: Option<SessionPerfSnapshot>,
-    ) {
-        self.pending_redraw_reason = reason;
-        self.active_session_perf_snapshot = session_perf;
-        self.terminal_refresh_timestamps.push_back(now);
-        trim_instants(&mut self.terminal_refresh_timestamps, now, PERF_WINDOW);
-        self.ui_refresh_timestamps.push_back(now);
-        trim_instants(&mut self.ui_refresh_timestamps, now, PERF_WINDOW);
-    }
-
-    fn mark_ui_refresh_request(&mut self, now: Instant, reason: RedrawReason) {
-        self.pending_redraw_reason = reason;
-        self.ui_refresh_timestamps.push_back(now);
-        trim_instants(&mut self.ui_refresh_timestamps, now, PERF_WINDOW);
-    }
-
-    fn mark_input(&mut self, reason: RedrawReason) {
-        self.pending_redraw_reason = reason;
-    }
-
-    fn finish_render(&mut self, started_at: Instant, ended_at: Instant) {
-        self.render_cost_samples
-            .push_back((ended_at, ended_at.saturating_duration_since(started_at)));
-        trim_timed_durations(&mut self.render_cost_samples, ended_at, PERF_WINDOW);
-        if let Some(previous) = self.last_present_timestamp.replace(ended_at) {
-            self.present_intervals
-                .push_back((ended_at, ended_at.saturating_duration_since(previous)));
-            trim_timed_durations(&mut self.present_intervals, ended_at, PERF_WINDOW);
-        }
-        self.present_timestamps.push_back(ended_at);
-        trim_instants(&mut self.present_timestamps, ended_at, PERF_WINDOW);
-        self.frame_stats = build_frame_stats(
-            self.frame_stats.frame_count_total.saturating_add(1),
-            &self.render_cost_samples,
-            &self.present_intervals,
-            &self.present_timestamps,
-            self.pending_redraw_reason,
-        );
-        self.pending_redraw_reason = RedrawReason::Unknown;
-
-        trace!(
-            frame_count_total = self.frame_stats.frame_count_total,
-            fps_1s = self.frame_stats.fps_1s,
-            frame_time_last_ms = self.frame_stats.frame_time_last_ms,
-            redraw_reason = self.frame_stats.redraw_reason.label(),
-            "perf render sampled"
-        );
-    }
-
-    fn ui_refreshes_last_second(&self) -> usize {
-        self.ui_refresh_timestamps.len()
-    }
-
-    fn terminal_refreshes_last_second(&self) -> usize {
-        self.terminal_refresh_timestamps.len()
-    }
-
-    fn frames_presented_last_second(&self) -> usize {
-        self.present_timestamps.len()
-    }
-
-    fn active_session_dirty(&self) -> bool {
-        self.active_session_perf_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.dirty_since_last_ui_frame)
-    }
-
-    fn vt_bytes_per_second(&self) -> usize {
-        self.active_session_perf_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.terminal.vt_bytes_processed_since_last_snapshot)
-            .unwrap_or(0)
-    }
-}
-
-fn perf_mode_override_from_env() -> Option<UiPerfMode> {
-    match env::var("SEANCE_PERF_HUD") {
-        Ok(value) if value.eq_ignore_ascii_case("expanded") => Some(UiPerfMode::Expanded),
-        Ok(value)
-            if value == "1"
-                || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("compact") =>
-        {
-            Some(UiPerfMode::Compact)
-        }
-        _ => None,
-    }
-}
-
-fn perf_mode_from_config(config: &AppConfig) -> UiPerfMode {
-    perf_mode_override_from_env().unwrap_or(config.debug.perf_hud_default.into())
-}
-
 fn theme_id_from_config(config: &AppConfig) -> ThemeId {
     ThemeId::from_key(&config.appearance.theme).unwrap_or(ThemeId::ObsidianSmoke)
-}
-
-fn trim_instants(samples: &mut VecDeque<Instant>, now: Instant, window: Duration) {
-    while let Some(front) = samples.front().copied() {
-        if now.saturating_duration_since(front) <= window {
-            break;
-        }
-        samples.pop_front();
-    }
-}
-
-fn trim_timed_durations(
-    samples: &mut VecDeque<(Instant, Duration)>,
-    now: Instant,
-    window: Duration,
-) {
-    while let Some((timestamp, _)) = samples.front().copied() {
-        if now.saturating_duration_since(timestamp) <= window {
-            break;
-        }
-        samples.pop_front();
-    }
-}
-
-fn build_frame_stats(
-    frame_count_total: u64,
-    render_cost_samples: &VecDeque<(Instant, Duration)>,
-    present_intervals: &VecDeque<(Instant, Duration)>,
-    present_timestamps: &VecDeque<Instant>,
-    redraw_reason: RedrawReason,
-) -> FrameStats {
-    let frame_time_last_ms = render_cost_samples
-        .back()
-        .map(|(_, duration)| duration.as_secs_f32() * 1_000.0)
-        .unwrap_or_default();
-    let frame_time_avg_ms = average_duration_ms(render_cost_samples);
-    let frame_time_p95_ms = percentile_duration_ms(render_cost_samples, 0.95);
-    let present_interval_last_ms = present_intervals
-        .back()
-        .map(|(_, duration)| duration.as_secs_f32() * 1_000.0)
-        .unwrap_or_default();
-    let present_interval_avg_ms = average_duration_ms(present_intervals);
-    let present_interval_p95_ms = percentile_duration_ms(present_intervals, 0.95);
-
-    FrameStats {
-        frame_count_total,
-        fps_1s: normalized_fps_1s(present_timestamps),
-        frame_time_last_ms,
-        frame_time_avg_ms,
-        frame_time_p95_ms,
-        present_interval_last_ms,
-        present_interval_avg_ms,
-        present_interval_p95_ms,
-        redraw_reason,
-    }
-}
-
-fn average_duration_ms(samples: &VecDeque<(Instant, Duration)>) -> f32 {
-    if samples.is_empty() {
-        0.0
-    } else {
-        samples
-            .iter()
-            .map(|(_, duration)| duration.as_secs_f32())
-            .sum::<f32>()
-            * 1_000.0
-            / samples.len() as f32
-    }
-}
-
-fn normalized_fps_1s(present_timestamps: &VecDeque<Instant>) -> f32 {
-    present_timestamps.len() as f32
-}
-
-fn percentile_duration_ms(samples: &VecDeque<(Instant, Duration)>, percentile: f32) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-
-    let mut millis = samples
-        .iter()
-        .map(|(_, sample)| sample.as_secs_f32() * 1_000.0)
-        .collect::<Vec<_>>();
-    millis.sort_by(f32::total_cmp);
-    let index = ((millis.len() - 1) as f32 * percentile).round() as usize;
-    millis[index.min(millis.len() - 1)]
 }
 
 fn frame_budget_color(frame_ms: f32, theme: &Theme) -> gpui::Hsla {
@@ -1368,6 +865,19 @@ fn perf_mode_label(mode: UiPerfMode) -> &'static str {
         UiPerfMode::Off => "off",
         UiPerfMode::Compact => "compact",
         UiPerfMode::Expanded => "expanded",
+    }
+}
+
+fn update_status_label(state: &UpdateState) -> &'static str {
+    match state {
+        UpdateState::Idle => "Idle",
+        UpdateState::Checking => "Checking for updates…",
+        UpdateState::Available(_) => "Update available",
+        UpdateState::Downloading => "Downloading update…",
+        UpdateState::Installing => "Installing update…",
+        UpdateState::ReadyToRelaunch => "Update ready to relaunch",
+        UpdateState::UpToDate => "Séance is up to date.",
+        UpdateState::Failed(_) => "Update check failed",
     }
 }
 
@@ -1530,6 +1040,7 @@ impl SeanceWorkspace {
                 self.selected_host_id = Some(host_id.clone());
                 self.connect_saved_host(&host_id, window, cx);
             }
+            InitialWorkspaceAction::CheckForUpdates => self.check_for_updates(cx),
             InitialWorkspaceAction::OpenPreferences => {
                 self.open_settings_panel(SettingsSection::General, cx)
             }
@@ -1614,6 +1125,28 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
+    fn apply_update_state_snapshot(&mut self, next_state: UpdateState, cx: &mut Context<Self>) {
+        self.update_state = next_state.clone();
+        match next_state {
+            UpdateState::Available(ref update) => {
+                self.status_message = Some(format!("Update {} is available.", update.version));
+            }
+            UpdateState::Checking
+            | UpdateState::Downloading
+            | UpdateState::Installing
+            | UpdateState::ReadyToRelaunch
+            | UpdateState::UpToDate => {
+                self.status_message = Some(update_status_label(&self.update_state).to_string());
+            }
+            UpdateState::Failed(error) => {
+                self.status_message = Some(error);
+            }
+            UpdateState::Idle => {}
+        }
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
+    }
+
     fn persist_theme(&mut self, theme_id: ThemeId, _window: &mut Window, cx: &mut Context<Self>) {
         match self.backend.set_theme(theme_id.key().to_string()) {
             Ok(_) => {
@@ -1660,6 +1193,38 @@ impl SeanceWorkspace {
             Ok(_) => self.settings_panel.message = None,
             Err(error) => self.settings_panel.message = Some(error.to_string()),
         }
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
+    }
+
+    fn persist_update_auto_check(&mut self, auto_check: bool, cx: &mut Context<Self>) {
+        match self.backend.controller().update_config(|config| {
+            config.updates.auto_check = auto_check;
+        }) {
+            Ok(_) => self.settings_panel.message = None,
+            Err(error) => self.settings_panel.message = Some(error.to_string()),
+        }
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
+    }
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        self.backend.check_for_updates();
+        self.status_message = Some("Checking for updates…".into());
+        self.update_state = UpdateState::Checking;
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
+    }
+
+    fn install_available_update(&mut self, cx: &mut Context<Self>) {
+        self.backend.install_update();
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
+    }
+
+    fn dismiss_update_banner(&mut self, cx: &mut Context<Self>) {
+        self.backend.dismiss_update();
+        self.update_state = UpdateState::Idle;
         self.perf_overlay.mark_input(RedrawReason::UiRefresh);
         cx.notify();
     }
@@ -1850,6 +1415,39 @@ impl SeanceWorkspace {
                     let _ = cx.update(move |window, cx| {
                         entity.update(cx, |this, cx| {
                             this.apply_config_snapshot(next_config, window, cx);
+                        });
+                        window.refresh();
+                    });
+                }
+            })
+            .detach();
+    }
+
+    fn schedule_update_watcher(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        entity: gpui::Entity<Self>,
+        update_rx: std::sync::mpsc::Receiver<UpdateState>,
+    ) {
+        let update_rx = Arc::new(std::sync::Mutex::new(update_rx));
+        window
+            .spawn(cx, async move |cx| {
+                loop {
+                    let rx = Arc::clone(&update_rx);
+                    let next_state = cx
+                        .background_executor()
+                        .spawn(async move { rx.lock().unwrap().recv().ok() })
+                        .await;
+                    let Some(mut next_state) = next_state else {
+                        break;
+                    };
+                    while let Ok(state) = update_rx.lock().unwrap().try_recv() {
+                        next_state = state;
+                    }
+                    let entity = entity.clone();
+                    let _ = cx.update(move |window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.apply_update_state_snapshot(next_state, cx);
                         });
                         window.refresh();
                     });
@@ -2358,6 +1956,12 @@ impl SeanceWorkspace {
     ) {
         match action {
             PaletteAction::NewLocalTerminal => self.spawn_session(window, cx),
+            PaletteAction::CheckForUpdates => {
+                self.check_for_updates(cx);
+            }
+            PaletteAction::InstallAvailableUpdate => {
+                self.install_available_update(cx);
+            }
             PaletteAction::SwitchSession(id) => self.select_session(id, cx),
             PaletteAction::CloseActiveSession => {
                 let id = self.active_session_id;
@@ -2536,6 +2140,7 @@ impl SeanceWorkspace {
                     &self.palette_query,
                     self.vault_unlocked(),
                     &remote_ids,
+                    &self.update_state,
                 )
                 .len();
                 if self.palette_selected + 1 < count {
@@ -2559,6 +2164,7 @@ impl SeanceWorkspace {
                     &self.palette_query,
                     self.vault_unlocked(),
                     &remote_ids,
+                    &self.update_state,
                 );
                 if let Some(item) = items.get(self.palette_selected) {
                     let action = item.action.clone();
@@ -3814,6 +3420,95 @@ impl SeanceWorkspace {
                                         }),
                                     ),
                             ),
+                    )
+            }
+            SettingsSection::Updates => {
+                let updates = self.config.updates;
+                let update_state = self.update_state.clone();
+                let update_version = match &update_state {
+                    UpdateState::Available(update) => update.version.clone(),
+                    _ => "none".into(),
+                };
+
+                let mut actions = div().flex().flex_wrap().gap(px(8.0)).child(
+                    settings_action_chip("check now", &t).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.check_for_updates(cx);
+                        }),
+                    ),
+                );
+
+                if matches!(update_state, UpdateState::Available(_)) {
+                    actions =
+                        actions.child(settings_action_chip("install update", &t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.install_available_update(cx);
+                            }),
+                        ));
+                }
+
+                if !matches!(update_state, UpdateState::Idle) {
+                    actions = actions.child(settings_action_chip("dismiss", &t).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.dismiss_update_banner(cx);
+                        }),
+                    ));
+                }
+
+                content
+                    .child(
+                        settings_toggle_card(
+                            "Automatic checks",
+                            "Check the stable release channel on app startup.",
+                            updates.auto_check,
+                            &t,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.persist_update_auto_check(!updates.auto_check, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        settings_info_card(
+                            "Current build",
+                            env!("CARGO_PKG_VERSION").to_string(),
+                            "The updater compares this version against GitHub Releases.",
+                            &t,
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(8.0))
+                                .child(settings_choice_chip("stable", true, &t))
+                                .child(settings_choice_chip("prompted install", true, &t)),
+                        ),
+                    )
+                    .child(
+                        settings_info_card(
+                            "Updater state",
+                            update_status_label(&update_state).to_string(),
+                            "Official builds support Sparkle on macOS and AppImage updating on Linux.",
+                            &t,
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(t.text_muted)
+                                        .child(format!("available version: {update_version}")),
+                                )
+                                .child(actions),
+                        ),
                     )
             }
             SettingsSection::Appearance => {
@@ -5567,7 +5262,21 @@ impl SeanceWorkspace {
             .active_session()
             .and_then(|session| session.snapshot().exit_status);
 
-        let mut term = base.p_4().child(
+        let mut content = div().flex_1().flex().flex_col().gap(px(12.0));
+
+        if matches!(
+            self.update_state,
+            UpdateState::Available(_)
+                | UpdateState::Checking
+                | UpdateState::Downloading
+                | UpdateState::Installing
+                | UpdateState::ReadyToRelaunch
+                | UpdateState::Failed(_)
+        ) {
+            content = content.child(self.render_update_banner(cx));
+        }
+
+        content = content.child(
             canvas(
                 move |_bounds, _window, _cx| prepared,
                 move |bounds, prepared, window, cx| {
@@ -5576,6 +5285,8 @@ impl SeanceWorkspace {
             )
             .size_full(),
         );
+
+        let mut term = base.p_4().child(content);
 
         if let Some(exit_status) = exit_status {
             term = term.child(
@@ -5601,6 +5312,66 @@ impl SeanceWorkspace {
         term
     }
 
+    fn render_update_banner(&self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme();
+        let mut actions = div().flex().flex_wrap().gap(px(8.0));
+
+        if matches!(self.update_state, UpdateState::Available(_)) {
+            actions = actions.child(settings_action_chip("install update", &t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.install_available_update(cx);
+                }),
+            ));
+        }
+
+        if matches!(self.update_state, UpdateState::Failed(_))
+            || matches!(self.update_state, UpdateState::Available(_))
+        {
+            actions = actions.child(settings_action_chip("dismiss", &t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.dismiss_update_banner(cx);
+                }),
+            ));
+        }
+
+        let description = match &self.update_state {
+            UpdateState::Available(update) => format!(
+                "Version {} is available from the stable channel.",
+                update.version
+            ),
+            UpdateState::Failed(error) => error.clone(),
+            _ => update_status_label(&self.update_state).to_string(),
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(16.0))
+            .p_4()
+            .rounded_xl()
+            .bg(t.glass_tint)
+            .border_1()
+            .border_color(t.glass_border)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(t.text_primary)
+                            .child("Updater"),
+                    )
+                    .child(div().text_xs().text_color(t.text_muted).child(description)),
+            )
+            .child(actions)
+    }
+
     fn render_palette_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme();
         let session_labels = self.palette_session_labels();
@@ -5617,6 +5388,7 @@ impl SeanceWorkspace {
             &self.palette_query,
             self.vault_unlocked(),
             &remote_ids,
+            &self.update_state,
         );
         trace!(palette_items = items.len(), "rendered palette overlay");
         let selected = self.palette_selected.min(items.len().saturating_sub(1));
@@ -7222,6 +6994,11 @@ fn terminal_color_to_hsla(color: TerminalColor) -> gpui::Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        collections::VecDeque,
+        time::{Duration, Instant},
+    };
+
     use gpui::size;
     use seance_terminal::{TerminalCell, TerminalRow};
 
@@ -7984,6 +7761,9 @@ impl Render for SeanceWorkspace {
             .flex()
             .bg(t.bg_deep)
             .text_color(t.text_primary)
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| {
+                this.check_for_updates(cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
                 this.toggle_palette(cx);
             }))

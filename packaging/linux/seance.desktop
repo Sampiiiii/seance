@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Séance
+Exec=Seance
+Icon=seance
+Categories=Network;System;TerminalEmulator;
+StartupNotify=true
+Terminal=false
+Comment=Cross-platform SSH terminal client

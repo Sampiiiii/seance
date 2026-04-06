@@ -120,7 +120,10 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use crate::{AppConfig, ConfigError, KeybindingOverride, SUPPORTED_KEYBINDING_ACTIONS};
+    use crate::{
+        AppConfig, ConfigError, KeybindingOverride, SUPPORTED_KEYBINDING_ACTIONS,
+        UpdateInstallMode, UpdateReleaseChannel,
+    };
 
     #[test]
     fn invalid_theme_is_rejected() {
@@ -199,5 +202,13 @@ mod tests {
             invalid_err,
             ConfigError::UnsupportedKeybindingAction { .. }
         ));
+    }
+
+    #[test]
+    fn update_defaults_use_prompted_stable_channel() {
+        let config = AppConfig::default();
+        assert!(config.updates.auto_check);
+        assert_eq!(config.updates.install_mode, UpdateInstallMode::Prompted);
+        assert_eq!(config.updates.channel, UpdateReleaseChannel::Stable);
     }
 }

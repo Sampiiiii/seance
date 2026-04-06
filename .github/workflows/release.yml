@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+      - name: Prepare release manifest
+        run: cargo run -q -p seance-build -- prepare-release --tag-ref "$GITHUB_REF_NAME" --release-dir dist/release --manifest-out dist/release/manifest.json --release-notes-out dist/release/release-notes.md
+      - name: Ensure draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo run -q -p seance-build -- ensure-draft-release --manifest dist/release/manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-metadata
+          path: |
+            dist/release/manifest.json
+            dist/release/release-notes.md
+
+  build-macos-aarch64:
+    needs: prepare
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-metadata
+          path: dist/release
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+      - name: Build notarized macOS artifacts
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+          SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: ./scripts/build-macos-release.sh "${GITHUB_REF_NAME#v}" dist/release/manifest.json
+      - name: Upload macOS assets to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo run -q -p seance-build -- upload-platform-assets --manifest dist/release/manifest.json --platform macos --arch aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-metadata
+          path: |
+            dist/release/sparkle-item.json
+            dist/release/manifests/macos-aarch64.json
+
+  build-linux-x86_64:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-metadata
+          path: dist/release
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            curl \
+            file \
+            fuse \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxinerama-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+      - run: ./scripts/build-appimage.sh x86_64 dist/release/manifest.json
+      - name: Upload Linux x86_64 assets to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo run -q -p seance-build -- upload-platform-assets --manifest dist/release/manifest.json --platform linux --arch x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-metadata
+          path: dist/release/manifests/linux-x86_64.json
+
+  build-linux-aarch64:
+    needs: prepare
+    runs-on: [self-hosted, Linux, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-metadata
+          path: dist/release
+      - run: ./scripts/build-appimage.sh aarch64 dist/release/manifest.json
+      - name: Upload Linux aarch64 assets to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo run -q -p seance-build -- upload-platform-assets --manifest dist/release/manifest.json --platform linux --arch aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64-metadata
+          path: dist/release/manifests/linux-aarch64.json
+
+  publish:
+    needs:
+      - prepare
+      - build-macos-aarch64
+      - build-linux-x86_64
+      - build-linux-aarch64
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-metadata
+          path: dist/release
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-metadata
+          path: dist/release
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64-metadata
+          path: dist/release/manifests
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-aarch64-metadata
+          path: dist/release/manifests
+      - name: Download release assets from GitHub
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download "$GITHUB_REF_NAME" --dir dist/release
+      - name: Validate release artifacts
+        run: cargo run -q -p seance-build -- validate-from-manifest --manifest dist/release/manifest.json
+      - name: Generate checksums
+        run: cargo run -q -p seance-build -- write-checksums-from-manifest --manifest dist/release/manifest.json
+      - name: Upload checksums to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/release/SHA256SUMS.txt --clobber
+      - name: Build Sparkle appcast
+        run: cargo run -q -p seance-build -- generate-appcast-from-manifest --manifest dist/release/manifest.json
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - uses: actions/deploy-pages@v4
+      - name: Publish release and mark latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest

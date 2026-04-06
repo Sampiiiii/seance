@@ -14,6 +14,8 @@ use seance_ssh::{
     ResolvedAuthMethod, SftpEntry, SshConnectRequest, SshConnectionConfig, SshSessionManager,
 };
 use seance_terminal::{LocalSessionFactory, TerminalSession};
+use seance_updater::UpdateManager;
+pub use seance_updater::{InstallMode, ReleaseChannel, UpdateInfo, UpdateSettings, UpdateState};
 use seance_vault::{
     CredentialSummary, GenerateKeyRequest, HostAuthRef, HostSummary, KeySummary, SecretString,
     VaultHostProfile, VaultPasswordCredential, VaultStatus, VaultStore,
@@ -51,6 +53,7 @@ pub struct AppContext {
     pub vault: VaultStore,
     pub ssh: Arc<SshSessionManager>,
     pub local: LocalSessionFactory,
+    pub updater: Arc<UpdateManager>,
 }
 
 impl AppContext {
@@ -69,12 +72,16 @@ impl AppContext {
         let vault =
             VaultStore::open(&paths.vault_db_path).context("failed to open the encrypted vault")?;
         let ssh = Arc::new(SshSessionManager::new()?);
+        let updater = Arc::new(UpdateManager::new(update_settings_from_config(
+            &config.snapshot(),
+        )));
         Ok(Self {
             paths,
             config,
             vault,
             ssh,
-            local: LocalSessionFactory::default(),
+            local: LocalSessionFactory,
+            updater,
         })
     }
 }
@@ -130,6 +137,7 @@ pub struct WindowBootstrap {
     pub vault_status: VaultStatus,
     pub device_unlock_attempted: bool,
     pub config: AppConfig,
+    pub update_state: UpdateState,
 }
 
 #[derive(Default)]
@@ -266,8 +274,28 @@ impl AppControllerHandle {
         self.with_lock(|controller| controller.subscribe_config_changes())
     }
 
+    pub fn update_state_snapshot(&self) -> UpdateState {
+        self.with_lock(|controller| controller.context.updater.state_snapshot())
+    }
+
+    pub fn subscribe_update_changes(&self) -> Receiver<UpdateState> {
+        self.with_lock(|controller| controller.context.updater.subscribe())
+    }
+
     pub fn bootstrap(&self) -> Result<()> {
         self.with_lock(|controller| controller.bootstrap())
+    }
+
+    pub fn check_for_updates(&self) {
+        self.with_lock(|controller| controller.context.updater.check_now());
+    }
+
+    pub fn install_update(&self) {
+        self.with_lock(|controller| controller.context.updater.install_update());
+    }
+
+    pub fn dismiss_update(&self) {
+        self.with_lock(|controller| controller.context.updater.dismiss_update());
     }
 
     pub fn prepare_window(&self, target: WindowTarget) -> Result<WindowBootstrap> {
@@ -544,6 +572,7 @@ impl AppController {
         if self.sessions.is_empty() {
             let _ = self.spawn_local_session()?;
         }
+        self.context.updater.startup_check();
         Ok(())
     }
 
@@ -588,6 +617,7 @@ impl AppController {
             vault_status: self.context.vault.status(),
             device_unlock_attempted: self.device_unlock_attempted,
             config: self.context.config.snapshot(),
+            update_state: self.context.updater.state_snapshot(),
         })
     }
 
@@ -606,6 +636,9 @@ impl AppController {
             .update(f)
             .context("failed to persist app config")?;
         self.lifecycle_policy = LifecyclePolicy::from(&snapshot);
+        self.context
+            .updater
+            .update_settings(update_settings_from_config(&snapshot));
         self.publish_config_update(snapshot.clone());
         Ok(snapshot)
     }
@@ -618,6 +651,9 @@ impl AppController {
             .context("failed to reset app config to defaults")?;
         let snapshot = self.context.config.snapshot();
         self.lifecycle_policy = LifecyclePolicy::from(&snapshot);
+        self.context
+            .updater
+            .update_settings(update_settings_from_config(&snapshot));
         self.publish_config_update(snapshot.clone());
         Ok(snapshot)
     }
@@ -641,6 +677,18 @@ impl AppController {
 
     fn bump_access_seq(&mut self) {
         self.access_seq = self.access_seq.wrapping_add(1);
+    }
+}
+
+fn update_settings_from_config(config: &AppConfig) -> UpdateSettings {
+    UpdateSettings {
+        auto_check: config.updates.auto_check,
+        install_mode: match config.updates.install_mode {
+            seance_config::UpdateInstallMode::Prompted => InstallMode::Prompted,
+        },
+        channel: match config.updates.channel {
+            seance_config::UpdateReleaseChannel::Stable => ReleaseChannel::Stable,
+        },
     }
 }
 

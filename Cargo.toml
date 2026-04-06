@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/seance-app",
+    "crates/seance-build",
     "crates/seance-core",
     "crates/seance-config",
     "crates/seance-platform",
@@ -9,7 +10,14 @@ members = [
     "crates/seance-ssh",
     "crates/seance-terminal",
     "crates/seance-ui",
+    "crates/seance-updater",
     "crates/seance-vault",
 ]
 default-members = ["crates/seance-app"]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/Sampiiiii/seance"

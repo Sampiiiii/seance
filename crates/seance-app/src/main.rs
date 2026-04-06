@@ -47,11 +47,11 @@ fn main() -> anyhow::Result<()> {
             {
                 let bridge = MacosPlatformAppBridge::new(controller.clone(), ui_tx.clone());
                 MacosPlatformRuntime.run(Box::new(bridge.clone()))?;
-                return seance_ui::run(UiRuntime {
+                seance_ui::run(UiRuntime {
                     controller,
                     commands: ui_rx,
                     integration: MacosPlatformRuntime::ui_integration(bridge),
-                });
+                })
             }
 
             #[cfg(not(target_os = "macos"))]

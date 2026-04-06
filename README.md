@@ -19,15 +19,16 @@ An open-source, cross-platform SSH terminal client built with Rust, [GPUI](https
 
 ## Architecture
 
-Cargo workspace with resident lifecycle support and nine crates:
+Cargo workspace with resident lifecycle support and ten crates:
 
 | Crate | Role |
-|---|---|
+| --- | --- |
 | `seance-app` | Binary entry point. Elects the primary instance, starts IPC, and launches the UI host. |
 | `seance-core` | Resident app state: session registry, lifecycle policy, vault/SSH service orchestration. |
 | `seance-terminal` | libghostty-vt integration, terminal state, local shell via `portable-pty`. |
 | `seance-ssh` | SSH client built on `russh`. Password/key auth, PTY session, resize, SFTP bootstrap. |
-| `seance-ui` | GPUI window host. Terminal canvas, session list, vault management, command palette, themes. |
+| `seance-ui` | GPUI window host. Terminal canvas, session list, vault management, command palette, themes, update UI. |
+| `seance-updater` | Cross-platform update manager. Sparkle integration on macOS and AppImage release checks on Linux. |
 | `seance-vault` | Encrypted SQLite storage for hosts, credentials, and SSH keys. |
 | `seance-platform` | Cross-platform resident-app contracts, IPC protocol, and single-instance plumbing. |
 | `seance-platform-macos` | macOS runtime shim for resident lifecycle integration. |
@@ -48,7 +49,7 @@ Resident lifecycle behavior now works like this:
 
 ## Getting started
 
-```
+```bash
 git clone https://github.com/sampiiiii/seance.git
 cd seance
 make run
@@ -56,7 +57,7 @@ make run
 
 Other useful targets:
 
-```
+```bash
 make run-perf           # Compact performance HUD
 make run-perf-expanded  # Expanded performance HUD
 make run-trace          # Tracing enabled
@@ -65,6 +66,30 @@ make clippy             # Clippy with -D warnings
 make test               # Run tests
 make fmt                # Format code
 ```
+
+Release metadata and artifact naming now go through the Rust build helper:
+
+```bash
+make release-version
+make release-notes VERSION=0.1.0
+make release-artifacts
+make release-validate RELEASE_DIR=dist/release
+make release-checksums RELEASE_DIR=dist/release
+```
+
+## Release pipeline
+
+GitHub Actions now drives CI and release packaging:
+
+- `.github/workflows/ci.yml` runs `fmt`, `clippy`, and workspace tests on Linux and macOS
+- `.github/workflows/release.yml` builds tagged releases, uploads GitHub Release assets, and publishes the Sparkle appcast to GitHub Pages
+- Linux release artifacts are AppImages for `x86_64` and `aarch64`
+- macOS release artifacts are a signed/notarized `dmg` plus a Sparkle update zip for Apple Silicon
+
+The canonical interface for release metadata is `cargo run -p seance-build -- <subcommand>`. The remaining scripts under `scripts/` are platform packaging wrappers for tools such as `cargo-packager`, `codesign`, `notarytool`, `linuxdeploy`, and `appimagetool`.
+
+See [docs/RELEASE.md](docs/RELEASE.md) for the release architecture, manifest model, and diagrams.
+See [docs/RELEASE-RUNBOOK.md](docs/RELEASE-RUNBOOK.md) for the operator runbook, preflight checklist, and recovery steps.
 
 ## Roadmap
 

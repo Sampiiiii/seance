@@ -7,9 +7,9 @@ use gpui::{App, Application, Menu, MenuItem, actions};
 use seance_core::{AppControllerHandle, SessionId, SessionKind, WindowTarget};
 use seance_platform::{PlatformApp, PlatformRuntime};
 use seance_ui::{
-    CloseActiveSession, ConnectHost, HideOtherApps, HideSeance, NewTerminal, OpenCommandPalette,
-    OpenNewWindow, OpenPreferences, QuitSeance, SelectSession, ShowAllApps, SwitchTheme, ThemeId,
-    TogglePerfHud, UiCommand, UiIntegration,
+    CheckForUpdates, CloseActiveSession, ConnectHost, HideOtherApps, HideSeance, NewTerminal,
+    OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance, SelectSession, ShowAllApps,
+    SwitchTheme, ThemeId, TogglePerfHud, UiCommand, UiIntegration,
 };
 
 #[cfg(target_os = "macos")]
@@ -146,6 +146,8 @@ fn build_macos_menus(controller: &AppControllerHandle) -> Vec<Menu> {
             name: "Séance".into(),
             items: vec![
                 MenuItem::action("About Séance", AboutSeance),
+                MenuItem::separator(),
+                MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action("Preferences…", OpenPreferences),
                 MenuItem::separator(),
@@ -351,6 +353,7 @@ mod tests {
         fs::create_dir_all(&app_root)?;
         let paths = AppPaths {
             app_root: app_root.clone(),
+            config_path: app_root.join("config.toml"),
             vault_db_path: app_root.join("vault.sqlite"),
             ipc_socket_path: app_root.join("resident.sock"),
             instance_lock_path: app_root.join("resident.lock"),

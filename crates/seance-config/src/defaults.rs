@@ -14,6 +14,7 @@ pub const SUPPORTED_THEME_KEYS: &[&str] = &[
 
 pub const SUPPORTED_KEYBINDING_ACTIONS: &[&str] = &[
     "seance_ui_app::NewTerminal",
+    "seance_ui_app::CheckForUpdates",
     "seance_ui_app::OpenCommandPalette",
     "seance_ui_app::OpenPreferences",
     "seance_ui_app::CloseActiveSession",

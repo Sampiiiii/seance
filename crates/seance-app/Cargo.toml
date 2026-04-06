@@ -1,7 +1,9 @@
 [package]
 name = "seance-app"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow = "1.0"
@@ -12,3 +14,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 seance-platform-macos = { path = "../seance-platform-macos" }
+
+[package.metadata.packager]
+product_name = "Seance"
+identifier = "com.seance.app"
+before-packaging-command = "cargo build --release -p seance-app"
+out_dir = "../../dist/packager"
+formats = ["app", "dmg"]

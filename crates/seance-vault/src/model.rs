@@ -23,14 +23,18 @@ impl RecordKind {
             Self::Snippet => "snippet",
         }
     }
+}
 
-    pub fn from_str(value: &str) -> Option<Self> {
+impl std::str::FromStr for RecordKind {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "host" => Some(Self::Host),
-            "password_credential" => Some(Self::PasswordCredential),
-            "private_key" => Some(Self::PrivateKey),
-            "snippet" => Some(Self::Snippet),
-            _ => None,
+            "host" => Ok(Self::Host),
+            "password_credential" => Ok(Self::PasswordCredential),
+            "private_key" => Ok(Self::PrivateKey),
+            "snippet" => Ok(Self::Snippet),
+            _ => Err(()),
         }
     }
 }

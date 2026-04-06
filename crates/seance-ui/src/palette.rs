@@ -10,6 +10,7 @@ pub enum PaletteGroup {
     Hosts,
     Vault,
     Appearance,
+    System,
 }
 
 impl PaletteGroup {
@@ -19,6 +20,7 @@ impl PaletteGroup {
             PaletteGroup::Hosts => "HOSTS",
             PaletteGroup::Vault => "VAULT",
             PaletteGroup::Appearance => "APPEARANCE",
+            PaletteGroup::System => "SYSTEM",
         }
     }
 }
@@ -26,6 +28,8 @@ impl PaletteGroup {
 #[derive(Clone)]
 pub enum PaletteAction {
     NewLocalTerminal,
+    CheckForUpdates,
+    InstallAvailableUpdate,
     SwitchSession(u64),
     CloseActiveSession,
     SwitchTheme(ThemeId),
@@ -133,6 +137,7 @@ pub fn build_items(
     query: &str,
     vault_unlocked: bool,
     remote_session_ids: &[u64],
+    update_state: &seance_core::UpdateState,
 ) -> Vec<PaletteItem> {
     let mut items: Vec<PaletteItem> = Vec::new();
 
@@ -365,6 +370,30 @@ pub fn build_items(
         }
     }
 
+    // --- System group ---
+
+    items.push(PaletteItem {
+        glyph: "↑",
+        label: "Check for Updates".into(),
+        hint: "Query the stable release channel".into(),
+        action: PaletteAction::CheckForUpdates,
+        group: PaletteGroup::System,
+        shortcut: None,
+        match_indices: Vec::new(),
+    });
+
+    if matches!(update_state, seance_core::UpdateState::Available(_)) {
+        items.push(PaletteItem {
+            glyph: "⇪",
+            label: "Install Available Update".into(),
+            hint: "Download and install the newest release".into(),
+            action: PaletteAction::InstallAvailableUpdate,
+            group: PaletteGroup::System,
+            shortcut: None,
+            match_indices: Vec::new(),
+        });
+    }
+
     // --- Filtering / fuzzy search ---
 
     if !query.is_empty() {
@@ -476,6 +505,7 @@ mod tests {
             "",
             false,
             &[],
+            &seance_core::UpdateState::Idle,
         );
 
         let switch_item = items

@@ -274,7 +274,7 @@ pub fn load_device_enrollment(
         WHERE device_id = ?1
         ",
         params![device_id],
-        |row| device_enrollment_from_row(row),
+        device_enrollment_from_row,
     )
     .optional()
     .map_err(Into::into)
@@ -414,7 +414,7 @@ pub fn verify_header_integrity(header: &VaultHeader) -> VaultResult<()> {
 
 fn encrypted_record_from_row(row: &Row<'_>) -> rusqlite::Result<EncryptedRecord> {
     let kind_raw: String = row.get(1)?;
-    let kind = RecordKind::from_str(&kind_raw).ok_or_else(|| {
+    let kind = kind_raw.parse::<RecordKind>().map_err(|_| {
         rusqlite::Error::FromSqlConversionFailure(
             1,
             rusqlite::types::Type::Text,

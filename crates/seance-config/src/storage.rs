@@ -69,9 +69,11 @@ fn persist_config(path: &Path, config: &AppConfig) -> Result<(), ConfigError> {
     let mut temp = NamedTempFile::new_in(parent).map_err(|source| ConfigError::Write { source })?;
     temp.write_all(serialized.as_bytes())
         .map_err(|source| ConfigError::Write { source })?;
-    temp.flush().map_err(|source| ConfigError::Write { source })?;
-    temp.persist(path)
-        .map_err(|error| ConfigError::Write { source: error.error })?;
+    temp.flush()
+        .map_err(|source| ConfigError::Write { source })?;
+    temp.persist(path).map_err(|error| ConfigError::Write {
+        source: error.error,
+    })?;
     Ok(())
 }
 

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::defaults::{
-    default_terminal_font_family, default_terminal_font_size_px,
-    default_terminal_line_height_px, default_theme, default_true,
+    default_terminal_font_family, default_terminal_font_size_px, default_terminal_line_height_px,
+    default_theme, default_true,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,17 +62,46 @@ impl Default for TerminalConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PerfHudDefault {
+    #[default]
     Off,
     Compact,
     Expanded,
 }
 
-impl Default for PerfHudDefault {
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateInstallMode {
+    #[default]
+    Prompted,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateReleaseChannel {
+    #[default]
+    Stable,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateConfig {
+    #[serde(default = "default_true")]
+    pub auto_check: bool,
+    #[serde(default)]
+    pub install_mode: UpdateInstallMode,
+    #[serde(default)]
+    pub channel: UpdateReleaseChannel,
+}
+
+impl Default for UpdateConfig {
     fn default() -> Self {
-        Self::Off
+        Self {
+            auto_check: true,
+            install_mode: UpdateInstallMode::Prompted,
+            channel: UpdateReleaseChannel::Stable,
+        }
     }
 }
 
@@ -102,6 +131,8 @@ pub struct AppConfig {
     pub window: WindowConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
+    #[serde(default)]
+    pub updates: UpdateConfig,
     #[serde(default)]
     pub debug: DebugConfig,
     #[serde(default)]

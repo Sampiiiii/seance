@@ -2,7 +2,7 @@ use std::sync::{Arc, mpsc::Receiver};
 
 use anyhow::Result;
 use seance_config::{AppConfig, PerfHudDefault, TerminalConfig, WindowConfig};
-use seance_core::{AppControllerHandle, SessionId, SessionKind};
+use seance_core::{AppControllerHandle, SessionId, SessionKind, UpdateState};
 use seance_ssh::{SftpEntry, SshConnectRequest, SshSessionManager};
 use seance_terminal::TerminalSession;
 use seance_vault::{
@@ -26,6 +26,10 @@ impl UiBackend {
 
     pub fn subscribe_config_changes(&self) -> Receiver<AppConfig> {
         self.controller.subscribe_config_changes()
+    }
+
+    pub fn subscribe_update_changes(&self) -> Receiver<UpdateState> {
+        self.controller.subscribe_update_changes()
     }
 
     pub fn set_theme(&self, theme: String) -> Result<AppConfig> {
@@ -54,6 +58,18 @@ impl UiBackend {
 
     pub fn reset_settings_to_defaults(&self) -> Result<AppConfig> {
         self.controller.reset_config_to_defaults()
+    }
+
+    pub fn check_for_updates(&self) {
+        self.controller.check_for_updates();
+    }
+
+    pub fn install_update(&self) {
+        self.controller.install_update();
+    }
+
+    pub fn dismiss_update(&self) {
+        self.controller.dismiss_update();
     }
 
     pub fn ssh_manager(&self) -> Arc<SshSessionManager> {

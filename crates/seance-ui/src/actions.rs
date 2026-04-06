@@ -8,6 +8,7 @@ actions!(
     seance_ui_app,
     [
         NewTerminal,
+        CheckForUpdates,
         OpenCommandPalette,
         OpenPreferences,
         CloseActiveSession,
