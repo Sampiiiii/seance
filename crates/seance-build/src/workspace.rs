@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use cargo_metadata::MetadataCommand;
 
 pub fn package_version(package_name: &str) -> Result<String> {

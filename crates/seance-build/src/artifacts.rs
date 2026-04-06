@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 const MACOS_APP_ZIP: &str = "seance-macos-aarch64.app.zip";

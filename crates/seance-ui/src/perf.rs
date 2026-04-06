@@ -306,3 +306,277 @@ pub(crate) fn percentile_duration_ms(
     let index = ((millis.len() - 1) as f32 * percentile).round() as usize;
     millis[index.min(millis.len() - 1)]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        collections::VecDeque,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn perf_mode_cycles_through_all_states() {
+        assert_eq!(UiPerfMode::Off.next(), UiPerfMode::Compact);
+        assert_eq!(UiPerfMode::Compact.next(), UiPerfMode::Expanded);
+        assert_eq!(UiPerfMode::Expanded.next(), UiPerfMode::Off);
+    }
+
+    #[test]
+    fn frame_stats_compute_average_and_percentile() {
+        let now = Instant::now();
+        let render_samples = VecDeque::from(vec![
+            (now + Duration::from_millis(4), Duration::from_millis(4)),
+            (now + Duration::from_millis(9), Duration::from_millis(5)),
+            (now + Duration::from_millis(16), Duration::from_millis(7)),
+        ]);
+        let cadence_samples = VecDeque::from(vec![
+            (now + Duration::from_millis(10), Duration::from_millis(10)),
+            (now + Duration::from_millis(43), Duration::from_millis(33)),
+            (now + Duration::from_millis(93), Duration::from_millis(50)),
+        ]);
+        let timestamps = VecDeque::from(vec![
+            now,
+            now + Duration::from_millis(100),
+            now + Duration::from_millis(200),
+        ]);
+
+        let stats = build_frame_stats(
+            9,
+            &render_samples,
+            &cadence_samples,
+            &timestamps,
+            RedrawReason::TerminalUpdate,
+        );
+
+        assert_eq!(stats.frame_count_total, 9);
+        assert!((stats.fps_1s - 3.0).abs() < 0.01);
+        assert_eq!(stats.frame_time_last_ms, 7.0);
+        assert!((stats.frame_time_avg_ms - 5.3333335).abs() < 0.01);
+        assert_eq!(stats.frame_time_p95_ms, 7.0);
+        assert_eq!(stats.present_interval_last_ms, 50.0);
+        assert!((stats.present_interval_avg_ms - 31.0).abs() < 0.01);
+        assert_eq!(stats.present_interval_p95_ms, 50.0);
+        assert_eq!(stats.redraw_reason, RedrawReason::TerminalUpdate);
+    }
+
+    #[test]
+    fn normalized_fps_counts_frames_in_window() {
+        let now = Instant::now();
+        let timestamps = VecDeque::from(vec![
+            now,
+            now + Duration::from_millis(250),
+            now + Duration::from_millis(500),
+        ]);
+
+        assert!((normalized_fps_1s(&timestamps) - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn refresh_and_present_counts_are_tracked_separately() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.mark_terminal_refresh_request(now, RedrawReason::TerminalUpdate, None);
+        state.mark_ui_refresh_request(now + Duration::from_millis(10), RedrawReason::UiRefresh);
+
+        assert_eq!(state.ui_refreshes_last_second(), 2);
+        assert_eq!(state.terminal_refreshes_last_second(), 1);
+        assert_eq!(state.frames_presented_last_second(), 0);
+
+        state.finish_render(
+            now + Duration::from_millis(16),
+            now + Duration::from_millis(20),
+        );
+
+        assert_eq!(state.ui_refreshes_last_second(), 2);
+        assert_eq!(state.terminal_refreshes_last_second(), 1);
+        assert_eq!(state.frames_presented_last_second(), 1);
+    }
+
+    #[test]
+    fn redraw_reason_is_consumed_on_present() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.mark_ui_refresh_request(now, RedrawReason::Palette);
+        assert_eq!(state.pending_redraw_reason, RedrawReason::Palette);
+
+        state.finish_render(
+            now + Duration::from_millis(8),
+            now + Duration::from_millis(16),
+        );
+
+        assert_eq!(state.frame_stats.redraw_reason, RedrawReason::Palette);
+        assert_eq!(state.pending_redraw_reason, RedrawReason::Unknown);
+    }
+
+    #[test]
+    fn present_intervals_are_trimmed_to_perf_window() {
+        let now = Instant::now();
+        let mut samples = VecDeque::from(vec![
+            (now - Duration::from_secs(2), Duration::from_millis(80_000)),
+            (now - Duration::from_millis(800), Duration::from_millis(16)),
+            (now - Duration::from_millis(100), Duration::from_millis(20)),
+        ]);
+
+        trim_timed_durations(&mut samples, now, PERF_WINDOW);
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples.front().unwrap().1, Duration::from_millis(16));
+        assert_eq!(samples.back().unwrap().1, Duration::from_millis(20));
+    }
+
+    #[test]
+    fn terminal_refresh_is_counted_as_ui_refresh() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.mark_terminal_refresh_request(now, RedrawReason::TerminalUpdate, None);
+
+        assert_eq!(state.ui_refreshes_last_second(), 1);
+        assert_eq!(state.terminal_refreshes_last_second(), 1);
+    }
+
+    #[test]
+    fn perf_mode_enable_resets_sampling_window() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Off);
+        let now = Instant::now();
+
+        state.mark_ui_refresh_request(now, RedrawReason::UiRefresh);
+        state.finish_render(
+            now + Duration::from_millis(8),
+            now + Duration::from_millis(16),
+        );
+        state.mode = UiPerfMode::Compact;
+        state.reset_sampling_window();
+
+        assert!(state.present_timestamps.is_empty());
+        assert!(state.present_intervals.is_empty());
+        assert!(state.render_cost_samples.is_empty());
+        assert!(state.ui_refresh_timestamps.is_empty());
+        assert!(state.terminal_refresh_timestamps.is_empty());
+        assert!(state.last_present_timestamp.is_none());
+        assert_eq!(state.frame_stats.frame_count_total, 0);
+    }
+
+    #[test]
+    fn frame_stats_ignore_stale_intervals_after_idle_gap() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.last_present_timestamp = Some(now - Duration::from_secs(3));
+        state
+            .present_intervals
+            .push_back((now - Duration::from_secs(3), Duration::from_secs(86)));
+        state
+            .render_cost_samples
+            .push_back((now - Duration::from_secs(3), Duration::from_secs(40)));
+        state
+            .present_timestamps
+            .push_back(now - Duration::from_secs(3));
+
+        state.finish_render(
+            now - Duration::from_millis(204),
+            now - Duration::from_millis(200),
+        );
+        state.finish_render(
+            now - Duration::from_millis(55),
+            now - Duration::from_millis(50),
+        );
+
+        assert_eq!(state.frame_stats.frame_time_last_ms, 5.0);
+        assert!(state.frame_stats.frame_time_avg_ms < 10.0);
+        assert!(state.frame_stats.frame_time_p95_ms < 10.0);
+        assert_eq!(state.frame_stats.present_interval_last_ms, 150.0);
+        assert!(state.frame_stats.present_interval_avg_ms < 2_900.0);
+        assert!(state.frame_stats.present_interval_p95_ms < 3_000.0);
+    }
+
+    #[test]
+    fn render_cost_and_cadence_are_computed_separately() {
+        let now = Instant::now();
+        let render_samples = VecDeque::from(vec![
+            (now + Duration::from_millis(4), Duration::from_millis(4)),
+            (now + Duration::from_millis(9), Duration::from_millis(5)),
+            (now + Duration::from_millis(16), Duration::from_millis(7)),
+        ]);
+        let cadence_samples = VecDeque::from(vec![
+            (now + Duration::from_millis(16), Duration::from_millis(16)),
+            (now + Duration::from_millis(49), Duration::from_millis(33)),
+            (now + Duration::from_millis(99), Duration::from_millis(50)),
+        ]);
+        let timestamps = VecDeque::from(vec![
+            now,
+            now + Duration::from_millis(250),
+            now + Duration::from_millis(500),
+        ]);
+
+        let stats = build_frame_stats(
+            3,
+            &render_samples,
+            &cadence_samples,
+            &timestamps,
+            RedrawReason::Input,
+        );
+
+        assert_eq!(stats.frame_time_last_ms, 7.0);
+        assert!((stats.frame_time_avg_ms - 5.3333335).abs() < 0.01);
+        assert_eq!(stats.frame_time_p95_ms, 7.0);
+        assert_eq!(stats.present_interval_last_ms, 50.0);
+        assert!((stats.present_interval_avg_ms - 33.0).abs() < 0.01);
+        assert_eq!(stats.present_interval_p95_ms, 50.0);
+    }
+
+    #[test]
+    fn stale_render_cost_samples_are_trimmed_to_perf_window() {
+        let now = Instant::now();
+        let mut samples = VecDeque::from(vec![
+            (now - Duration::from_secs(2), Duration::from_secs(2)),
+            (now - Duration::from_millis(300), Duration::from_millis(4)),
+            (now - Duration::from_millis(100), Duration::from_millis(5)),
+        ]);
+
+        trim_timed_durations(&mut samples, now, PERF_WINDOW);
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(average_duration_ms(&samples), 4.5);
+        assert!(percentile_duration_ms(&samples, 0.95) < 6.0);
+    }
+
+    #[test]
+    fn stale_cadence_samples_are_trimmed_to_perf_window() {
+        let now = Instant::now();
+        let mut samples = VecDeque::from(vec![
+            (now - Duration::from_secs(2), Duration::from_secs(30)),
+            (now - Duration::from_millis(200), Duration::from_millis(16)),
+            (now - Duration::from_millis(50), Duration::from_millis(20)),
+        ]);
+
+        trim_timed_durations(&mut samples, now, PERF_WINDOW);
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples.front().unwrap().1, Duration::from_millis(16));
+        assert_eq!(samples.back().unwrap().1, Duration::from_millis(20));
+    }
+
+    #[test]
+    fn focus_like_notify_pattern_does_not_inflate_frame_cost() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.finish_render(now, now + Duration::from_millis(4));
+        state.finish_render(
+            now + Duration::from_millis(80),
+            now + Duration::from_millis(85),
+        );
+        state.finish_render(
+            now + Duration::from_millis(200),
+            now + Duration::from_millis(206),
+        );
+
+        assert!(state.frame_stats.frame_time_last_ms <= 6.0);
+        assert!(state.frame_stats.frame_time_avg_ms <= 5.1);
+        assert!(state.frame_stats.present_interval_last_ms >= 100.0);
+    }
+}

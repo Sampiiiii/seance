@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 pub fn release_notes(changelog_path: &Path, version: &str) -> Result<String> {
     let content = fs::read_to_string(changelog_path)
