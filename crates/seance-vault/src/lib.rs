@@ -5,6 +5,7 @@ mod model;
 mod storage;
 
 use std::{
+    cmp::Ordering,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -28,13 +29,14 @@ use device_store::default_device_secret_store;
 pub use device_store::{DeviceSecretError, DeviceSecretStore};
 use kdf::KdfParams;
 pub use model::{
-    CredentialSummary, DeviceEnrollment, GenerateKeyAlgorithm, GenerateKeyRequest, HostAuthRef,
-    HostSummary, ImportKeyRequest, KeySummary, PrivateKeyAlgorithm, PrivateKeySource, RecordKind,
-    RecoveryBundle, UnlockMethod, VaultHeader, VaultHostProfile, VaultPasswordCredential,
-    VaultPrivateKey, VaultStatus,
+    ApplyDeltaReport, CredentialSummary, DeviceEnrollment, GenerateKeyAlgorithm,
+    GenerateKeyRequest, HostAuthRef, HostSummary, ImportKeyRequest, KeySummary,
+    PrivateKeyAlgorithm, PrivateKeySource, RecordKind, RecoveryBundle, SyncCursor, UnlockMethod,
+    VaultDelta, VaultDeltaRecord, VaultHeader, VaultHostProfile, VaultPasswordCredential,
+    VaultPrivateKey, VaultSnapshot, VaultStatus,
 };
 
-use model::{EncryptedRecord, RECORD_SCHEMA_VERSION, VAULT_SCHEMA_VERSION};
+use model::{EncryptedRecord, RECORD_SCHEMA_VERSION, RecordSyncState, VAULT_SCHEMA_VERSION};
 pub use secrecy::SecretString;
 
 const DEVICE_STATE_KEY: &str = "local_device_id";
@@ -134,6 +136,27 @@ pub enum VaultError {
     MissingPrivateKeyReference(String),
     #[error("unsupported private key algorithm")]
     UnsupportedPrivateKeyAlgorithm,
+    #[error("credential {credential_id} is still referenced by host {host_id}")]
+    CredentialInUse {
+        credential_id: String,
+        host_id: String,
+    },
+    #[error("private key {key_id} is still referenced by host {host_id}")]
+    PrivateKeyInUse { key_id: String, host_id: String },
+    #[error("a full snapshot must be applied before importing deltas")]
+    SyncBootstrapRequired,
+    #[error("cannot apply a full snapshot to an initialized vault")]
+    SnapshotRequiresUninitializedVault,
+    #[error("delta belongs to vault {actual_vault_id}, expected {expected_vault_id}")]
+    VaultIdMismatch {
+        expected_vault_id: String,
+        actual_vault_id: String,
+    },
+    #[error("delta starts at clock {delta_from_clock}, but local vault is only at {local_clock}")]
+    DeltaOutOfOrder {
+        local_clock: u64,
+        delta_from_clock: u64,
+    },
 }
 
 pub struct VaultStore {
@@ -372,6 +395,133 @@ impl VaultStore {
         self.last_unlock_method = None;
     }
 
+    pub fn current_cursor(&self) -> SyncCursor {
+        SyncCursor {
+            logical_clock: self
+                .header
+                .as_ref()
+                .map(|header| header.last_logical_clock)
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn export_snapshot(&self) -> VaultResult<VaultSnapshot> {
+        let header = self.header.clone().ok_or(VaultError::VaultNotInitialized)?;
+        let recovery_bundle = storage::load_recovery_bundle(&self.conn)?
+            .ok_or_else(|| VaultError::CorruptVault("missing recovery bundle".into()))?;
+        let device_enrollments = storage::list_device_enrollments(&self.conn)?;
+        let records = storage::list_all_records(&self.conn)?
+            .into_iter()
+            .map(VaultDeltaRecord::from)
+            .collect();
+
+        Ok(VaultSnapshot {
+            header,
+            recovery_bundle,
+            device_enrollments,
+            records,
+        })
+    }
+
+    pub fn export_delta(&self, since: SyncCursor) -> VaultResult<VaultDelta> {
+        let header = self.header.clone().ok_or(VaultError::VaultNotInitialized)?;
+        let from_clock = since.logical_clock.min(header.last_logical_clock);
+        let records = storage::list_records_after_clock(&self.conn, from_clock)?
+            .into_iter()
+            .map(VaultDeltaRecord::from)
+            .collect();
+
+        Ok(VaultDelta {
+            vault_id: header.vault_id,
+            from_clock,
+            to_clock: header.last_logical_clock,
+            records,
+        })
+    }
+
+    pub fn apply_snapshot(&mut self, mut snapshot: VaultSnapshot) -> VaultResult<()> {
+        if self.header.is_some() || storage::count_records(&self.conn)? > 0 {
+            return Err(VaultError::SnapshotRequiresUninitializedVault);
+        }
+
+        storage::verify_header_integrity(&snapshot.header)?;
+        let max_record_clock = snapshot
+            .records
+            .iter()
+            .map(|record| record.logical_clock)
+            .max()
+            .unwrap_or_default();
+        if snapshot.header.last_logical_clock < max_record_clock {
+            snapshot.header.last_logical_clock = max_record_clock;
+        }
+
+        storage::insert_header(&self.conn, &snapshot.header)?;
+        storage::insert_recovery_bundle(&self.conn, &snapshot.recovery_bundle)?;
+        storage::clear_device_enrollments(&self.conn)?;
+        for enrollment in &snapshot.device_enrollments {
+            storage::upsert_device_enrollment(&self.conn, enrollment)?;
+        }
+        for record in snapshot.records {
+            storage::upsert_record(&self.conn, &delta_record_to_synced_record(record))?;
+        }
+
+        self.header = Some(snapshot.header);
+        Ok(())
+    }
+
+    pub fn apply_delta(&mut self, delta: VaultDelta) -> VaultResult<ApplyDeltaReport> {
+        let header = self
+            .header
+            .clone()
+            .ok_or(VaultError::SyncBootstrapRequired)?;
+        if delta.vault_id != header.vault_id {
+            return Err(VaultError::VaultIdMismatch {
+                expected_vault_id: header.vault_id,
+                actual_vault_id: delta.vault_id,
+            });
+        }
+
+        let local_cursor = self.current_cursor().logical_clock;
+        if local_cursor < delta.from_clock {
+            return Err(VaultError::DeltaOutOfOrder {
+                local_clock: local_cursor,
+                delta_from_clock: delta.from_clock,
+            });
+        }
+
+        let mut applied_records = 0usize;
+        let mut skipped_records = 0usize;
+        let mut new_cursor = local_cursor.max(delta.to_clock);
+
+        for delta_record in delta.records {
+            new_cursor = new_cursor.max(delta_record.logical_clock);
+            let incoming = delta_record_to_synced_record(delta_record);
+            match storage::load_record(&self.conn, &incoming.record_id, incoming.kind)? {
+                Some(existing) if compare_record_precedence(&incoming, &existing).is_le() => {
+                    skipped_records += 1;
+                }
+                _ => {
+                    storage::upsert_record(&self.conn, &incoming)?;
+                    applied_records += 1;
+                }
+            }
+        }
+
+        storage::set_last_logical_clock(&self.conn, new_cursor)?;
+        if let Some(header) = self.header.as_mut() {
+            header.last_logical_clock = new_cursor;
+            header.updated_at = now_ts();
+        }
+
+        Ok(ApplyDeltaReport {
+            applied_records,
+            skipped_records,
+            new_cursor: SyncCursor {
+                logical_clock: new_cursor,
+            },
+        })
+    }
+
     pub fn store_host_profile(&mut self, mut host: VaultHostProfile) -> VaultResult<HostSummary> {
         self.validate_host(&host)?;
         self.validate_host_auth_refs(&host)?;
@@ -435,6 +585,7 @@ impl VaultStore {
     }
 
     pub fn delete_password_credential(&mut self, id: &str) -> VaultResult<bool> {
+        self.ensure_credential_not_referenced(id)?;
         self.delete_record(id, RecordKind::PasswordCredential)
     }
 
@@ -464,6 +615,7 @@ impl VaultStore {
     }
 
     pub fn delete_private_key(&mut self, id: &str) -> VaultResult<bool> {
+        self.ensure_private_key_not_referenced(id)?;
         self.delete_record(id, RecordKind::PrivateKey)
     }
 
@@ -544,9 +696,15 @@ impl VaultStore {
         if value.record_id().is_empty() {
             value.set_record_id(Uuid::new_v4().to_string());
         }
+        let previous_sync_clock = storage::load_record(&self.conn, value.record_id(), kind)?
+            .and_then(|record| record.last_synced_clock);
 
         let logical_clock = storage::bump_logical_clock(&self.conn)?;
         let modified_at = now_ts();
+        if let Some(header) = self.header.as_mut() {
+            header.last_logical_clock = logical_clock;
+            header.updated_at = modified_at;
+        }
         let record_key = SecretKey::generate();
         let payload = Zeroizing::new(serde_json::to_vec(value)?);
         let aad = record_aad(
@@ -573,6 +731,8 @@ impl VaultStore {
             wrapped_record_key: wrapped_record_key.ciphertext,
             payload_nonce: payload_envelope.nonce,
             payload_ciphertext: payload_envelope.ciphertext,
+            last_synced_clock: previous_sync_clock,
+            sync_state: RecordSyncState::Pending,
         };
         storage::upsert_record(&self.conn, &record)?;
         Ok(())
@@ -617,6 +777,11 @@ impl VaultStore {
         record.logical_clock = storage::bump_logical_clock(&self.conn)?;
         record.modified_at = now_ts();
         record.deleted_at = Some(record.modified_at);
+        record.sync_state = RecordSyncState::Pending;
+        if let Some(header) = self.header.as_mut() {
+            header.last_logical_clock = record.logical_clock;
+            header.updated_at = record.modified_at;
+        }
         storage::upsert_record(&self.conn, &record)?;
         Ok(true)
     }
@@ -676,6 +841,51 @@ impl VaultStore {
             }
         }
         Ok(())
+    }
+
+    fn ensure_credential_not_referenced(&self, credential_id: &str) -> VaultResult<()> {
+        for host in self.active_hosts()? {
+            if host.auth_order.iter().any(|auth| {
+                matches!(
+                    auth,
+                    HostAuthRef::Password { credential_id: id } if id == credential_id
+                ) || matches!(
+                    auth,
+                    HostAuthRef::PrivateKey {
+                        passphrase_credential_id: Some(id),
+                        ..
+                    } if id == credential_id
+                )
+            }) {
+                return Err(VaultError::CredentialInUse {
+                    credential_id: credential_id.to_string(),
+                    host_id: host.id,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_private_key_not_referenced(&self, key_id: &str) -> VaultResult<()> {
+        for host in self.active_hosts()? {
+            if host.auth_order.iter().any(
+                |auth| matches!(auth, HostAuthRef::PrivateKey { key_id: id, .. } if id == key_id),
+            ) {
+                return Err(VaultError::PrivateKeyInUse {
+                    key_id: key_id.to_string(),
+                    host_id: host.id,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn active_hosts(&self) -> VaultResult<Vec<VaultHostProfile>> {
+        let records = storage::list_records_by_kind(&self.conn, RecordKind::Host)?;
+        records
+            .into_iter()
+            .map(|record| self.decrypt_record(&record))
+            .collect()
     }
 
     fn validate_password_credential(
@@ -803,6 +1013,35 @@ impl RecordIdentity for VaultPrivateKey {
     fn set_record_id(&mut self, id: String) {
         self.id = id;
     }
+}
+
+fn delta_record_to_synced_record(record: VaultDeltaRecord) -> EncryptedRecord {
+    EncryptedRecord {
+        record_id: record.record_id,
+        kind: record.kind,
+        version: record.version,
+        logical_clock: record.logical_clock,
+        modified_at: record.modified_at,
+        deleted_at: record.deleted_at,
+        key_nonce: record.key_nonce,
+        wrapped_record_key: record.wrapped_record_key,
+        payload_nonce: record.payload_nonce,
+        payload_ciphertext: record.payload_ciphertext,
+        last_synced_clock: Some(record.logical_clock),
+        sync_state: RecordSyncState::Synced,
+    }
+}
+
+fn compare_record_precedence(left: &EncryptedRecord, right: &EncryptedRecord) -> Ordering {
+    left.logical_clock
+        .cmp(&right.logical_clock)
+        .then_with(|| left.modified_at.cmp(&right.modified_at))
+        .then_with(|| left.record_id.cmp(&right.record_id))
+        .then_with(|| left.deleted_at.cmp(&right.deleted_at))
+        .then_with(|| left.key_nonce.cmp(&right.key_nonce))
+        .then_with(|| left.wrapped_record_key.cmp(&right.wrapped_record_key))
+        .then_with(|| left.payload_nonce.cmp(&right.payload_nonce))
+        .then_with(|| left.payload_ciphertext.cmp(&right.payload_ciphertext))
 }
 
 fn private_key_algorithm(public_key: &PublicKey) -> VaultResult<PrivateKeyAlgorithm> {
@@ -950,6 +1189,53 @@ mod tests {
 
     fn secret(value: &str) -> SecretString {
         SecretString::from(value.to_owned())
+    }
+
+    fn make_secondary_vault(dir: &tempfile::TempDir) -> (VaultStore, Arc<MemoryDeviceSecretStore>) {
+        let path = dir.path().join("secondary.sqlite");
+        let store = Arc::new(MemoryDeviceSecretStore::default());
+        let vault = VaultStore::open_with_device_store(path, store.clone()).unwrap();
+        (vault, store)
+    }
+
+    fn seed_password_and_key(
+        vault: &mut VaultStore,
+    ) -> (CredentialSummary, KeySummary, HostSummary) {
+        let credential = vault
+            .store_password_credential(VaultPasswordCredential {
+                id: String::new(),
+                label: "prod password".into(),
+                username_hint: Some("root".into()),
+                secret: "hunter2".into(),
+            })
+            .unwrap();
+        let key = vault
+            .generate_private_key(GenerateKeyRequest {
+                label: "deploy".into(),
+                algorithm: GenerateKeyAlgorithm::Ed25519,
+            })
+            .unwrap();
+        let host = vault
+            .store_host_profile(VaultHostProfile {
+                id: String::new(),
+                label: "Production".into(),
+                hostname: "prod.example.com".into(),
+                port: 22,
+                username: "root".into(),
+                notes: Some("main cluster".into()),
+                auth_order: vec![
+                    HostAuthRef::Password {
+                        credential_id: credential.id.clone(),
+                    },
+                    HostAuthRef::PrivateKey {
+                        key_id: key.id.clone(),
+                        passphrase_credential_id: Some(credential.id.clone()),
+                    },
+                ],
+            })
+            .unwrap();
+
+        (credential, key, host)
     }
 
     #[test]
@@ -1284,5 +1570,235 @@ mod tests {
             vault.status().device_unlock_message.as_deref(),
             Some(DEVICE_UNLOCK_BUILD_MESSAGE)
         );
+    }
+
+    #[test]
+    fn snapshot_import_bootstraps_second_device_and_preserves_records() {
+        let (dir, mut source) = make_vault();
+        source
+            .create_vault(&secret("snapshot passphrase"), "source")
+            .unwrap();
+        let (credential, key, host) = seed_password_and_key(&mut source);
+
+        let snapshot = source.export_snapshot().unwrap();
+        let (mut target, _) = make_secondary_vault(&dir);
+        target.apply_snapshot(snapshot.clone()).unwrap();
+
+        assert_eq!(target.export_snapshot().unwrap(), snapshot);
+
+        target
+            .unlock_with_passphrase(&secret("snapshot passphrase"), "target")
+            .unwrap();
+
+        let restored_host = target.load_host_profile(&host.id).unwrap().unwrap();
+        assert_eq!(restored_host.hostname, "prod.example.com");
+        assert!(
+            target
+                .load_password_credential(&credential.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(target.load_private_key(&key.id).unwrap().is_some());
+        assert!(target.status().device_unlock_available);
+    }
+
+    #[test]
+    fn delta_import_converges_host_updates_and_tombstones() {
+        let (dir, mut source) = make_vault();
+        source
+            .create_vault(&secret("delta passphrase"), "source")
+            .unwrap();
+        let (_, _, host) = seed_password_and_key(&mut source);
+
+        let snapshot = source.export_snapshot().unwrap();
+        let (mut target, _) = make_secondary_vault(&dir);
+        target.apply_snapshot(snapshot).unwrap();
+        source
+            .store_host_profile(VaultHostProfile {
+                id: host.id.clone(),
+                label: "Production".into(),
+                hostname: "prod-2.example.com".into(),
+                port: 22,
+                username: "root".into(),
+                notes: Some("rotated".into()),
+                auth_order: source
+                    .load_host_profile(&host.id)
+                    .unwrap()
+                    .unwrap()
+                    .auth_order,
+            })
+            .unwrap();
+
+        let delta = source
+            .export_delta(SyncCursor { logical_clock: 3 })
+            .unwrap();
+        let report = target.apply_delta(delta).unwrap();
+        assert_eq!(report.applied_records, 1);
+
+        target
+            .unlock_with_passphrase(&secret("delta passphrase"), "target")
+            .unwrap();
+        let restored_host = target.load_host_profile(&host.id).unwrap().unwrap();
+        assert_eq!(restored_host.hostname, "prod-2.example.com");
+
+        source.delete_host_profile(&host.id).unwrap();
+        target.lock();
+        let tombstone_delta = source
+            .export_delta(SyncCursor {
+                logical_clock: report.new_cursor.logical_clock,
+            })
+            .unwrap();
+        target.apply_delta(tombstone_delta).unwrap();
+        target
+            .unlock_with_passphrase(&secret("delta passphrase"), "target")
+            .unwrap();
+        assert!(target.load_host_profile(&host.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_equal_clock_edits_converge_after_delta_exchange() {
+        let (dir, mut source) = make_vault();
+        source
+            .create_vault(&secret("conflict passphrase"), "source")
+            .unwrap();
+        let (_, _, host) = seed_password_and_key(&mut source);
+        let base_cursor = source.current_cursor();
+
+        let snapshot = source.export_snapshot().unwrap();
+        let (mut target, _) = make_secondary_vault(&dir);
+        target.apply_snapshot(snapshot).unwrap();
+        source
+            .unlock_with_passphrase(&secret("conflict passphrase"), "source")
+            .unwrap();
+        target
+            .unlock_with_passphrase(&secret("conflict passphrase"), "target")
+            .unwrap();
+
+        let source_auth = source
+            .load_host_profile(&host.id)
+            .unwrap()
+            .unwrap()
+            .auth_order;
+        let target_auth = target
+            .load_host_profile(&host.id)
+            .unwrap()
+            .unwrap()
+            .auth_order;
+        source
+            .store_host_profile(VaultHostProfile {
+                id: host.id.clone(),
+                label: "Production".into(),
+                hostname: "source.example.com".into(),
+                port: 22,
+                username: "root".into(),
+                notes: Some("source edit".into()),
+                auth_order: source_auth,
+            })
+            .unwrap();
+        target
+            .store_host_profile(VaultHostProfile {
+                id: host.id.clone(),
+                label: "Production".into(),
+                hostname: "target.example.com".into(),
+                port: 22,
+                username: "root".into(),
+                notes: Some("target edit".into()),
+                auth_order: target_auth,
+            })
+            .unwrap();
+
+        assert_eq!(
+            source.current_cursor().logical_clock,
+            target.current_cursor().logical_clock
+        );
+        source
+            .apply_delta(target.export_delta(base_cursor.clone()).unwrap())
+            .unwrap();
+        target
+            .apply_delta(source.export_delta(base_cursor).unwrap())
+            .unwrap();
+
+        let source_host = source.load_host_profile(&host.id).unwrap().unwrap();
+        let target_host = target.load_host_profile(&host.id).unwrap().unwrap();
+        assert_eq!(source_host, target_host);
+    }
+
+    #[test]
+    fn deleting_referenced_credentials_and_keys_is_rejected() {
+        let (_dir, mut vault) = make_vault();
+        vault
+            .create_vault(&secret("refs passphrase"), "source")
+            .unwrap();
+        let (credential, key, _) = seed_password_and_key(&mut vault);
+
+        let credential_err = vault
+            .delete_password_credential(&credential.id)
+            .unwrap_err();
+        assert!(matches!(
+            credential_err,
+            VaultError::CredentialInUse { credential_id, .. } if credential_id == credential.id
+        ));
+
+        let key_err = vault.delete_private_key(&key.id).unwrap_err();
+        assert!(matches!(
+            key_err,
+            VaultError::PrivateKeyInUse { key_id, .. } if key_id == key.id
+        ));
+    }
+
+    #[test]
+    fn out_of_order_delta_requires_snapshot_or_prior_deltas() {
+        let (dir, mut source) = make_vault();
+        source
+            .create_vault(&secret("ordering passphrase"), "source")
+            .unwrap();
+        let (_, _, host) = seed_password_and_key(&mut source);
+
+        let snapshot = source.export_snapshot().unwrap();
+        let (mut target, _) = make_secondary_vault(&dir);
+        target.apply_snapshot(snapshot).unwrap();
+
+        let auth = source
+            .load_host_profile(&host.id)
+            .unwrap()
+            .unwrap()
+            .auth_order;
+        source
+            .store_host_profile(VaultHostProfile {
+                id: host.id.clone(),
+                label: "Production".into(),
+                hostname: "step-one.example.com".into(),
+                port: 22,
+                username: "root".into(),
+                notes: Some("step one".into()),
+                auth_order: auth.clone(),
+            })
+            .unwrap();
+        source
+            .store_host_profile(VaultHostProfile {
+                id: host.id.clone(),
+                label: "Production".into(),
+                hostname: "step-two.example.com".into(),
+                port: 22,
+                username: "root".into(),
+                notes: Some("step two".into()),
+                auth_order: auth,
+            })
+            .unwrap();
+
+        let err = target
+            .apply_delta(
+                source
+                    .export_delta(SyncCursor { logical_clock: 4 })
+                    .unwrap(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            VaultError::DeltaOutOfOrder {
+                local_clock: 3,
+                delta_from_clock: 4
+            }
+        ));
     }
 }

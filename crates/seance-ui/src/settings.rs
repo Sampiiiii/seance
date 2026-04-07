@@ -6,7 +6,7 @@ use seance_core::UpdateState;
 
 use crate::{
     SeanceWorkspace,
-    forms::SettingsSection,
+    forms::{SettingsSection, WorkspaceSurface},
     theme::ThemeId,
     ui_components::{
         perf_mode_label, settings_action_chip, settings_choice_chip, settings_info_card,
@@ -15,22 +15,8 @@ use crate::{
 };
 
 impl SeanceWorkspace {
-    pub(crate) fn is_settings_panel_open(&self) -> bool {
-        self.settings_panel.open
-    }
-
     pub(crate) fn open_settings_panel(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
-        if matches!(section, SettingsSection::Vault) && !self.vault_unlocked() {
-            self.unlock_form.reset_for_unlock();
-            self.unlock_form.message =
-                Some("Unlock the vault to manage credentials and keys.".into());
-            cx.notify();
-            return;
-        }
-        if matches!(section, SettingsSection::Vault) {
-            self.refresh_vault_cache();
-        }
-        self.settings_panel.open = true;
+        self.surface = WorkspaceSurface::Settings;
         self.settings_panel.section = section;
         self.settings_panel.message = None;
         self.palette_open = false;
@@ -38,7 +24,7 @@ impl SeanceWorkspace {
     }
 
     pub(crate) fn close_settings_panel(&mut self, cx: &mut Context<Self>) {
-        self.settings_panel.open = false;
+        self.surface = WorkspaceSurface::Terminal;
         self.settings_panel.message = None;
         cx.notify();
     }
@@ -751,43 +737,8 @@ impl SeanceWorkspace {
                     .child(choices),
                 )
             }
-            SettingsSection::Vault => {
-                let vault_status = self.backend.vault_status();
-                let content = if let Some(message) = vault_status.device_unlock_message {
-                    content.child(
-                        div()
-                            .p_4()
-                            .rounded_lg()
-                            .bg(t.glass_tint)
-                            .border_1()
-                            .border_color(t.warning)
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(t.warning)
-                                    .child("Touch ID Warning"),
-                            )
-                            .child(div().text_sm().text_color(t.text_secondary).child(message)),
-                    )
-                } else {
-                    content
-                };
-
-                content
-                    .child(self.render_vault_credentials_card(cx))
-                    .child(self.render_vault_keys_card(cx))
-            }
         };
 
-        div()
-            .flex_1()
-            .h_full()
-            .flex()
-            .child(nav)
-            .child(content)
+        div().flex_1().h_full().flex().child(nav).child(content)
     }
 }

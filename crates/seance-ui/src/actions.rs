@@ -61,6 +61,7 @@ impl Action for SwitchTheme {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectHost {
+    pub vault_id: String,
     pub host_id: String,
 }
 
@@ -88,11 +89,16 @@ impl Action for ConnectHost {
     where
         Self: Sized,
     {
+        let vault_id = value
+            .get("vault_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing vault_id"))?;
         let host_id = value
             .get("host_id")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("missing host_id"))?;
         Ok(Box::new(Self {
+            vault_id: vault_id.to_string(),
             host_id: host_id.to_string(),
         }))
     }

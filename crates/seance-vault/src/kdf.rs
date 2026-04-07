@@ -8,7 +8,7 @@ use crate::{VaultError, VaultResult, crypto::SecretKey};
 pub const KDF_SALT_LEN: usize = 16;
 pub const WRAP_KEY_LEN: usize = 32;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KdfParams {
     pub salt: Vec<u8>,
     pub memory_kib: u32,

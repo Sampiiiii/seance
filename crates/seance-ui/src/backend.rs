@@ -2,12 +2,15 @@ use std::sync::{Arc, mpsc::Receiver};
 
 use anyhow::Result;
 use seance_config::{AppConfig, PerfHudDefault, TerminalConfig, WindowConfig};
-use seance_core::{AppControllerHandle, SessionId, SessionKind, UpdateState};
+use seance_core::{
+    AppControllerHandle, ManagedVaultSummary, SessionId, SessionKind, UpdateState,
+    VaultScopedCredentialSummary, VaultScopedHostSummary, VaultScopedKeySummary,
+};
 use seance_ssh::{SftpEntry, SshConnectRequest, SshSessionManager};
 use seance_terminal::TerminalSession;
 use seance_vault::{
-    CredentialSummary, GenerateKeyAlgorithm, GenerateKeyRequest, HostSummary, ImportKeyRequest,
-    KeySummary, SecretString, VaultHostProfile, VaultPasswordCredential, VaultStatus,
+    GenerateKeyAlgorithm, GenerateKeyRequest, ImportKeyRequest, KeySummary, SecretString,
+    VaultHostProfile, VaultPasswordCredential, VaultStatus,
 };
 
 #[derive(Clone)]
@@ -80,21 +83,55 @@ impl UiBackend {
         self.controller.vault_status()
     }
 
+    pub fn list_vaults(&self) -> Vec<ManagedVaultSummary> {
+        self.controller.list_vaults()
+    }
+
     #[allow(dead_code)]
-    pub fn try_unlock_with_device(&self) -> Result<bool> {
-        self.controller.try_unlock_with_device()
+    pub fn try_unlock_with_device(&self, vault_id: &str) -> Result<bool> {
+        self.controller.try_unlock_vault_with_device(vault_id)
     }
 
-    pub fn create_vault(&self, passphrase: &SecretString, device_name: &str) -> Result<()> {
-        self.controller.create_vault(passphrase, device_name)
+    pub fn create_vault(
+        &self,
+        name: String,
+        passphrase: &SecretString,
+        device_name: &str,
+    ) -> Result<ManagedVaultSummary> {
+        self.controller.create_named_vault(name, passphrase, device_name)
     }
 
-    pub fn unlock_vault(&self, passphrase: &SecretString, device_name: &str) -> Result<()> {
-        self.controller.unlock_vault(passphrase, device_name)
+    pub fn rename_vault(&self, vault_id: &str, name: String) -> Result<ManagedVaultSummary> {
+        self.controller.rename_vault(vault_id, name)
     }
 
-    pub fn lock_vault(&self) {
-        self.controller.lock_vault();
+    pub fn open_vault(&self, vault_id: &str) -> Result<()> {
+        self.controller.open_vault(vault_id)
+    }
+
+    pub fn close_vault(&self, vault_id: &str) -> Result<()> {
+        self.controller.close_vault(vault_id)
+    }
+
+    pub fn unlock_vault(
+        &self,
+        vault_id: &str,
+        passphrase: &SecretString,
+        device_name: &str,
+    ) -> Result<()> {
+        self.controller.unlock_named_vault(vault_id, passphrase, device_name)
+    }
+
+    pub fn lock_vault(&self, vault_id: &str) -> Result<()> {
+        self.controller.lock_named_vault(vault_id)
+    }
+
+    pub fn delete_vault_permanently(&self, vault_id: &str) -> Result<()> {
+        self.controller.delete_vault_permanently(vault_id)
+    }
+
+    pub fn set_default_target_vault(&self, vault_id: &str) -> Result<()> {
+        self.controller.set_default_target_vault(vault_id)
     }
 
     pub fn spawn_local_session(&self) -> Result<Arc<dyn TerminalSession>> {
@@ -129,42 +166,47 @@ impl UiBackend {
         self.controller.close_session(id)
     }
 
-    pub fn list_hosts(&self) -> Result<Vec<HostSummary>> {
+    pub fn list_hosts(&self) -> Result<Vec<VaultScopedHostSummary>> {
         self.controller.list_hosts()
     }
 
-    pub fn load_host(&self, id: &str) -> Result<Option<VaultHostProfile>> {
-        self.controller.load_host(id)
+    pub fn load_host(&self, vault_id: &str, id: &str) -> Result<Option<VaultHostProfile>> {
+        self.controller.load_host(vault_id, id)
     }
 
-    pub fn save_host(&self, host: VaultHostProfile) -> Result<HostSummary> {
-        self.controller.save_host(host)
+    pub fn save_host(&self, vault_id: &str, host: VaultHostProfile) -> Result<VaultScopedHostSummary> {
+        self.controller.save_host(vault_id, host)
     }
 
-    pub fn delete_host(&self, id: &str) -> Result<bool> {
-        self.controller.delete_host(id)
+    pub fn delete_host(&self, vault_id: &str, id: &str) -> Result<bool> {
+        self.controller.delete_host(vault_id, id)
     }
 
-    pub fn list_password_credentials(&self) -> Result<Vec<CredentialSummary>> {
+    pub fn list_password_credentials(&self) -> Result<Vec<VaultScopedCredentialSummary>> {
         self.controller.list_password_credentials()
     }
 
-    pub fn load_password_credential(&self, id: &str) -> Result<Option<VaultPasswordCredential>> {
-        self.controller.load_password_credential(id)
+    pub fn load_password_credential(
+        &self,
+        vault_id: &str,
+        id: &str,
+    ) -> Result<Option<VaultPasswordCredential>> {
+        self.controller.load_password_credential(vault_id, id)
     }
 
     pub fn save_password_credential(
         &self,
+        vault_id: &str,
         credential: VaultPasswordCredential,
-    ) -> Result<CredentialSummary> {
-        self.controller.save_password_credential(credential)
+    ) -> Result<VaultScopedCredentialSummary> {
+        self.controller.save_password_credential(vault_id, credential)
     }
 
-    pub fn delete_password_credential(&self, id: &str) -> Result<bool> {
-        self.controller.delete_password_credential(id)
+    pub fn delete_password_credential(&self, vault_id: &str, id: &str) -> Result<bool> {
+        self.controller.delete_password_credential(vault_id, id)
     }
 
-    pub fn list_private_keys(&self) -> Result<Vec<KeySummary>> {
+    pub fn list_private_keys(&self) -> Result<Vec<VaultScopedKeySummary>> {
         self.controller.list_private_keys()
     }
 
@@ -173,30 +215,48 @@ impl UiBackend {
         anyhow::bail!("private key import is not yet wired through the resident controller")
     }
 
-    pub fn delete_private_key(&self, id: &str) -> Result<bool> {
-        self.controller.delete_private_key(id)
+    pub fn delete_private_key(&self, vault_id: &str, id: &str) -> Result<bool> {
+        self.controller.delete_private_key(vault_id, id)
     }
 
-    pub fn generate_private_key(&self, request: GenerateKeyRequest) -> Result<KeySummary> {
-        self.controller.generate_private_key(request)
+    pub fn generate_private_key(
+        &self,
+        vault_id: &str,
+        request: GenerateKeyRequest,
+    ) -> Result<VaultScopedKeySummary> {
+        self.controller.generate_private_key(vault_id, request)
     }
 
-    pub fn generate_ed25519_key(&self, label: String) -> Result<KeySummary> {
-        self.generate_private_key(GenerateKeyRequest {
-            label,
-            algorithm: GenerateKeyAlgorithm::Ed25519,
-        })
+    pub fn generate_ed25519_key(
+        &self,
+        vault_id: &str,
+        label: String,
+    ) -> Result<VaultScopedKeySummary> {
+        self.generate_private_key(
+            vault_id,
+            GenerateKeyRequest {
+                label,
+                algorithm: GenerateKeyAlgorithm::Ed25519,
+            },
+        )
     }
 
-    pub fn generate_rsa_key(&self, label: String) -> Result<KeySummary> {
-        self.generate_private_key(GenerateKeyRequest {
-            label,
-            algorithm: GenerateKeyAlgorithm::Rsa { bits: 4096 },
-        })
+    pub fn generate_rsa_key(
+        &self,
+        vault_id: &str,
+        label: String,
+    ) -> Result<VaultScopedKeySummary> {
+        self.generate_private_key(
+            vault_id,
+            GenerateKeyRequest {
+                label,
+                algorithm: GenerateKeyAlgorithm::Rsa { bits: 4096 },
+            },
+        )
     }
 
-    pub fn build_connect_request(&self, host_id: &str) -> Result<SshConnectRequest> {
-        self.controller.build_connect_request(host_id)
+    pub fn build_connect_request(&self, vault_id: &str, host_id: &str) -> Result<SshConnectRequest> {
+        self.controller.build_connect_request(vault_id, host_id)
     }
 
     pub fn sftp_canonicalize(&self, session_id: u64, path: &str) -> Result<String> {

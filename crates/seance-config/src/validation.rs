@@ -44,6 +44,16 @@ pub enum ConfigError {
     UnsupportedKeybindingAction { action: String },
     #[error("duplicate keybinding override for chord '{chord}' and action '{action}'")]
     DuplicateKeybindingOverride { chord: String, action: String },
+    #[error("duplicate vault id '{vault_id}'")]
+    DuplicateVaultId { vault_id: String },
+    #[error("duplicate vault name '{name}'")]
+    DuplicateVaultName { name: String },
+    #[error("duplicate vault db_file '{db_file}'")]
+    DuplicateVaultDbFile { db_file: String },
+    #[error("open_vault_ids references unknown vault id '{vault_id}'")]
+    UnknownOpenVaultId { vault_id: String },
+    #[error("default_target_vault_id references unknown vault id '{vault_id}'")]
+    UnknownDefaultVaultId { vault_id: String },
 }
 
 impl AppConfig {
@@ -114,6 +124,61 @@ impl AppConfig {
             }
         }
 
+        let mut seen_vault_ids = HashSet::new();
+        let mut seen_vault_names = HashSet::new();
+        let mut seen_db_files = HashSet::new();
+        let mut known_vault_ids = HashSet::new();
+        for entry in &self.vaults.entries {
+            if entry.id.is_empty() {
+                return Err(ConfigError::EmptyField {
+                    field: "vaults.entries.id",
+                });
+            }
+            if entry.name.is_empty() {
+                return Err(ConfigError::EmptyField {
+                    field: "vaults.entries.name",
+                });
+            }
+            if entry.db_file.is_empty() {
+                return Err(ConfigError::EmptyField {
+                    field: "vaults.entries.db_file",
+                });
+            }
+            if !seen_vault_ids.insert(entry.id.clone()) {
+                return Err(ConfigError::DuplicateVaultId {
+                    vault_id: entry.id.clone(),
+                });
+            }
+            let normalized_name = entry.name.to_lowercase();
+            if !seen_vault_names.insert(normalized_name) {
+                return Err(ConfigError::DuplicateVaultName {
+                    name: entry.name.clone(),
+                });
+            }
+            if !seen_db_files.insert(entry.db_file.clone()) {
+                return Err(ConfigError::DuplicateVaultDbFile {
+                    db_file: entry.db_file.clone(),
+                });
+            }
+            known_vault_ids.insert(entry.id.clone());
+        }
+
+        for vault_id in &self.vaults.open_vault_ids {
+            if !known_vault_ids.contains(vault_id) {
+                return Err(ConfigError::UnknownOpenVaultId {
+                    vault_id: vault_id.clone(),
+                });
+            }
+        }
+
+        if let Some(vault_id) = self.vaults.default_target_vault_id.as_ref()
+            && !known_vault_ids.contains(vault_id)
+        {
+            return Err(ConfigError::UnknownDefaultVaultId {
+                vault_id: vault_id.clone(),
+            });
+        }
+
         Ok(())
     }
 }
@@ -122,7 +187,7 @@ impl AppConfig {
 mod tests {
     use crate::{
         AppConfig, ConfigError, KeybindingOverride, SUPPORTED_KEYBINDING_ACTIONS,
-        UpdateInstallMode, UpdateReleaseChannel,
+        UpdateInstallMode, UpdateReleaseChannel, VaultRegistryEntry,
     };
 
     #[test]
@@ -210,5 +275,47 @@ mod tests {
         assert!(config.updates.auto_check);
         assert_eq!(config.updates.install_mode, UpdateInstallMode::Prompted);
         assert_eq!(config.updates.channel, UpdateReleaseChannel::Stable);
+    }
+
+    #[test]
+    fn duplicate_vault_name_and_unknown_refs_are_rejected() {
+        let mut config = AppConfig::default();
+        config.vaults.entries = vec![
+            VaultRegistryEntry {
+                id: "vault-a".into(),
+                name: "Personal".into(),
+                db_file: "vault-a.sqlite".into(),
+                created_at: 1,
+                updated_at: 1,
+            },
+            VaultRegistryEntry {
+                id: "vault-b".into(),
+                name: "personal".into(),
+                db_file: "vault-b.sqlite".into(),
+                created_at: 1,
+                updated_at: 1,
+            },
+        ];
+        let duplicate_err = config.validate().unwrap_err();
+        assert!(matches!(
+            duplicate_err,
+            ConfigError::DuplicateVaultName { .. }
+        ));
+
+        config.vaults.entries.pop();
+        config.vaults.open_vault_ids = vec!["missing".into()];
+        let open_ref_err = config.validate().unwrap_err();
+        assert!(matches!(
+            open_ref_err,
+            ConfigError::UnknownOpenVaultId { .. }
+        ));
+
+        config.vaults.open_vault_ids.clear();
+        config.vaults.default_target_vault_id = Some("missing".into());
+        let default_ref_err = config.validate().unwrap_err();
+        assert!(matches!(
+            default_ref_err,
+            ConfigError::UnknownDefaultVaultId { .. }
+        ));
     }
 }

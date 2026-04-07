@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use seance_config::{AppConfig, ConfigStore};
+use seance_config::{AppConfig, ConfigStore, VaultRegistryEntry};
 use seance_ssh::{
     ResolvedAuthMethod, SftpEntry, SshConnectRequest, SshConnectionConfig, SshSessionManager,
 };
@@ -20,14 +20,17 @@ use seance_vault::{
     CredentialSummary, GenerateKeyRequest, HostAuthRef, HostSummary, KeySummary, SecretString,
     VaultHostProfile, VaultPasswordCredential, VaultStatus, VaultStore,
 };
+use uuid::Uuid;
 
 pub type SessionId = u64;
+const LEGACY_VAULT_DB_FILE: &str = "vault.sqlite";
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
     pub app_root: PathBuf,
     pub config_path: PathBuf,
     pub vault_db_path: PathBuf,
+    pub vaults_dir: PathBuf,
     pub ipc_socket_path: PathBuf,
     pub instance_lock_path: PathBuf,
 }
@@ -37,9 +40,12 @@ impl AppPaths {
         let data_root = dirs::data_local_dir().unwrap_or(std::env::current_dir()?);
         let app_root = data_root.join("seance");
         fs::create_dir_all(&app_root).context("failed to create app data directory")?;
+        let vaults_dir = app_root.join("vaults");
+        fs::create_dir_all(&vaults_dir).context("failed to create vault storage directory")?;
         Ok(Self {
             config_path: app_root.join("config.toml"),
             vault_db_path: app_root.join("vault.sqlite"),
+            vaults_dir,
             ipc_socket_path: app_root.join("resident.sock"),
             instance_lock_path: app_root.join("resident.lock"),
             app_root,
@@ -50,7 +56,7 @@ impl AppPaths {
 pub struct AppContext {
     pub paths: AppPaths,
     pub config: ConfigStore,
-    pub vault: VaultStore,
+    vaults: HashMap<String, ManagedVaultState>,
     pub ssh: Arc<SshSessionManager>,
     pub local: LocalSessionFactory,
     pub updater: Arc<UpdateManager>,
@@ -58,7 +64,7 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn open(paths: AppPaths) -> Result<Self> {
-        let config = match ConfigStore::load_or_default(&paths.config_path) {
+        let mut config = match ConfigStore::load_or_default(&paths.config_path) {
             Ok(config) => config,
             Err(error) => {
                 tracing::warn!(
@@ -69,8 +75,8 @@ impl AppContext {
                 ConfigStore::with_defaults(&paths.config_path)
             }
         };
-        let vault =
-            VaultStore::open(&paths.vault_db_path).context("failed to open the encrypted vault")?;
+        migrate_legacy_vault_registry(&paths, &mut config)?;
+        let vaults = load_managed_vaults(&paths, &config.snapshot())?;
         let ssh = Arc::new(SshSessionManager::new()?);
         let updater = Arc::new(UpdateManager::new(update_settings_from_config(
             &config.snapshot(),
@@ -78,7 +84,7 @@ impl AppContext {
         Ok(Self {
             paths,
             config,
-            vault,
+            vaults,
             ssh,
             local: LocalSessionFactory,
             updater,
@@ -131,13 +137,56 @@ impl From<&AppConfig> for LifecyclePolicy {
 #[derive(Clone, Debug)]
 pub struct WindowBootstrap {
     pub attached_session_id: SessionId,
-    pub saved_hosts: Vec<HostSummary>,
-    pub cached_credentials: Vec<CredentialSummary>,
-    pub cached_keys: Vec<KeySummary>,
-    pub vault_status: VaultStatus,
+    pub managed_vaults: Vec<ManagedVaultSummary>,
+    pub saved_hosts: Vec<VaultScopedHostSummary>,
+    pub cached_credentials: Vec<VaultScopedCredentialSummary>,
+    pub cached_keys: Vec<VaultScopedKeySummary>,
     pub device_unlock_attempted: bool,
     pub config: AppConfig,
     pub update_state: UpdateState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedVaultSummary {
+    pub vault_id: String,
+    pub name: String,
+    pub db_path: PathBuf,
+    pub open: bool,
+    pub initialized: bool,
+    pub unlocked: bool,
+    pub device_unlock_available: bool,
+    pub device_unlock_message: Option<String>,
+    pub host_count: usize,
+    pub credential_count: usize,
+    pub key_count: usize,
+    pub availability_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultScopedHostSummary {
+    pub vault_id: String,
+    pub vault_name: String,
+    pub host: HostSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultScopedCredentialSummary {
+    pub vault_id: String,
+    pub vault_name: String,
+    pub credential: CredentialSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultScopedKeySummary {
+    pub vault_id: String,
+    pub vault_name: String,
+    pub key: KeySummary,
+}
+
+struct ManagedVaultState {
+    entry: VaultRegistryEntry,
+    store: Option<VaultStore>,
+    availability_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -367,95 +416,156 @@ impl AppControllerHandle {
     }
 
     pub fn vault_status(&self) -> VaultStatus {
-        self.with_lock(|controller| controller.context.vault.status())
+        self.with_lock(|controller| controller.aggregate_vault_status())
     }
 
     pub fn try_unlock_with_device(&self) -> Result<bool> {
         self.with_lock(|controller| {
-            controller.device_unlock_attempted = true;
-            Ok(controller.context.vault.try_unlock_with_device()?)
+            let vault_id = controller
+                .default_target_vault_id_for_actions()
+                .ok_or_else(|| anyhow!("no vault available to unlock"))?;
+            controller.try_unlock_vault_with_device(&vault_id)
         })
     }
 
     pub fn create_vault(&self, passphrase: &SecretString, device_name: &str) -> Result<()> {
         self.with_lock(|controller| {
-            Ok(controller
-                .context
-                .vault
-                .create_vault(passphrase, device_name)?)
+            controller.create_named_vault("Personal".into(), passphrase, device_name)?;
+            Ok(())
         })
     }
 
     pub fn unlock_vault(&self, passphrase: &SecretString, device_name: &str) -> Result<()> {
         self.with_lock(|controller| {
-            Ok(controller
-                .context
-                .vault
-                .unlock_with_passphrase(passphrase, device_name)?)
+            let vault_id = controller
+                .default_target_vault_id_for_actions()
+                .ok_or_else(|| anyhow!("no vault available to unlock"))?;
+            controller.unlock_vault(&vault_id, passphrase, device_name)
         })
     }
 
     pub fn lock_vault(&self) {
-        self.with_lock(|controller| controller.context.vault.lock());
+        self.with_lock(|controller| {
+            if let Some(vault_id) = controller.default_target_vault_id_for_actions() {
+                let _ = controller.lock_vault(&vault_id);
+            }
+        });
     }
 
-    pub fn list_hosts(&self) -> Result<Vec<HostSummary>> {
-        self.with_lock(|controller| Ok(controller.context.vault.list_host_profiles()?))
+    pub fn list_vaults(&self) -> Vec<ManagedVaultSummary> {
+        self.with_lock(|controller| controller.list_vaults())
     }
 
-    pub fn load_host(&self, id: &str) -> Result<Option<VaultHostProfile>> {
-        self.with_lock(|controller| Ok(controller.context.vault.load_host_profile(id)?))
+    pub fn create_named_vault(
+        &self,
+        name: String,
+        passphrase: &SecretString,
+        device_name: &str,
+    ) -> Result<ManagedVaultSummary> {
+        self.with_lock(|controller| controller.create_named_vault(name, passphrase, device_name))
     }
 
-    pub fn save_host(&self, host: VaultHostProfile) -> Result<HostSummary> {
-        self.with_lock(|controller| Ok(controller.context.vault.store_host_profile(host)?))
+    pub fn rename_vault(&self, vault_id: &str, name: String) -> Result<ManagedVaultSummary> {
+        self.with_lock(|controller| controller.rename_vault(vault_id, name))
     }
 
-    pub fn delete_host(&self, id: &str) -> Result<bool> {
-        self.with_lock(|controller| Ok(controller.context.vault.delete_host_profile(id)?))
+    pub fn open_vault(&self, vault_id: &str) -> Result<()> {
+        self.with_lock(|controller| controller.open_vault(vault_id))
     }
 
-    pub fn list_password_credentials(&self) -> Result<Vec<CredentialSummary>> {
-        self.with_lock(|controller| Ok(controller.context.vault.list_password_credentials()?))
+    pub fn close_vault(&self, vault_id: &str) -> Result<()> {
+        self.with_lock(|controller| controller.close_vault(vault_id))
     }
 
-    pub fn load_password_credential(&self, id: &str) -> Result<Option<VaultPasswordCredential>> {
-        self.with_lock(|controller| Ok(controller.context.vault.load_password_credential(id)?))
+    pub fn unlock_named_vault(
+        &self,
+        vault_id: &str,
+        passphrase: &SecretString,
+        device_name: &str,
+    ) -> Result<()> {
+        self.with_lock(|controller| controller.unlock_vault(vault_id, passphrase, device_name))
+    }
+
+    pub fn try_unlock_vault_with_device(&self, vault_id: &str) -> Result<bool> {
+        self.with_lock(|controller| controller.try_unlock_vault_with_device(vault_id))
+    }
+
+    pub fn lock_named_vault(&self, vault_id: &str) -> Result<()> {
+        self.with_lock(|controller| controller.lock_vault(vault_id))
+    }
+
+    pub fn delete_vault_permanently(&self, vault_id: &str) -> Result<()> {
+        self.with_lock(|controller| controller.delete_vault_permanently(vault_id))
+    }
+
+    pub fn set_default_target_vault(&self, vault_id: &str) -> Result<()> {
+        self.with_lock(|controller| controller.set_default_target_vault(vault_id))
+    }
+
+    pub fn list_hosts(&self) -> Result<Vec<VaultScopedHostSummary>> {
+        self.with_lock(|controller| controller.list_hosts())
+    }
+
+    pub fn load_host(&self, vault_id: &str, id: &str) -> Result<Option<VaultHostProfile>> {
+        self.with_lock(|controller| controller.load_host(vault_id, id))
+    }
+
+    pub fn save_host(
+        &self,
+        vault_id: &str,
+        host: VaultHostProfile,
+    ) -> Result<VaultScopedHostSummary> {
+        self.with_lock(|controller| controller.save_host(vault_id, host))
+    }
+
+    pub fn delete_host(&self, vault_id: &str, id: &str) -> Result<bool> {
+        self.with_lock(|controller| controller.delete_host(vault_id, id))
+    }
+
+    pub fn list_password_credentials(&self) -> Result<Vec<VaultScopedCredentialSummary>> {
+        self.with_lock(|controller| controller.list_password_credentials())
+    }
+
+    pub fn load_password_credential(
+        &self,
+        vault_id: &str,
+        id: &str,
+    ) -> Result<Option<VaultPasswordCredential>> {
+        self.with_lock(|controller| controller.load_password_credential(vault_id, id))
     }
 
     pub fn save_password_credential(
         &self,
+        vault_id: &str,
         credential: VaultPasswordCredential,
-    ) -> Result<CredentialSummary> {
+    ) -> Result<VaultScopedCredentialSummary> {
+        self.with_lock(|controller| controller.save_password_credential(vault_id, credential))
+    }
+
+    pub fn delete_password_credential(&self, vault_id: &str, id: &str) -> Result<bool> {
+        self.with_lock(|controller| controller.delete_password_credential(vault_id, id))
+    }
+
+    pub fn list_private_keys(&self) -> Result<Vec<VaultScopedKeySummary>> {
+        self.with_lock(|controller| controller.list_private_keys())
+    }
+
+    pub fn generate_private_key(
+        &self,
+        vault_id: &str,
+        request: GenerateKeyRequest,
+    ) -> Result<VaultScopedKeySummary> {
+        self.with_lock(|controller| controller.generate_private_key(vault_id, request))
+    }
+
+    pub fn delete_private_key(&self, vault_id: &str, id: &str) -> Result<bool> {
+        self.with_lock(|controller| controller.delete_private_key(vault_id, id))
+    }
+
+    pub fn build_connect_request(&self, vault_id: &str, host_id: &str) -> Result<SshConnectRequest> {
         self.with_lock(|controller| {
-            Ok(controller
-                .context
-                .vault
-                .store_password_credential(credential)?)
-        })
-    }
-
-    pub fn delete_password_credential(&self, id: &str) -> Result<bool> {
-        self.with_lock(|controller| Ok(controller.context.vault.delete_password_credential(id)?))
-    }
-
-    pub fn list_private_keys(&self) -> Result<Vec<KeySummary>> {
-        self.with_lock(|controller| Ok(controller.context.vault.list_private_keys()?))
-    }
-
-    pub fn generate_private_key(&self, request: GenerateKeyRequest) -> Result<KeySummary> {
-        self.with_lock(|controller| Ok(controller.context.vault.generate_private_key(request)?))
-    }
-
-    pub fn delete_private_key(&self, id: &str) -> Result<bool> {
-        self.with_lock(|controller| Ok(controller.context.vault.delete_private_key(id)?))
-    }
-
-    pub fn build_connect_request(&self, host_id: &str) -> Result<SshConnectRequest> {
-        self.with_lock(|controller| {
-            let host = controller
-                .context
-                .vault
+            let vault = controller.store(vault_id)?;
+            let host = vault
                 .load_host_profile(host_id)?
                 .ok_or_else(|| anyhow!("saved host not found"))?;
 
@@ -463,9 +573,7 @@ impl AppControllerHandle {
             for auth in &host.auth_order {
                 match auth {
                     HostAuthRef::Password { credential_id } => {
-                        let credential = controller
-                            .context
-                            .vault
+                        let credential = vault
                             .load_password_credential(credential_id)?
                             .ok_or_else(|| anyhow!("missing password credential"))?;
                         auth_order.push(ResolvedAuthMethod::Password {
@@ -476,14 +584,12 @@ impl AppControllerHandle {
                         key_id,
                         passphrase_credential_id,
                     } => {
-                        let key = controller
-                            .context
-                            .vault
+                        let key = vault
                             .load_private_key(key_id)?
                             .ok_or_else(|| anyhow!("missing private key"))?;
                         let passphrase = passphrase_credential_id
                             .as_ref()
-                            .map(|id| controller.context.vault.load_password_credential(id))
+                            .map(|id| vault.load_password_credential(id))
                             .transpose()?
                             .flatten()
                             .map(|credential| credential.secret);
@@ -565,9 +671,13 @@ impl AppControllerHandle {
 
 impl AppController {
     fn bootstrap(&mut self) -> Result<()> {
-        if self.context.vault.status().initialized {
-            let _ = self.context.vault.try_unlock_with_device();
-            self.device_unlock_attempted = true;
+        for state in self.context.vaults.values_mut() {
+            if let Some(store) = state.store.as_mut()
+                && store.status().initialized
+            {
+                let _ = store.try_unlock_with_device();
+                self.device_unlock_attempted = true;
+            }
         }
         if self.sessions.is_empty() {
             let _ = self.spawn_local_session()?;
@@ -593,28 +703,12 @@ impl AppController {
         self.bump_access_seq();
         let seq = self.access_seq;
         self.sessions.touch(attached_session_id, seq);
-        let unlocked = self.context.vault.status().unlocked;
         Ok(WindowBootstrap {
             attached_session_id,
-            saved_hosts: if unlocked {
-                self.context.vault.list_host_profiles().unwrap_or_default()
-            } else {
-                Vec::new()
-            },
-            cached_credentials: if unlocked {
-                self.context
-                    .vault
-                    .list_password_credentials()
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            },
-            cached_keys: if unlocked {
-                self.context.vault.list_private_keys().unwrap_or_default()
-            } else {
-                Vec::new()
-            },
-            vault_status: self.context.vault.status(),
+            managed_vaults: self.list_vaults(),
+            saved_hosts: self.list_hosts().unwrap_or_default(),
+            cached_credentials: self.list_password_credentials().unwrap_or_default(),
+            cached_keys: self.list_private_keys().unwrap_or_default(),
             device_unlock_attempted: self.device_unlock_attempted,
             config: self.context.config.snapshot(),
             update_state: self.context.updater.state_snapshot(),
@@ -677,6 +771,529 @@ impl AppController {
 
     fn bump_access_seq(&mut self) {
         self.access_seq = self.access_seq.wrapping_add(1);
+    }
+
+    fn aggregate_vault_status(&self) -> VaultStatus {
+        let mut open_vaults = self.context.vaults.values().filter_map(|state| state.store.as_ref());
+        if let Some(store) = open_vaults.next() {
+            return store.status();
+        }
+
+        VaultStatus {
+            initialized: self
+                .context
+                .vaults
+                .values()
+                .any(|state| state.entry.db_file == LEGACY_VAULT_DB_FILE || state.store.is_some()),
+            unlocked: false,
+            vault_path: self.context.paths.vault_db_path.display().to_string(),
+            device_unlock_available: false,
+            device_unlock_message: None,
+        }
+    }
+
+    fn list_vaults(&self) -> Vec<ManagedVaultSummary> {
+        let mut vaults = self
+            .context
+            .vaults
+            .values()
+            .map(|state| state.summary(&self.context.paths))
+            .collect::<Vec<_>>();
+        vaults.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        vaults
+    }
+
+    fn create_named_vault(
+        &mut self,
+        name: String,
+        passphrase: &SecretString,
+        device_name: &str,
+    ) -> Result<ManagedVaultSummary> {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            anyhow::bail!("vault name cannot be empty");
+        }
+        if self
+            .context
+            .vaults
+            .values()
+            .any(|state| state.entry.name.eq_ignore_ascii_case(trimmed_name))
+        {
+            anyhow::bail!("a vault named '{}' already exists", trimmed_name);
+        }
+
+        fs::create_dir_all(&self.context.paths.vaults_dir)
+            .context("failed to create vault storage directory")?;
+        let vault_id = Uuid::new_v4().to_string();
+        let db_file = format!("{vault_id}.sqlite");
+        let db_path = self.context.paths.vaults_dir.join(&db_file);
+        let mut store = VaultStore::open(&db_path).context("failed to create vault database")?;
+        store
+            .create_vault(passphrase, device_name)
+            .context("failed to initialize vault")?;
+
+        let now = seance_vault::now_ts();
+        let entry = VaultRegistryEntry {
+            id: vault_id.clone(),
+            name: trimmed_name.to_string(),
+            db_file,
+            created_at: now,
+            updated_at: now,
+        };
+        if let Err(error) = self.update_config(|config| {
+            config.vaults.entries.push(entry.clone());
+            config.vaults.open_vault_ids.push(vault_id.clone());
+            if config.vaults.default_target_vault_id.is_none() {
+                config.vaults.default_target_vault_id = Some(vault_id.clone());
+            }
+        }) {
+            let _ = fs::remove_file(&db_path);
+            return Err(error);
+        }
+
+        self.context.vaults.insert(
+            vault_id.clone(),
+            ManagedVaultState {
+                entry,
+                store: Some(store),
+                availability_error: None,
+            },
+        );
+        Ok(self
+            .context
+            .vaults
+            .get(&vault_id)
+            .expect("inserted vault state")
+            .summary(&self.context.paths))
+    }
+
+    fn rename_vault(&mut self, vault_id: &str, name: String) -> Result<ManagedVaultSummary> {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            anyhow::bail!("vault name cannot be empty");
+        }
+        if self.context.vaults.iter().any(|(id, state)| {
+            id != vault_id && state.entry.name.eq_ignore_ascii_case(trimmed_name)
+        }) {
+            anyhow::bail!("a vault named '{}' already exists", trimmed_name);
+        }
+
+        let state = self
+            .context
+            .vaults
+            .get_mut(vault_id)
+                .ok_or_else(|| anyhow!("vault not found"))?;
+        state.entry.name = trimmed_name.to_string();
+        state.entry.updated_at = seance_vault::now_ts();
+        let updated_entry = state.entry.clone();
+        let summary = state.summary(&self.context.paths);
+        let _ = state;
+        self.update_config(|config| {
+            if let Some(entry) = config.vaults.entries.iter_mut().find(|entry| entry.id == vault_id) {
+                *entry = updated_entry.clone();
+            }
+        })?;
+        Ok(summary)
+    }
+
+    fn open_vault(&mut self, vault_id: &str) -> Result<()> {
+        let state = self
+            .context
+            .vaults
+            .get_mut(vault_id)
+            .ok_or_else(|| anyhow!("vault not found"))?;
+        if state.store.is_none() {
+            let path = vault_db_path(&self.context.paths, &state.entry);
+            let store = VaultStore::open(&path).with_context(|| {
+                format!("failed to open vault database at {}", path.display())
+            })?;
+            state.store = Some(store);
+            state.availability_error = None;
+        }
+        if !self
+            .context
+            .config
+            .snapshot()
+            .vaults
+            .open_vault_ids
+            .iter()
+            .any(|id| id == vault_id)
+        {
+            self.update_config(|config| {
+                config.vaults.open_vault_ids.push(vault_id.to_string());
+            })?;
+        }
+        Ok(())
+    }
+
+    fn close_vault(&mut self, vault_id: &str) -> Result<()> {
+        let state = self
+            .context
+            .vaults
+            .get_mut(vault_id)
+            .ok_or_else(|| anyhow!("vault not found"))?;
+        state.store = None;
+        self.update_config(|config| {
+            config.vaults.open_vault_ids.retain(|id| id != vault_id);
+        })?;
+        Ok(())
+    }
+
+    fn unlock_vault(
+        &mut self,
+        vault_id: &str,
+        passphrase: &SecretString,
+        device_name: &str,
+    ) -> Result<()> {
+        self.open_vault(vault_id)?;
+        let store = self.store_mut(vault_id)?;
+        store
+            .unlock_with_passphrase(passphrase, device_name)
+            .context("failed to unlock vault")?;
+        self.device_unlock_attempted = true;
+        Ok(())
+    }
+
+    fn try_unlock_vault_with_device(&mut self, vault_id: &str) -> Result<bool> {
+        self.open_vault(vault_id)?;
+        self.device_unlock_attempted = true;
+        let store = self.store_mut(vault_id)?;
+        Ok(store.try_unlock_with_device()?)
+    }
+
+    fn lock_vault(&mut self, vault_id: &str) -> Result<()> {
+        let store = self.store_mut(vault_id)?;
+        store.lock();
+        Ok(())
+    }
+
+    fn delete_vault_permanently(&mut self, vault_id: &str) -> Result<()> {
+        let state = self
+            .context
+            .vaults
+            .get(vault_id)
+            .ok_or_else(|| anyhow!("vault not found"))?;
+        if state.store.as_ref().is_some_and(|store| store.status().unlocked) {
+            anyhow::bail!("lock the vault before deleting it");
+        }
+        let path = vault_db_path(&self.context.paths, &state.entry);
+        self.context.vaults.remove(vault_id);
+        self.update_config(|config| {
+            config.vaults.entries.retain(|entry| entry.id != vault_id);
+            config.vaults.open_vault_ids.retain(|id| id != vault_id);
+            if config.vaults.default_target_vault_id.as_deref() == Some(vault_id) {
+                config.vaults.default_target_vault_id = None;
+            }
+        })?;
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove vault at {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn set_default_target_vault(&mut self, vault_id: &str) -> Result<()> {
+        if !self.context.vaults.contains_key(vault_id) {
+            anyhow::bail!("vault not found");
+        }
+        self.update_config(|config| {
+            config.vaults.default_target_vault_id = Some(vault_id.to_string());
+        })?;
+        Ok(())
+    }
+
+    fn list_hosts(&self) -> Result<Vec<VaultScopedHostSummary>> {
+        let mut hosts = Vec::new();
+        for (vault_id, state) in &self.context.vaults {
+            let Some(store) = state.store.as_ref() else {
+                continue;
+            };
+            if !store.status().unlocked {
+                continue;
+            }
+            hosts.extend(
+                store
+                    .list_host_profiles()?
+                    .into_iter()
+                    .map(|host| VaultScopedHostSummary {
+                        vault_id: vault_id.clone(),
+                        vault_name: state.entry.name.clone(),
+                        host,
+                    }),
+            );
+        }
+        hosts.sort_by(|left, right| {
+            left.host
+                .label
+                .to_lowercase()
+                .cmp(&right.host.label.to_lowercase())
+                .then_with(|| left.vault_name.to_lowercase().cmp(&right.vault_name.to_lowercase()))
+        });
+        Ok(hosts)
+    }
+
+    fn load_host(&self, vault_id: &str, id: &str) -> Result<Option<VaultHostProfile>> {
+        Ok(self.store(vault_id)?.load_host_profile(id)?)
+    }
+
+    fn save_host(&mut self, vault_id: &str, host: VaultHostProfile) -> Result<VaultScopedHostSummary> {
+        let summary = self.store_mut(vault_id)?.store_host_profile(host)?;
+        let vault_name = self.vault_entry(vault_id)?.name.clone();
+        Ok(VaultScopedHostSummary {
+            vault_id: vault_id.to_string(),
+            vault_name,
+            host: summary,
+        })
+    }
+
+    fn delete_host(&mut self, vault_id: &str, id: &str) -> Result<bool> {
+        Ok(self.store_mut(vault_id)?.delete_host_profile(id)?)
+    }
+
+    fn list_password_credentials(&self) -> Result<Vec<VaultScopedCredentialSummary>> {
+        let mut credentials = Vec::new();
+        for (vault_id, state) in &self.context.vaults {
+            let Some(store) = state.store.as_ref() else {
+                continue;
+            };
+            if !store.status().unlocked {
+                continue;
+            }
+            credentials.extend(
+                store
+                    .list_password_credentials()?
+                    .into_iter()
+                    .map(|credential| VaultScopedCredentialSummary {
+                        vault_id: vault_id.clone(),
+                        vault_name: state.entry.name.clone(),
+                        credential,
+                    }),
+            );
+        }
+        credentials.sort_by(|left, right| {
+            left.credential
+                .label
+                .to_lowercase()
+                .cmp(&right.credential.label.to_lowercase())
+                .then_with(|| left.vault_name.to_lowercase().cmp(&right.vault_name.to_lowercase()))
+        });
+        Ok(credentials)
+    }
+
+    fn load_password_credential(
+        &self,
+        vault_id: &str,
+        id: &str,
+    ) -> Result<Option<VaultPasswordCredential>> {
+        Ok(self.store(vault_id)?.load_password_credential(id)?)
+    }
+
+    fn save_password_credential(
+        &mut self,
+        vault_id: &str,
+        credential: VaultPasswordCredential,
+    ) -> Result<VaultScopedCredentialSummary> {
+        let summary = self.store_mut(vault_id)?.store_password_credential(credential)?;
+        let vault_name = self.vault_entry(vault_id)?.name.clone();
+        Ok(VaultScopedCredentialSummary {
+            vault_id: vault_id.to_string(),
+            vault_name,
+            credential: summary,
+        })
+    }
+
+    fn delete_password_credential(&mut self, vault_id: &str, id: &str) -> Result<bool> {
+        Ok(self.store_mut(vault_id)?.delete_password_credential(id)?)
+    }
+
+    fn list_private_keys(&self) -> Result<Vec<VaultScopedKeySummary>> {
+        let mut keys = Vec::new();
+        for (vault_id, state) in &self.context.vaults {
+            let Some(store) = state.store.as_ref() else {
+                continue;
+            };
+            if !store.status().unlocked {
+                continue;
+            }
+            keys.extend(
+                store
+                    .list_private_keys()?
+                    .into_iter()
+                    .map(|key| VaultScopedKeySummary {
+                        vault_id: vault_id.clone(),
+                        vault_name: state.entry.name.clone(),
+                        key,
+                    }),
+            );
+        }
+        keys.sort_by(|left, right| {
+            left.key
+                .label
+                .to_lowercase()
+                .cmp(&right.key.label.to_lowercase())
+                .then_with(|| left.vault_name.to_lowercase().cmp(&right.vault_name.to_lowercase()))
+        });
+        Ok(keys)
+    }
+
+    fn generate_private_key(
+        &mut self,
+        vault_id: &str,
+        request: GenerateKeyRequest,
+    ) -> Result<VaultScopedKeySummary> {
+        let summary = self.store_mut(vault_id)?.generate_private_key(request)?;
+        let vault_name = self.vault_entry(vault_id)?.name.clone();
+        Ok(VaultScopedKeySummary {
+            vault_id: vault_id.to_string(),
+            vault_name,
+            key: summary,
+        })
+    }
+
+    fn delete_private_key(&mut self, vault_id: &str, id: &str) -> Result<bool> {
+        Ok(self.store_mut(vault_id)?.delete_private_key(id)?)
+    }
+
+    fn default_target_vault_id_for_actions(&self) -> Option<String> {
+        let config = self.context.config.snapshot();
+        if let Some(default_id) = config.vaults.default_target_vault_id
+            && self
+                .context
+                .vaults
+                .get(&default_id)
+                .is_some_and(|state| state.store.as_ref().is_some_and(|store| store.status().unlocked))
+        {
+            return Some(default_id);
+        }
+
+        let mut unlocked = self
+            .context
+            .vaults
+            .iter()
+            .filter(|(_, state)| state.store.as_ref().is_some_and(|store| store.status().unlocked))
+            .map(|(vault_id, state)| (vault_id.clone(), state.entry.name.to_lowercase()))
+            .collect::<Vec<_>>();
+        unlocked.sort_by(|left, right| left.1.cmp(&right.1));
+        unlocked.into_iter().map(|(vault_id, _)| vault_id).next()
+    }
+
+    fn vault_entry(&self, vault_id: &str) -> Result<&VaultRegistryEntry> {
+        Ok(&self
+            .context
+            .vaults
+            .get(vault_id)
+            .ok_or_else(|| anyhow!("vault not found"))?
+            .entry)
+    }
+
+    fn store(&self, vault_id: &str) -> Result<&VaultStore> {
+        self.context
+            .vaults
+            .get(vault_id)
+            .and_then(|state| state.store.as_ref())
+            .ok_or_else(|| anyhow!("vault is not open"))
+    }
+
+    fn store_mut(&mut self, vault_id: &str) -> Result<&mut VaultStore> {
+        self.context
+            .vaults
+            .get_mut(vault_id)
+            .and_then(|state| state.store.as_mut())
+            .ok_or_else(|| anyhow!("vault is not open"))
+    }
+}
+
+impl ManagedVaultState {
+    fn summary(&self, paths: &AppPaths) -> ManagedVaultSummary {
+        let db_path = vault_db_path(paths, &self.entry);
+        let status = self.store.as_ref().map(VaultStore::status);
+        let (host_count, credential_count, key_count) = if let Some(store) = self.store.as_ref() {
+            if store.status().unlocked {
+                (
+                    store.list_host_profiles().unwrap_or_default().len(),
+                    store.list_password_credentials().unwrap_or_default().len(),
+                    store.list_private_keys().unwrap_or_default().len(),
+                )
+            } else {
+                (0, 0, 0)
+            }
+        } else {
+            (0, 0, 0)
+        };
+
+        ManagedVaultSummary {
+            vault_id: self.entry.id.clone(),
+            name: self.entry.name.clone(),
+            db_path,
+            open: self.store.is_some(),
+            initialized: status.as_ref().is_some_and(|status| status.initialized),
+            unlocked: status.as_ref().is_some_and(|status| status.unlocked),
+            device_unlock_available: status
+                .as_ref()
+                .is_some_and(|status| status.device_unlock_available),
+            device_unlock_message: status
+                .as_ref()
+                .and_then(|status| status.device_unlock_message.clone()),
+            host_count,
+            credential_count,
+            key_count,
+            availability_error: self.availability_error.clone(),
+        }
+    }
+}
+
+fn migrate_legacy_vault_registry(paths: &AppPaths, config: &mut ConfigStore) -> Result<()> {
+    let snapshot = config.snapshot();
+    if !snapshot.vaults.entries.is_empty() || !paths.vault_db_path.exists() {
+        return Ok(());
+    }
+
+    let now = seance_vault::now_ts();
+    let legacy_entry = VaultRegistryEntry {
+        id: Uuid::new_v4().to_string(),
+        name: "Personal".into(),
+        db_file: LEGACY_VAULT_DB_FILE.into(),
+        created_at: now,
+        updated_at: now,
+    };
+    config
+        .update(|config| {
+            config.vaults.entries.push(legacy_entry.clone());
+            config.vaults.open_vault_ids.push(legacy_entry.id.clone());
+            config.vaults.default_target_vault_id = Some(legacy_entry.id.clone());
+        })
+        .context("failed to migrate legacy vault registry")?;
+    Ok(())
+}
+
+fn load_managed_vaults(
+    paths: &AppPaths,
+    config: &AppConfig,
+) -> Result<HashMap<String, ManagedVaultState>> {
+    let mut vaults = HashMap::new();
+    for entry in &config.vaults.entries {
+        let mut state = ManagedVaultState {
+            entry: entry.clone(),
+            store: None,
+            availability_error: None,
+        };
+        if config.vaults.open_vault_ids.iter().any(|id| id == &entry.id) {
+            let db_path = vault_db_path(paths, entry);
+            match VaultStore::open(&db_path) {
+                Ok(store) => state.store = Some(store),
+                Err(error) => state.availability_error = Some(error.to_string()),
+            }
+        }
+        vaults.insert(entry.id.clone(), state);
+    }
+    Ok(vaults)
+}
+
+fn vault_db_path(paths: &AppPaths, entry: &VaultRegistryEntry) -> PathBuf {
+    if entry.db_file == LEGACY_VAULT_DB_FILE && paths.vault_db_path.exists() {
+        paths.vault_db_path.clone()
+    } else {
+        paths.vaults_dir.join(&entry.db_file)
     }
 }
 
@@ -761,6 +1378,7 @@ mod tests {
     fn detected_paths_include_config_toml() {
         let paths = AppPaths::detect().unwrap();
         assert_eq!(paths.config_path.file_name().unwrap(), "config.toml");
+        assert_eq!(paths.vaults_dir.file_name().unwrap(), "vaults");
     }
 
     #[test]
@@ -861,6 +1479,7 @@ mod tests {
             app_root: root.clone(),
             config_path: root.join("config.toml"),
             vault_db_path: root.join("vault.sqlite"),
+            vaults_dir: root.join("vaults"),
             ipc_socket_path: root.join("resident.sock"),
             instance_lock_path: root.join("resident.lock"),
         })

@@ -1,10 +1,12 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
-use gpui::FocusHandle;
+use gpui::{FocusHandle, ScrollHandle};
 use seance_config::AppConfig;
-use seance_core::{SessionKind, UpdateState};
+use seance_core::{
+    ManagedVaultSummary, SessionKind, UpdateState, VaultScopedCredentialSummary,
+    VaultScopedHostSummary, VaultScopedKeySummary,
+};
 use seance_terminal::{TerminalGeometry, TerminalSession};
-use seance_vault::{CredentialSummary, HostSummary, KeySummary};
 
 pub(crate) const DEFAULT_SIDEBAR_WIDTH: f32 = 260.0;
 pub(crate) const MIN_SIDEBAR_WIDTH: f32 = 180.0;
@@ -12,7 +14,10 @@ pub(crate) const MAX_SIDEBAR_WIDTH: f32 = 450.0;
 
 use crate::{
     backend::UiBackend,
-    forms::{CredentialEditorState, HostEditorState, SettingsPanelState, UnlockFormState},
+    forms::{
+        ConfirmDialogState, SecureWorkspaceState, SettingsPanelState, VaultModalState,
+        WorkspaceSurface,
+    },
     perf::{PerfOverlayState, UiPerfMode},
     sftp::SftpBrowserState,
     surface::TerminalSurfaceState,
@@ -24,21 +29,24 @@ pub(crate) struct SeanceWorkspace {
     pub(crate) active_session_id: u64,
     pub(crate) backend: UiBackend,
     pub(crate) config: AppConfig,
-    pub(crate) saved_hosts: Vec<HostSummary>,
+    pub(crate) managed_vaults: Vec<ManagedVaultSummary>,
+    pub(crate) saved_hosts: Vec<VaultScopedHostSummary>,
     pub(crate) selected_host_id: Option<String>,
     pub(crate) connecting_host_id: Option<String>,
-    pub(crate) unlock_form: UnlockFormState,
-    pub(crate) host_editor: Option<HostEditorState>,
-    pub(crate) credential_editor: Option<CredentialEditorState>,
+    pub(crate) surface: WorkspaceSurface,
+    pub(crate) vault_modal: VaultModalState,
+    pub(crate) secure: SecureWorkspaceState,
+    pub(crate) confirm_dialog: Option<ConfirmDialogState>,
     pub(crate) settings_panel: SettingsPanelState,
     pub(crate) sftp_browser: Option<SftpBrowserState>,
-    pub(crate) cached_credentials: Vec<CredentialSummary>,
-    pub(crate) cached_keys: Vec<KeySummary>,
+    pub(crate) cached_credentials: Vec<VaultScopedCredentialSummary>,
+    pub(crate) cached_keys: Vec<VaultScopedKeySummary>,
     pub(crate) update_state: UpdateState,
     pub(crate) active_theme: ThemeId,
     pub(crate) palette_open: bool,
     pub(crate) palette_query: String,
     pub(crate) palette_selected: usize,
+    pub(crate) palette_scroll_handle: ScrollHandle,
     pub(crate) terminal_metrics: Option<TerminalMetrics>,
     pub(crate) last_applied_geometry: Option<TerminalGeometry>,
     pub(crate) active_terminal_rows: usize,

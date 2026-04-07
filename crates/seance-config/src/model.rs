@@ -6,6 +6,25 @@ use crate::defaults::{
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultRegistryEntry {
+    pub id: String,
+    pub name: String,
+    pub db_file: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VaultRegistryConfig {
+    #[serde(default)]
+    pub entries: Vec<VaultRegistryEntry>,
+    #[serde(default)]
+    pub open_vault_ids: Vec<String>,
+    #[serde(default)]
+    pub default_target_vault_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppearanceConfig {
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -128,6 +147,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub appearance: AppearanceConfig,
     #[serde(default)]
+    pub vaults: VaultRegistryConfig,
+    #[serde(default)]
     pub window: WindowConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
@@ -143,6 +164,25 @@ impl AppConfig {
     pub(crate) fn normalized(&self) -> Self {
         let mut normalized = self.clone();
         normalized.appearance.theme = normalized.appearance.theme.trim().to_string();
+        for entry in &mut normalized.vaults.entries {
+            entry.id = entry.id.trim().to_string();
+            entry.name = entry.name.trim().to_string();
+            entry.db_file = entry.db_file.trim().to_string();
+        }
+        normalized.vaults.open_vault_ids = normalized
+            .vaults
+            .open_vault_ids
+            .into_iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+        normalized.vaults.default_target_vault_id = normalized
+            .vaults
+            .default_target_vault_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
         normalized.terminal.font_family = normalized.terminal.font_family.trim().to_string();
         normalized.terminal.local_shell = normalized
             .terminal

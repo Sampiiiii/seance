@@ -201,12 +201,7 @@ pub(crate) fn settings_section_group(label: &'static str, theme: &Theme) -> Div 
                 .text_color(theme.text_ghost)
                 .child(label.to_uppercase()),
         )
-        .child(
-            div()
-                .flex_1()
-                .h(px(1.0))
-                .bg(theme.glass_border_bright),
-        )
+        .child(div().flex_1().h(px(1.0)).bg(theme.glass_border_bright))
 }
 
 pub(crate) fn settings_nav_button(section: SettingsSection, active: bool, theme: &Theme) -> Div {
@@ -222,8 +217,7 @@ pub(crate) fn settings_nav_button(section: SettingsSection, active: bool, theme:
             .bg(theme.accent_glow)
             .hover(|style| style.bg(theme.accent_glow))
     } else {
-        base.ml(px(2.0))
-            .hover(|style| style.bg(theme.glass_hover))
+        base.ml(px(2.0)).hover(|style| style.bg(theme.glass_hover))
     };
 
     styled.child(
@@ -322,65 +316,63 @@ pub(crate) fn settings_toggle_card(
         .hover(|style| style.bg(theme.glass_hover));
 
     let card = if enabled {
-        card.border_l_2()
-            .border_color(theme.accent)
+        card.border_l_2().border_color(theme.accent)
     } else {
-        card.border_1()
-            .border_color(theme.glass_border)
+        card.border_1().border_color(theme.glass_border)
     };
 
     card.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_4()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.0))
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.text_primary)
-                                .child(title),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.text_muted)
-                                .child(description),
-                        ),
-                )
-                .child(
-                    // Pill-shaped toggle
-                    div()
-                        .w(px(40.0))
-                        .h(px(22.0))
-                        .rounded_full()
-                        .bg(if enabled {
-                            theme.accent
-                        } else {
-                            theme.glass_active
-                        })
-                        .flex()
-                        .items_center()
-                        .child(
-                            div()
-                                .w(px(16.0))
-                                .h(px(16.0))
-                                .rounded_full()
-                                .bg(if enabled {
-                                    theme.text_primary
-                                } else {
-                                    theme.text_ghost
-                                })
-                                .ml(if enabled { px(21.0) } else { px(3.0) }),
-                        ),
-                ),
-        )
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text_primary)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child(description),
+                    ),
+            )
+            .child(
+                // Pill-shaped toggle
+                div()
+                    .w(px(40.0))
+                    .h(px(22.0))
+                    .rounded_full()
+                    .bg(if enabled {
+                        theme.accent
+                    } else {
+                        theme.glass_active
+                    })
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .rounded_full()
+                            .bg(if enabled {
+                                theme.text_primary
+                            } else {
+                                theme.text_ghost
+                            })
+                            .ml(if enabled { px(21.0) } else { px(3.0) }),
+                    ),
+            ),
+    )
 }
 
 pub(crate) fn settings_info_card(
@@ -437,7 +429,7 @@ pub(crate) fn unlock_field_card(
     value: String,
     selected: bool,
     theme: &Theme,
-) -> impl IntoElement {
+) -> Div {
     let mut card = div()
         .p_3()
         .rounded_lg()
@@ -465,7 +457,7 @@ pub(crate) fn editor_field_card(
     value: String,
     selected: bool,
     theme: &Theme,
-) -> impl IntoElement {
+) -> Div {
     let mut card = div()
         .p_3()
         .rounded_lg()

@@ -4,8 +4,8 @@ use crate::{
     VaultError, VaultResult,
     kdf::KdfParams,
     model::{
-        DeviceEnrollment, EncryptedRecord, RecordKind, RecoveryBundle, VAULT_SCHEMA_VERSION,
-        VaultHeader,
+        DeviceEnrollment, EncryptedRecord, RecordKind, RecordSyncState, RecoveryBundle,
+        VAULT_SCHEMA_VERSION, VaultHeader,
     },
 };
 
@@ -296,6 +296,25 @@ pub fn update_device_last_used(
     Ok(())
 }
 
+pub fn list_device_enrollments(conn: &Connection) -> VaultResult<Vec<DeviceEnrollment>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT device_id, device_name, wrapping_nonce, wrapped_master_key,
+               created_at, last_used_at, revoked_at
+        FROM device_enrollments
+        ORDER BY created_at ASC, device_id ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], device_enrollment_from_row)?;
+    let enrollments = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(enrollments)
+}
+
+pub fn clear_device_enrollments(conn: &Connection) -> VaultResult<()> {
+    conn.execute("DELETE FROM device_enrollments", [])?;
+    Ok(())
+}
+
 pub fn set_local_state(conn: &Connection, key: &str, value: &str) -> VaultResult<()> {
     conn.execute(
         "
@@ -331,7 +350,7 @@ pub fn upsert_record(conn: &Connection, record: &EncryptedRecord) -> VaultResult
             key_nonce, wrapped_record_key, payload_nonce, payload_ciphertext,
             last_synced_clock, sync_state
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, 'pending')
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(record_id) DO UPDATE SET
             kind = excluded.kind,
             version = excluded.version,
@@ -342,7 +361,8 @@ pub fn upsert_record(conn: &Connection, record: &EncryptedRecord) -> VaultResult
             wrapped_record_key = excluded.wrapped_record_key,
             payload_nonce = excluded.payload_nonce,
             payload_ciphertext = excluded.payload_ciphertext,
-            sync_state = 'pending'
+            last_synced_clock = excluded.last_synced_clock,
+            sync_state = excluded.sync_state
         ",
         params![
             record.record_id,
@@ -355,6 +375,8 @@ pub fn upsert_record(conn: &Connection, record: &EncryptedRecord) -> VaultResult
             record.wrapped_record_key,
             record.payload_nonce,
             record.payload_ciphertext,
+            record.last_synced_clock,
+            record.sync_state.as_str(),
         ],
     )?;
     Ok(())
@@ -367,7 +389,8 @@ pub fn list_records_by_kind(
     let mut stmt = conn.prepare(
         "
         SELECT record_id, kind, version, logical_clock, modified_at, deleted_at,
-               key_nonce, wrapped_record_key, payload_nonce, payload_ciphertext
+               key_nonce, wrapped_record_key, payload_nonce, payload_ciphertext,
+               last_synced_clock, sync_state
         FROM records
         WHERE kind = ?1 AND deleted_at IS NULL
         ORDER BY modified_at DESC
@@ -387,7 +410,8 @@ pub fn load_record(
     conn.query_row(
         "
         SELECT record_id, kind, version, logical_clock, modified_at, deleted_at,
-               key_nonce, wrapped_record_key, payload_nonce, payload_ciphertext
+               key_nonce, wrapped_record_key, payload_nonce, payload_ciphertext,
+               last_synced_clock, sync_state
         FROM records
         WHERE record_id = ?1 AND kind = ?2
         ",
@@ -396,6 +420,53 @@ pub fn load_record(
     )
     .optional()
     .map_err(Into::into)
+}
+
+pub fn list_all_records(conn: &Connection) -> VaultResult<Vec<EncryptedRecord>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT record_id, kind, version, logical_clock, modified_at, deleted_at,
+               key_nonce, wrapped_record_key, payload_nonce, payload_ciphertext,
+               last_synced_clock, sync_state
+        FROM records
+        ORDER BY logical_clock ASC, record_id ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], encrypted_record_from_row)?;
+    let records = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(records)
+}
+
+pub fn list_records_after_clock(
+    conn: &Connection,
+    logical_clock: u64,
+) -> VaultResult<Vec<EncryptedRecord>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT record_id, kind, version, logical_clock, modified_at, deleted_at,
+               key_nonce, wrapped_record_key, payload_nonce, payload_ciphertext,
+               last_synced_clock, sync_state
+        FROM records
+        WHERE logical_clock > ?1
+        ORDER BY logical_clock ASC, record_id ASC
+        ",
+    )?;
+    let rows = stmt.query_map(params![logical_clock], encrypted_record_from_row)?;
+    let records = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(records)
+}
+
+pub fn count_records(conn: &Connection) -> VaultResult<u64> {
+    let count = conn.query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))?;
+    Ok(count)
+}
+
+pub fn set_last_logical_clock(conn: &Connection, logical_clock: u64) -> VaultResult<()> {
+    conn.execute(
+        "UPDATE vault_header SET last_logical_clock = ?1, updated_at = ?2 WHERE singleton = 1",
+        params![logical_clock, crate::now_ts()],
+    )?;
+    Ok(())
 }
 
 pub fn verify_header_integrity(header: &VaultHeader) -> VaultResult<()> {
@@ -428,6 +499,16 @@ fn encrypted_record_from_row(row: &Row<'_>) -> rusqlite::Result<EncryptedRecord>
             ))),
         )
     })?;
+    let sync_state_raw: String = row.get(11)?;
+    let sync_state = sync_state_raw.parse::<RecordSyncState>().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            11,
+            rusqlite::types::Type::Text,
+            Box::new(VaultError::CorruptVault(format!(
+                "unsupported sync state stored in sqlite: {sync_state_raw}"
+            ))),
+        )
+    })?;
 
     Ok(EncryptedRecord {
         record_id: row.get(0)?,
@@ -440,6 +521,8 @@ fn encrypted_record_from_row(row: &Row<'_>) -> rusqlite::Result<EncryptedRecord>
         wrapped_record_key: row.get(7)?,
         payload_nonce: row.get(8)?,
         payload_ciphertext: row.get(9)?,
+        last_synced_clock: row.get(10)?,
+        sync_state,
     })
 }
 

@@ -15,9 +15,10 @@ mod hosts;
 mod model;
 mod palette;
 mod perf;
+mod secure;
+mod sessions;
 mod settings;
 mod sftp;
-mod sessions;
 mod surface;
 mod terminal_paint;
 mod theme;
@@ -35,17 +36,18 @@ pub use actions::{
     OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance, SelectSession, ShowAllApps,
     SwitchTheme, TogglePerfHud,
 };
-pub use app::{UiCommand, UiIntegration, UiRuntime, run};
-use forms::SettingsSection;
-use model::{MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH};
 pub(crate) use app::refresh_app_menus;
+pub use app::{UiCommand, UiIntegration, UiRuntime, run};
+use forms::{SettingsSection, WorkspaceSurface};
+use model::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 pub(crate) use model::{
-    SeanceWorkspace, TerminalMetrics, TerminalRendererMetrics, local_session_display_number_for_ids,
-    session_kind_map_from_sessions,
+    SeanceWorkspace, TerminalMetrics, TerminalRendererMetrics,
+    local_session_display_number_for_ids, session_kind_map_from_sessions,
 };
 pub(crate) use surface::{
     CachedShapeLine, HslaKey, PreparedTerminalSurface, ShapeCache, ShapeCacheKey,
-    TerminalFragmentPlan, TerminalGlyphPolicy, TerminalPaintFragment, TerminalPaintQuad, TerminalPaintRow,
+    TerminalFragmentPlan, TerminalGlyphPolicy, TerminalPaintFragment, TerminalPaintQuad,
+    TerminalPaintRow,
 };
 pub use theme::ThemeId;
 
@@ -66,12 +68,11 @@ impl Render for SeanceWorkspace {
 
         let t = self.theme();
 
-        let main_content = if self.is_settings_panel_open() {
-            self.render_settings_panel(window, cx)
-        } else if self.sftp_browser.is_some() {
-            self.render_sftp_panel(window, cx)
-        } else {
-            self.render_terminal_shell(window, cx)
+        let main_content = match self.surface {
+            WorkspaceSurface::Terminal => self.render_terminal_shell(window, cx),
+            WorkspaceSurface::Settings => self.render_settings_panel(window, cx),
+            WorkspaceSurface::Sftp => self.render_sftp_panel(window, cx),
+            WorkspaceSurface::Secure => self.render_secure_workspace(window, cx),
         };
 
         let sidebar_resizing = self.sidebar_resizing;
@@ -96,14 +97,16 @@ impl Render for SeanceWorkspace {
             .flex()
             .bg(t.bg_deep)
             .text_color(t.text_primary)
-            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, window, _cx| {
-                if this.sidebar_resizing {
-                    let new_width = f32::from(event.position.x);
-                    this.sidebar_width = new_width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
-                    this.invalidate_terminal_surface();
-                    this.apply_active_terminal_geometry(window);
-                }
-            }))
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, window, _cx| {
+                    if this.sidebar_resizing {
+                        let new_width = f32::from(event.position.x);
+                        this.sidebar_width = new_width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+                        this.invalidate_terminal_surface();
+                        this.apply_active_terminal_geometry(window);
+                    }
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -134,8 +137,11 @@ impl Render for SeanceWorkspace {
                 this.toggle_perf_mode(window, cx);
             }))
             .on_action(cx.listener(|this, action: &ConnectHost, window, cx| {
-                this.selected_host_id = Some(action.host_id.clone());
-                this.connect_saved_host(&action.host_id, window, cx);
+                this.selected_host_id = Some(crate::workspace::host_scope_key(
+                    &action.vault_id,
+                    &action.host_id,
+                ));
+                this.connect_saved_host(&action.vault_id, &action.host_id, window, cx);
             }))
             .on_action(cx.listener(|this, action: &SelectSession, _window, cx| {
                 if this.backend.session(action.session_id).is_some() {
@@ -152,14 +158,11 @@ impl Render for SeanceWorkspace {
         if self.palette_open {
             root = root.child(deferred(self.render_palette_overlay(cx)).with_priority(1));
         }
-        if self.host_editor.is_some() {
-            root = root.child(deferred(self.render_host_editor_overlay(cx)).with_priority(2));
+        if self.vault_modal.is_visible() {
+            root = root.child(deferred(self.render_vault_modal(cx)).with_priority(3));
         }
-        if self.credential_editor.is_some() {
-            root = root.child(deferred(self.render_credential_editor_overlay()).with_priority(5));
-        }
-        if self.unlock_form.is_visible() {
-            root = root.child(deferred(self.render_unlock_overlay()).with_priority(3));
+        if self.confirm_dialog.is_some() {
+            root = root.child(deferred(self.render_confirm_dialog(cx)).with_priority(5));
         }
         if self.perf_overlay.mode.is_enabled() {
             root = root.child(deferred(self.render_perf_overlay()).with_priority(4));

@@ -10,7 +10,7 @@ pub use defaults::{DEFAULT_THEME_KEY, SUPPORTED_KEYBINDING_ACTIONS, SUPPORTED_TH
 pub use model::{
     AppConfig, AppearanceConfig, DebugConfig, KeybindingOverride, KeybindingsConfig,
     PerfHudDefault, TerminalConfig, UpdateConfig, UpdateInstallMode, UpdateReleaseChannel,
-    WindowConfig,
+    VaultRegistryConfig, VaultRegistryEntry, WindowConfig,
 };
 pub use storage::ConfigStore;
 pub use validation::ConfigError;

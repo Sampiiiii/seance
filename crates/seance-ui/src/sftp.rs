@@ -7,6 +7,7 @@ use seance_ssh::SftpEntry;
 
 use crate::{
     SIDEBAR_FONT_MONO, SeanceWorkspace,
+    forms::WorkspaceSurface,
     theme::Theme,
     ui_components::{format_file_size, format_unix_perms, sftp_file_glyph},
 };
@@ -132,13 +133,14 @@ impl SeanceWorkspace {
         let mut browser = SftpBrowserState::new(session_id, label, home);
         self.refresh_sftp_listing(&mut browser);
         self.sftp_browser = Some(browser);
-        self.settings_panel.open = false;
+        self.surface = WorkspaceSurface::Sftp;
         self.palette_open = false;
         cx.notify();
     }
 
     pub(crate) fn close_sftp_browser(&mut self, cx: &mut Context<Self>) {
         self.sftp_browser = None;
+        self.surface = WorkspaceSurface::Terminal;
         cx.notify();
     }
 
@@ -928,11 +930,7 @@ impl SeanceWorkspace {
             );
         content = content.child(status);
 
-        div()
-            .flex_1()
-            .h_full()
-            .flex()
-            .child(content)
+        div().flex_1().h_full().flex().child(content)
     }
 
     fn render_sftp_breadcrumb(

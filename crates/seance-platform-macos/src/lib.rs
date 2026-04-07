@@ -199,13 +199,28 @@ fn build_macos_menus(controller: &AppControllerHandle) -> Vec<Menu> {
 
 fn build_hosts_submenu(controller: &AppControllerHandle) -> Menu {
     let mut hosts = controller.list_hosts().unwrap_or_default();
-    hosts.sort_by(|left, right| left.label.to_lowercase().cmp(&right.label.to_lowercase()));
+    hosts.sort_by(|left, right| {
+        left.host
+            .label
+            .to_lowercase()
+            .cmp(&right.host.label.to_lowercase())
+            .then_with(|| left.vault_name.to_lowercase().cmp(&right.vault_name.to_lowercase()))
+    });
 
     Menu {
         name: "Connect to Host".into(),
         items: hosts
             .into_iter()
-            .map(|host| MenuItem::action(host.label, ConnectHost { host_id: host.id }))
+            .map(|host| {
+                let label = format!("{} ({})", host.host.label, host.vault_name);
+                MenuItem::action(
+                    label,
+                    ConnectHost {
+                        vault_id: host.vault_id,
+                        host_id: host.host.id,
+                    },
+                )
+            })
             .collect(),
     }
 }
@@ -245,8 +260,16 @@ fn build_themes_submenu() -> Menu {
 #[cfg(test)]
 fn host_menu_labels(controller: &AppControllerHandle) -> Vec<String> {
     let mut hosts = controller.list_hosts().unwrap_or_default();
-    hosts.sort_by(|left, right| left.label.to_lowercase().cmp(&right.label.to_lowercase()));
-    hosts.into_iter().map(|host| host.label).collect()
+    hosts.sort_by(|left, right| {
+        left.host
+            .label
+            .to_lowercase()
+            .cmp(&right.host.label.to_lowercase())
+            .then_with(|| left.vault_name.to_lowercase().cmp(&right.vault_name.to_lowercase()))
+    });
+    hosts.into_iter()
+        .map(|host| format!("{} ({})", host.host.label, host.vault_name))
+        .collect()
 }
 
 fn session_menu_labels(controller: &AppControllerHandle) -> Vec<String> {

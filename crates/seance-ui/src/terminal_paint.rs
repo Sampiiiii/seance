@@ -1,13 +1,12 @@
-use gpui::{
-    App, Bounds, Pixels, SharedString, TextRun, Window, fill, font, point, px, size,
+use gpui::{App, Bounds, Pixels, SharedString, TextRun, Window, fill, font, point, px, size};
+use seance_terminal::{
+    TerminalCell, TerminalCellStyle, TerminalColor, TerminalGeometry, TerminalRow,
 };
-use seance_terminal::{TerminalCell, TerminalCellStyle, TerminalColor, TerminalGeometry, TerminalRow};
 
 use crate::{
     CachedShapeLine, HslaKey, PreparedTerminalSurface, ShapeCache, ShapeCacheKey,
     TerminalFragmentPlan, TerminalGlyphPolicy, TerminalMetrics, TerminalPaintFragment,
-    TerminalPaintQuad, TerminalPaintRow, TerminalRendererMetrics, ThemeId,
-    theme::Theme,
+    TerminalPaintQuad, TerminalPaintRow, TerminalRendererMetrics, ThemeId, theme::Theme,
 };
 
 pub(crate) fn build_terminal_surface_rows(
@@ -434,10 +433,7 @@ pub(crate) fn is_terminal_special_glyph(ch: char) -> bool {
     )
 }
 
-pub(crate) fn resolve_terminal_foreground(
-    style: TerminalCellStyle,
-    theme: &Theme,
-) -> gpui::Hsla {
+pub(crate) fn resolve_terminal_foreground(style: TerminalCellStyle, theme: &Theme) -> gpui::Hsla {
     let base = style
         .foreground
         .map(terminal_color_to_hsla)
@@ -450,10 +446,7 @@ pub(crate) fn resolve_terminal_foreground(
     soften_faint_terminal_foreground(base, theme)
 }
 
-pub(crate) fn soften_faint_terminal_foreground(
-    base: gpui::Hsla,
-    theme: &Theme,
-) -> gpui::Hsla {
+pub(crate) fn soften_faint_terminal_foreground(base: gpui::Hsla, theme: &Theme) -> gpui::Hsla {
     let subdued = base.blend(theme.bg_void.alpha(0.62)).alpha(0.78);
     let cap = if lightness_distance(theme.text_ghost, theme.bg_void) >= 0.10 {
         theme.text_ghost

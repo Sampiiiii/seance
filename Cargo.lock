@@ -6117,6 +6117,7 @@ dependencies = [
  "seance-vault",
  "tempfile",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

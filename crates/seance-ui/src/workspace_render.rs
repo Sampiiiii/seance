@@ -7,17 +7,17 @@ use tracing::trace;
 
 use crate::{
     SIDEBAR_FONT_MONO, SIDEBAR_MONO_SIZE_PX, SeanceWorkspace,
-    forms::{CredentialField, SettingsSection, UnlockMode},
+    forms::{SettingsSection, UnlockMode},
     model::{TerminalMetrics, ToastState},
-    palette::{PaletteGroup, build_items},
+    palette::PaletteRow,
     perf::{RedrawReason, UiPerfMode},
     surface::PreparedTerminalSurface,
     terminal_paint::paint_terminal_surface,
     theme::ThemeId,
     ui_components::{
-        compact_perf_strings, editor_field_card, expanded_perf_strings,
-        frame_budget_color, masked_value, perf_mode_label, perf_row, perf_status_color,
-        settings_action_chip, unlock_field_card, update_status_label,
+        compact_perf_strings, expanded_perf_strings, frame_budget_color, masked_value,
+        perf_mode_label, perf_row, perf_status_color, settings_action_chip, unlock_field_card,
+        update_status_label,
     },
 };
 
@@ -64,7 +64,7 @@ impl SeanceWorkspace {
         let t = self.theme();
         let row = div()
             .px(px(12.0))
-            .py(px(6.0))
+            .py(px(8.0))
             .cursor_pointer()
             .flex()
             .items_center()
@@ -72,10 +72,9 @@ impl SeanceWorkspace {
 
         if active {
             row.border_l_2()
-                .border_color(t.sidebar_indicator)
+                .border_color(t.accent)
                 .bg(t.sidebar_row_active)
                 .rounded_r_md()
-                .shadow_sm()
         } else {
             row.ml(px(2.0))
                 .rounded_r_md()
@@ -88,19 +87,22 @@ impl SeanceWorkspace {
 
         div()
             .px(px(14.0))
-            .py(px(4.0))
+            .pt(px(2.0))
+            .pb(px(6.0))
             .flex()
             .items_center()
-            .gap(px(6.0))
+            .justify_between()
+            .border_b_1()
+            .border_color(t.sidebar_separator)
+            .mx(px(14.0))
             .child(
                 div()
                     .font_family(SIDEBAR_FONT_MONO)
                     .text_size(px(SIDEBAR_MONO_SIZE_PX))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(t.sidebar_section_label)
-                    .child(format!("-- {label}")),
+                    .child(label.to_uppercase()),
             )
-            .child(div().flex_1().h(px(1.0)).bg(t.accent_glow))
             .child(
                 div()
                     .font_family(SIDEBAR_FONT_MONO)
@@ -122,9 +124,12 @@ impl SeanceWorkspace {
             .pt(px(36.0))
             .px(px(14.0))
             .pb(px(10.0))
+            .mb(px(4.0))
             .flex()
             .items_center()
             .justify_between()
+            .border_b_1()
+            .border_color(t.sidebar_separator)
             .child(
                 div()
                     .flex()
@@ -133,7 +138,7 @@ impl SeanceWorkspace {
                     .child(
                         div()
                             .font_family(SIDEBAR_FONT_MONO)
-                            .text_size(px(13.0))
+                            .text_size(px(14.0))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(t.text_primary)
                             .child("séance"),
@@ -165,24 +170,28 @@ impl SeanceWorkspace {
 
     fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
-        let vault_status = self.backend.vault_status();
-        let device_unlock_warning = vault_status.device_unlock_message.clone();
-
-        let vault_label = if vault_status.unlocked {
-            "unlocked"
-        } else {
-            "locked"
-        };
+        let open_count = self.managed_vaults.iter().filter(|vault| vault.open).count();
+        let unlocked_count = self
+            .managed_vaults
+            .iter()
+            .filter(|vault| vault.unlocked)
+            .count();
+        let device_unlock_warning = self
+            .managed_vaults
+            .iter()
+            .find_map(|vault| vault.device_unlock_message.clone());
+        let vault_label = format!("{open_count} open / {unlocked_count} unlocked");
 
         let mut footer = div()
             .px(px(14.0))
             .pb(px(10.0))
+            .pt(px(8.0))
             .flex()
             .flex_col()
-            .gap(px(6.0))
+            .gap(px(8.0))
             .child(div().h(px(1.0)).bg(t.sidebar_separator))
             .child({
-                let mut theme_row = div().flex().items_center().gap(px(5.0)).flex_wrap();
+                let mut theme_row = div().flex().items_center().gap(px(7.0)).flex_wrap();
                 let active_theme = self.active_theme;
                 for &tid in ThemeId::ALL {
                     let tid_theme = tid.theme();
@@ -190,8 +199,8 @@ impl SeanceWorkspace {
                     let accent_color = tid_theme.accent;
                     theme_row = theme_row.child(
                         div()
-                            .w(px(10.0))
-                            .h(px(10.0))
+                            .w(px(11.0))
+                            .h(px(11.0))
                             .rounded_full()
                             .bg(accent_color)
                             .cursor_pointer()
@@ -233,7 +242,7 @@ impl SeanceWorkspace {
                                 div()
                                     .font_family(SIDEBAR_FONT_MONO)
                                     .text_size(px(SIDEBAR_MONO_SIZE_PX))
-                                    .text_color(if vault_status.unlocked {
+                                    .text_color(if unlocked_count > 0 {
                                         t.accent
                                     } else {
                                         t.warning
@@ -243,17 +252,9 @@ impl SeanceWorkspace {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
-                                    if this.vault_unlocked() {
-                                        this.lock_vault(cx);
-                                    } else {
-                                        this.unlock_form.reset_for_unlock();
-                                        this.unlock_form.message = Some(
-                                            "Enter the recovery passphrase to unlock the vault."
-                                                .into(),
-                                        );
-                                        this.perf_overlay.mark_input(RedrawReason::Input);
-                                        cx.notify();
-                                    }
+                                    this.open_vault_panel(cx);
+                                    this.perf_overlay.mark_input(RedrawReason::Input);
+                                    cx.notify();
                                 }),
                             ),
                     )
@@ -325,20 +326,19 @@ impl SeanceWorkspace {
             .flex_col()
             .justify_between()
             .bg(t.sidebar_bg_elevated)
-            .child({
-                let mut content = div()
+            .border_r_1()
+            .border_color(t.sidebar_edge)
+            .child(
+                div()
                     .flex_1()
                     .flex()
                     .flex_col()
                     .gap(px(16.0))
                     .child(self.render_sidebar_header(cx))
+                    .child(self.render_vault_section(cx))
                     .child(self.render_hosts_section(cx))
-                    .child(self.render_sessions_section(cx));
-                if self.vault_unlocked() {
-                    content = content.child(self.render_vault_section(cx));
-                }
-                content
-            })
+                    .child(self.render_sessions_section(cx)),
+            )
             .child(self.render_sidebar_footer(cx))
     }
 
@@ -551,30 +551,24 @@ impl SeanceWorkspace {
 
     pub(crate) fn render_palette_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme();
-        let session_labels = self.palette_session_labels();
-        let remote_ids = self.remote_session_ids();
-        let sessions = self.sessions();
-        let items = build_items(
-            &sessions,
-            &session_labels,
-            &self.saved_hosts,
-            &self.cached_credentials,
-            &self.cached_keys,
-            self.active_session_id,
-            self.active_theme,
-            &self.palette_query,
-            self.vault_unlocked(),
-            &remote_ids,
-            &self.update_state,
+        let view_model = self.palette_view_model();
+        trace!(
+            palette_items = view_model.items.len(),
+            "rendered palette overlay"
         );
-        trace!(palette_items = items.len(), "rendered palette overlay");
-        let selected = self.palette_selected.min(items.len().saturating_sub(1));
-        let show_groups = self.palette_query.is_empty();
+        let selected = self
+            .palette_selected
+            .min(view_model.items.len().saturating_sub(1));
 
-        let mut item_list = div().flex().flex_col().py_1();
+        let mut scrollable_list = div()
+            .id("palette-scroll")
+            .max_h(px(420.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.palette_scroll_handle)
+            .py_1();
 
-        if items.is_empty() {
-            item_list = item_list.child(
+        if view_model.items.is_empty() {
+            scrollable_list = scrollable_list.child(
                 div()
                     .py_3()
                     .flex()
@@ -585,37 +579,39 @@ impl SeanceWorkspace {
             );
         }
 
-        let mut prev_group: Option<PaletteGroup> = None;
+        for (row_index, palette_row) in view_model.rows.iter().enumerate() {
+            if let PaletteRow::Header(group) = palette_row {
+                let mut header = div()
+                    .px_4()
+                    .pt(px(if row_index == 0 { 6.0 } else { 12.0 }))
+                    .pb(px(4.0))
+                    .flex()
+                    .items_center()
+                    .gap_2();
 
-        for (idx, item) in items.iter().enumerate() {
-            if show_groups {
-                let cur_group = item.group;
-                if prev_group.map_or(true, |pg| pg != cur_group) {
-                    let is_first = prev_group.is_none();
-                    let mut header = div()
-                        .px_4()
-                        .pt(px(if is_first { 6.0 } else { 12.0 }))
-                        .pb(px(4.0))
-                        .flex()
-                        .items_center()
-                        .gap_2();
+                header = header
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(t.palette_group_label)
+                            .child(group.label()),
+                    )
+                    .child(div().flex_1().h(px(1.0)).bg(t.palette_group_separator));
 
-                    header = header
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(t.palette_group_label)
-                                .child(cur_group.label()),
-                        )
-                        .child(div().flex_1().h(px(1.0)).bg(t.palette_group_separator));
-
-                    item_list = item_list.child(header);
-                    prev_group = Some(cur_group);
-                }
+                scrollable_list = scrollable_list.child(header);
+                continue;
             }
 
-            let is_sel = idx == selected;
+            let PaletteRow::Item {
+                palette_index,
+                item,
+            } = palette_row
+            else {
+                continue;
+            };
+
+            let is_sel = *palette_index == selected;
             let action = item.action.clone();
 
             let mut row = div()
@@ -720,14 +716,8 @@ impl SeanceWorkspace {
                     }),
                 );
 
-            item_list = item_list.child(row);
+            scrollable_list = scrollable_list.child(row);
         }
-
-        let scrollable_list = div()
-            .id("palette-scroll")
-            .max_h(px(420.0))
-            .overflow_y_scroll()
-            .child(item_list);
 
         let panel = div()
             .w(px(560.0))
@@ -811,7 +801,7 @@ impl SeanceWorkspace {
                         div()
                             .text_xs()
                             .text_color(t.text_ghost)
-                            .child(format!("{} commands", items.len())),
+                            .child(format!("{} commands", view_model.items.len())),
                     ),
             );
 
@@ -826,20 +816,79 @@ impl SeanceWorkspace {
             .child(panel)
     }
 
-    pub(crate) fn render_unlock_overlay(&self) -> impl IntoElement {
+    pub(crate) fn render_vault_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme();
-        let create_mode = matches!(self.unlock_form.mode, UnlockMode::Create);
+        let create_mode = matches!(self.vault_modal.mode, UnlockMode::Create);
+        let rename_mode = matches!(self.vault_modal.mode, UnlockMode::Rename);
         let title = if create_mode {
             "Create Vault"
+        } else if rename_mode {
+            "Rename Vault"
         } else {
             "Unlock Vault"
         };
+        let using_passphrase =
+            self.vault_modal.unlock_method == seance_vault::UnlockMethod::Passphrase;
+        let show_passphrase_fields = create_mode || (!rename_mode && using_passphrase);
+        let field_count = self.vault_modal.passphrase_field_count();
+        let target_vault = self.vault_modal.target_vault_id.as_deref().and_then(|vault_id| {
+            self.managed_vaults
+                .iter()
+                .find(|vault| vault.vault_id == vault_id)
+        });
+        let device_available = target_vault
+            .map(|vault| vault.device_unlock_available)
+            .unwrap_or_else(|| self.backend.vault_status().device_unlock_available);
+        let modal_message = target_vault
+            .map(|vault| {
+                format!(
+                    "{}: {}",
+                    vault.name,
+                    self.vault_modal
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "Vault status unknown.".into())
+                )
+            })
+            .unwrap_or_else(|| {
+                self.vault_modal
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "Vault status unknown.".into())
+            });
+
+        let name_card = unlock_field_card(
+            "Vault Name",
+            self.vault_modal.vault_name.to_string(),
+            (create_mode || rename_mode) && self.vault_modal.selected_field == 0,
+            &t,
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                this.vault_modal.selected_field = 0;
+                cx.notify();
+            }),
+        );
 
         let passphrase_card = unlock_field_card(
             "Passphrase",
-            masked_value(&self.unlock_form.passphrase),
-            self.unlock_form.selected_field == 0,
+            if self.vault_modal.reveal_secret {
+                self.vault_modal.passphrase.to_string()
+            } else {
+                masked_value(&self.vault_modal.passphrase)
+            },
+            field_count > 0
+                && self.vault_modal.selected_field
+                    == if create_mode { 1 } else { 0 },
             &t,
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.vault_modal.selected_field = if create_mode { 1 } else { 0 };
+                cx.notify();
+            }),
         );
 
         let mut panel = div()
@@ -866,129 +915,131 @@ impl SeanceWorkspace {
                             .child(title),
                     )
                     .child(
-                        div().text_sm().text_color(t.text_muted).child(
-                            self.unlock_form
-                                .message
-                                .clone()
-                                .unwrap_or_else(|| "Vault status unknown.".into()),
-                        ),
-                    ),
-            )
-            .child(passphrase_card);
-
-        if create_mode {
-            panel = panel.child(unlock_field_card(
-                "Confirm Passphrase",
-                masked_value(&self.unlock_form.confirm_passphrase),
-                self.unlock_form.selected_field == 1,
-                &t,
-            ));
-        }
-
-        panel = panel.child(
-            div()
-                .pt_2()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(t.text_ghost)
-                        .child("tab move  enter submit"),
-                )
-                .child(
-                    div()
-                        .px_3()
-                        .py(px(6.0))
-                        .rounded_md()
-                        .bg(t.accent_glow)
-                        .text_xs()
-                        .text_color(t.text_primary)
-                        .child(if create_mode {
-                            "create vault"
-                        } else {
-                            "unlock vault"
-                        }),
-                ),
-        );
-
-        div()
-            .absolute()
-            .size_full()
-            .bg(t.scrim)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(panel)
-    }
-
-    pub(crate) fn render_credential_editor_overlay(&self) -> impl IntoElement {
-        let t = self.theme();
-        let Some(editor) = self.credential_editor.as_ref() else {
-            return div();
-        };
-
-        let title = if editor.credential_id.is_some() {
-            "Edit Credential"
-        } else {
-            "Add Credential"
-        };
-
-        let fields = [
-            (CredentialField::Label, editor.label.clone(), false),
-            (
-                CredentialField::UsernameHint,
-                editor.username_hint.clone(),
-                false,
-            ),
-            (CredentialField::Secret, editor.secret.clone(), true),
-        ];
-
-        let mut panel = div()
-            .w(px(520.0))
-            .bg(t.glass_strong)
-            .border_1()
-            .border_color(t.glass_border_bright)
-            .rounded_xl()
-            .shadow_lg()
-            .p_5()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(t.text_primary)
-                            .child(title),
-                    )
-                    .child(
                         div()
                             .text_sm()
                             .text_color(t.text_muted)
-                            .child(editor.message.clone().unwrap_or_default()),
+                            .child(modal_message),
                     ),
             );
 
-        for (idx, (field, value, is_secret)) in fields.into_iter().enumerate() {
-            let is_selected = idx == editor.selected_field;
-            let display_value = if is_secret && !is_selected {
-                "\u{2022}".repeat(value.len().min(20))
-            } else {
-                value
-            };
-            panel = panel.child(editor_field_card(
-                field.title(),
-                display_value,
-                is_selected,
-                &t,
-            ));
+        if !create_mode && !rename_mode {
+            let device_active =
+                self.vault_modal.unlock_method == seance_vault::UnlockMethod::Device;
+            panel = panel.child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(6.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if using_passphrase {
+                                t.accent
+                            } else {
+                                t.glass_border
+                            })
+                            .bg(if using_passphrase {
+                                t.accent_glow
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .text_xs()
+                            .text_color(t.text_primary)
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.vault_modal.unlock_method =
+                                        seance_vault::UnlockMethod::Passphrase;
+                                    this.vault_modal.selected_field = 0;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("use passphrase"),
+                    )
+                    .child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(6.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if device_active {
+                                t.accent
+                            } else {
+                                t.glass_border
+                            })
+                            .bg(if device_active {
+                                t.accent_glow
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .text_xs()
+                            .text_color(if device_available {
+                                t.text_primary
+                            } else {
+                                t.text_muted
+                            })
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    if device_available {
+                                        this.vault_modal.unlock_method =
+                                            seance_vault::UnlockMethod::Device;
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .child("use device unlock"),
+                    ),
+            );
+        }
+
+        if create_mode || rename_mode {
+            panel = panel.child(name_card);
+        }
+
+        if show_passphrase_fields {
+            panel = panel.child(passphrase_card);
+        }
+
+        if create_mode {
+            panel = panel.child(
+                unlock_field_card(
+                    "Confirm Passphrase",
+                    if self.vault_modal.reveal_secret {
+                        self.vault_modal.confirm_passphrase.to_string()
+                    } else {
+                        masked_value(&self.vault_modal.confirm_passphrase)
+                    },
+                    self.vault_modal.selected_field == 2,
+                    &t,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.vault_modal.selected_field = 2;
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+
+        if let Some(error) = self.vault_modal.error.as_ref() {
+            panel = panel.child(
+                div()
+                    .px_3()
+                    .py(px(8.0))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(t.warning)
+                    .bg(t.glass_tint)
+                    .text_sm()
+                    .text_color(t.warning)
+                    .child(error.clone()),
+            );
         }
 
         panel = panel.child(
@@ -1001,17 +1052,78 @@ impl SeanceWorkspace {
                     div()
                         .text_xs()
                         .text_color(t.text_ghost)
-                        .child("tab move  esc cancel  enter on password saves"),
+                        .child(if create_mode {
+                            "Tab moves fields, Enter submits."
+                        } else if rename_mode {
+                            "Enter a new vault name."
+                        } else if using_passphrase {
+                            "Use passphrase or device unlock."
+                        } else {
+                            "Device unlock can be submitted directly."
+                        }),
                 )
                 .child(
                     div()
-                        .px_3()
-                        .py(px(6.0))
-                        .rounded_md()
-                        .bg(t.accent_glow)
-                        .text_xs()
-                        .text_color(t.text_primary)
-                        .child("save credential"),
+                        .flex()
+                        .gap(px(8.0))
+                        .when(!rename_mode, |row| {
+                            row.child(
+                                settings_action_chip(
+                                    if self.vault_modal.reveal_secret {
+                                        "hide secret"
+                                    } else {
+                                        "show secret"
+                                    },
+                                    &t,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.vault_modal.reveal_secret =
+                                            !this.vault_modal.reveal_secret;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                        })
+                        .when(self.vault_modal.can_close(), |row| {
+                            row.child(settings_action_chip("cancel", &t).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.vault_modal.close();
+                                    cx.notify();
+                                }),
+                            ))
+                        })
+                        .child(
+                            div()
+                                .px_3()
+                                .py(px(6.0))
+                                .rounded_md()
+                                .bg(if self.vault_modal.can_submit() {
+                                    t.accent_glow
+                                } else {
+                                    t.glass_active
+                                })
+                                .text_xs()
+                                .text_color(t.text_primary)
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.submit_vault_modal(cx);
+                                    }),
+                                )
+                                .child(if create_mode {
+                                    "create vault"
+                                } else if rename_mode {
+                                    "rename vault"
+                                } else if using_passphrase {
+                                    "unlock vault"
+                                } else {
+                                    "unlock with device"
+                                }),
+                        ),
                 ),
         );
 

@@ -39,7 +39,7 @@ impl std::str::FromStr for RecordKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultHeader {
     pub vault_id: String,
     pub schema_version: u32,
@@ -50,7 +50,7 @@ pub struct VaultHeader {
     pub last_logical_clock: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryBundle {
     pub bundle_id: String,
     pub params: KdfParams,
@@ -60,7 +60,7 @@ pub struct RecoveryBundle {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceEnrollment {
     pub device_id: String,
     pub device_name: String,
@@ -71,8 +71,57 @@ pub struct DeviceEnrollment {
     pub revoked_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordSyncState {
+    Pending,
+    Synced,
+}
+
+impl RecordSyncState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Synced => "synced",
+        }
+    }
+}
+
+impl std::str::FromStr for RecordSyncState {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "synced" => Ok(Self::Synced),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EncryptedRecord {
+    pub record_id: String,
+    pub kind: RecordKind,
+    pub version: u32,
+    pub logical_clock: u64,
+    pub modified_at: i64,
+    pub deleted_at: Option<i64>,
+    pub key_nonce: Vec<u8>,
+    pub wrapped_record_key: Vec<u8>,
+    pub payload_nonce: Vec<u8>,
+    pub payload_ciphertext: Vec<u8>,
+    pub last_synced_clock: Option<u64>,
+    pub sync_state: RecordSyncState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncCursor {
+    pub logical_clock: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultDeltaRecord {
     pub record_id: String,
     pub kind: RecordKind,
     pub version: u32,
@@ -85,7 +134,30 @@ pub struct EncryptedRecord {
     pub payload_ciphertext: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSnapshot {
+    pub header: VaultHeader,
+    pub recovery_bundle: RecoveryBundle,
+    pub device_enrollments: Vec<DeviceEnrollment>,
+    pub records: Vec<VaultDeltaRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultDelta {
+    pub vault_id: String,
+    pub from_clock: u64,
+    pub to_clock: u64,
+    pub records: Vec<VaultDeltaRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplyDeltaReport {
+    pub applied_records: usize,
+    pub skipped_records: usize,
+    pub new_cursor: SyncCursor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultHostProfile {
     pub id: String,
     pub label: String,
@@ -112,7 +184,7 @@ pub enum HostAuthRef {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultPasswordCredential {
     pub id: String,
     pub label: String,
@@ -121,7 +193,7 @@ pub struct VaultPasswordCredential {
     pub secret: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultPrivateKey {
     pub id: String,
     pub label: String,
@@ -164,7 +236,7 @@ pub struct ImportKeyRequest {
     pub private_key_pem: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostSummary {
     pub id: String,
     pub label: String,
@@ -174,7 +246,7 @@ pub struct HostSummary {
     pub modified_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CredentialSummary {
     pub id: String,
     pub label: String,
@@ -182,7 +254,7 @@ pub struct CredentialSummary {
     pub modified_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KeySummary {
     pub id: String,
     pub label: String,
@@ -225,6 +297,40 @@ impl VaultPrivateKey {
             encrypted_at_rest: self.encrypted_at_rest,
             source: self.source.clone(),
             modified_at,
+        }
+    }
+}
+
+impl From<EncryptedRecord> for VaultDeltaRecord {
+    fn from(record: EncryptedRecord) -> Self {
+        Self {
+            record_id: record.record_id,
+            kind: record.kind,
+            version: record.version,
+            logical_clock: record.logical_clock,
+            modified_at: record.modified_at,
+            deleted_at: record.deleted_at,
+            key_nonce: record.key_nonce,
+            wrapped_record_key: record.wrapped_record_key,
+            payload_nonce: record.payload_nonce,
+            payload_ciphertext: record.payload_ciphertext,
+        }
+    }
+}
+
+impl From<&EncryptedRecord> for VaultDeltaRecord {
+    fn from(record: &EncryptedRecord) -> Self {
+        Self {
+            record_id: record.record_id.clone(),
+            kind: record.kind,
+            version: record.version,
+            logical_clock: record.logical_clock,
+            modified_at: record.modified_at,
+            deleted_at: record.deleted_at,
+            key_nonce: record.key_nonce.clone(),
+            wrapped_record_key: record.wrapped_record_key.clone(),
+            payload_nonce: record.payload_nonce.clone(),
+            payload_ciphertext: record.payload_ciphertext.clone(),
         }
     }
 }

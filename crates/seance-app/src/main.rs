@@ -35,9 +35,9 @@ fn main() -> anyhow::Result<()> {
                                 target: seance_core::WindowTarget::MostRecentOrNew,
                             });
                         }
-                        PlatformEvent::OpenHost { host_id } => {
+                        PlatformEvent::OpenHost { vault_id, host_id } => {
                             let _ = ui_tx_for_ipc.send(UiCommand::ActivateApp);
-                            let _ = ui_tx_for_ipc.send(UiCommand::OpenHost { host_id });
+                            let _ = ui_tx_for_ipc.send(UiCommand::OpenHost { vault_id, host_id });
                         }
                     }
                 }

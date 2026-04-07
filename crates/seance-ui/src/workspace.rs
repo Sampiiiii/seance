@@ -2,24 +2,44 @@
 
 use std::{sync::Arc, time::Instant};
 
-use gpui::{App, Context, FocusHandle, Focusable, KeyDownEvent, Window, font, px};
+use gpui::{App, Context, FocusHandle, Focusable, KeyDownEvent, Window, font, point, px};
 use seance_config::AppConfig;
 use seance_core::UpdateState;
 use seance_terminal::TerminalGeometry;
-use seance_vault::SecretString;
+use seance_vault::{SecretString, UnlockMethod};
 use tracing::trace;
 
 use crate::{
     app::{InitialWorkspaceAction, refresh_app_menus},
-    forms::{CredentialEditorState, CredentialField, HostField, SettingsSection, UnlockMode},
+    forms::{
+        CredentialDraftField, HostDraftField, SecureInputTarget, SecureSection, SettingsSection,
+        UnlockMode, VaultModalOrigin, WorkspaceSurface,
+    },
     model::{SeanceWorkspace, TerminalMetrics, TerminalRendererMetrics},
-    palette::{PaletteAction, build_items},
+    palette::{
+        PageDirection, PaletteAction, PaletteViewModel, build_items, flatten_items,
+        page_target_index,
+    },
     perf::{RedrawReason, UiPerfMode},
     surface::ShapeCache,
     terminal_paint::build_terminal_surface_rows,
     theme::Theme,
     ui_components::{compute_terminal_geometry, theme_id_from_config, update_status_label},
 };
+
+const SCOPE_KEY_SEPARATOR: &str = "::";
+
+pub(crate) fn item_scope_key(vault_id: &str, item_id: &str) -> String {
+    format!("{vault_id}{SCOPE_KEY_SEPARATOR}{item_id}")
+}
+
+pub(crate) fn host_scope_key(vault_id: &str, host_id: &str) -> String {
+    item_scope_key(vault_id, host_id)
+}
+
+pub(crate) fn split_scope_key(scope_key: &str) -> Option<(&str, &str)> {
+    scope_key.split_once(SCOPE_KEY_SEPARATOR)
+}
 
 impl SeanceWorkspace {
     pub(crate) fn apply_initial_action(
@@ -29,9 +49,9 @@ impl SeanceWorkspace {
         cx: &mut Context<Self>,
     ) {
         match action {
-            InitialWorkspaceAction::ConnectHost(host_id) => {
-                self.selected_host_id = Some(host_id.clone());
-                self.connect_saved_host(&host_id, window, cx);
+            InitialWorkspaceAction::ConnectHost { vault_id, host_id } => {
+                self.selected_host_id = Some(host_scope_key(&vault_id, &host_id));
+                self.connect_saved_host(&vault_id, &host_id, window, cx);
             }
             InitialWorkspaceAction::CheckForUpdates => self.check_for_updates(cx),
             InitialWorkspaceAction::OpenPreferences => {
@@ -153,8 +173,9 @@ impl SeanceWorkspace {
         };
 
         let metrics = self.terminal_metrics(window);
-        let geometry = compute_terminal_geometry(window.viewport_size(), metrics, self.sidebar_width)
-            .unwrap_or_else(TerminalGeometry::default);
+        let geometry =
+            compute_terminal_geometry(window.viewport_size(), metrics, self.sidebar_width)
+                .unwrap_or_else(TerminalGeometry::default);
         self.active_terminal_rows = geometry.size.rows as usize;
 
         if self.last_applied_geometry == Some(geometry) {
@@ -333,82 +354,200 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
-    pub(crate) fn submit_unlock_form(&mut self, cx: &mut Context<Self>) {
-        match self.unlock_form.mode {
+    pub(crate) fn open_vault_modal(
+        &mut self,
+        mode: UnlockMode,
+        origin: VaultModalOrigin,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_vault_modal_for(None, mode, origin, message, cx);
+    }
+
+    pub(crate) fn open_vault_modal_for(
+        &mut self,
+        target_vault_id: Option<String>,
+        mode: UnlockMode,
+        origin: VaultModalOrigin,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.vault_modal.open(mode, origin, message);
+        self.vault_modal.target_vault_id = target_vault_id.clone();
+        if matches!(mode, UnlockMode::Create) {
+            self.vault_modal.vault_name = format!("Vault {}", self.managed_vaults.len() + 1).into();
+        } else if matches!(mode, UnlockMode::Rename)
+            && let Some(vault) = target_vault_id.as_deref().and_then(|vault_id| {
+                self.managed_vaults
+                    .iter()
+                    .find(|vault| vault.vault_id == vault_id)
+            })
+        {
+            self.vault_modal.vault_name = vault.name.clone().into();
+        }
+
+        let device_unlock_available = target_vault_id
+            .as_deref()
+            .and_then(|vault_id| {
+                self.managed_vaults
+                    .iter()
+                    .find(|vault| vault.vault_id == vault_id)
+                    .map(|vault| vault.device_unlock_available)
+            })
+            .unwrap_or_else(|| self.backend.vault_status().device_unlock_available);
+
+        if matches!(mode, UnlockMode::Unlock) && device_unlock_available {
+            self.vault_modal.unlock_method = UnlockMethod::Device;
+        }
+        self.perf_overlay.mark_input(RedrawReason::Input);
+        cx.notify();
+    }
+
+    pub(crate) fn submit_vault_modal(&mut self, cx: &mut Context<Self>) {
+        self.vault_modal.error = None;
+        self.vault_modal.busy = true;
+        let target_vault_id = self.vault_modal.target_vault_id.clone().or_else(|| {
+            self.managed_vaults
+                .iter()
+                .find(|vault| vault.open && !vault.unlocked)
+                .or_else(|| self.managed_vaults.iter().find(|vault| !vault.unlocked))
+                .map(|vault| vault.vault_id.clone())
+        });
+
+        match self.vault_modal.mode {
             UnlockMode::Create => {
-                if self.unlock_form.passphrase.trim().is_empty() {
-                    self.unlock_form.message =
-                        Some("Choose a non-empty recovery passphrase.".into());
-                } else if self.unlock_form.passphrase != self.unlock_form.confirm_passphrase {
-                    self.unlock_form.message = Some("Passphrases do not match yet.".into());
+                if !self.vault_modal.can_submit() {
+                    self.vault_modal.error = Some(
+                        "Choose a vault name and a non-empty matching recovery passphrase.".into(),
+                    );
                 } else {
-                    let passphrase = SecretString::from(self.unlock_form.passphrase.to_string());
-                    let result = self.backend.create_vault(&passphrase, "This Device");
-                    self.unlock_form.passphrase.clear();
-                    self.unlock_form.confirm_passphrase.clear();
-                    match result {
-                        Ok(()) => {
-                            let vault_status = self.backend.vault_status();
-                            self.unlock_form.completed = true;
-                            self.show_toast(
-                                if vault_status.device_unlock_message.is_some() {
-                                    "Encrypted vault created. Touch ID is not available for this build yet."
-                                } else {
-                                    "Encrypted vault created. Device unlock is now enrolled."
-                                },
-                            );
+                    let passphrase = SecretString::from(self.vault_modal.passphrase.to_string());
+                    let next_name = self.vault_modal.vault_name.trim().to_string();
+                    match self
+                        .backend
+                        .create_vault(next_name, &passphrase, "This Device")
+                    {
+                        Ok(summary) => {
+                            self.vault_modal.close();
+                            self.show_toast(if summary.device_unlock_message.is_some() {
+                                "Encrypted vault created. Device unlock still needs attention."
+                            } else {
+                                "Encrypted vault created."
+                            });
                             self.refresh_saved_hosts();
                             self.refresh_vault_cache();
                         }
+                        Err(err) => self.vault_modal.error = Some(err.to_string()),
+                    }
+                }
+            }
+            UnlockMode::Rename => {
+                let next_name = self.vault_modal.vault_name.trim().to_string();
+                match target_vault_id.as_deref() {
+                    Some(vault_id) if !next_name.is_empty() => {
+                        match self.backend.rename_vault(vault_id, next_name) {
+                            Ok(_) => {
+                                self.vault_modal.close();
+                                self.show_toast("Vault renamed.");
+                                self.refresh_saved_hosts();
+                                self.refresh_vault_cache();
+                            }
+                            Err(err) => self.vault_modal.error = Some(err.to_string()),
+                        }
+                    }
+                    Some(_) => {
+                        self.vault_modal.error = Some("Enter a vault name.".into());
+                    }
+                    None => {
+                        self.vault_modal.error = Some("No vault is selected to rename.".into());
+                    }
+                }
+            }
+            UnlockMode::Unlock => match self.vault_modal.unlock_method {
+                UnlockMethod::Device => match target_vault_id.as_deref() {
+                    Some(vault_id) => match self.backend.try_unlock_with_device(vault_id) {
+                        Ok(true) => {
+                            self.vault_modal.close();
+                            self.show_toast("Vault unlocked from device credentials.");
+                            self.refresh_saved_hosts();
+                            self.refresh_vault_cache();
+                        }
+                        Ok(false) => {
+                            self.vault_modal.unlock_method = UnlockMethod::Passphrase;
+                            self.vault_modal.error = Some(
+                                "Device unlock failed. Enter your recovery passphrase.".into(),
+                            );
+                        }
                         Err(err) => {
-                            self.unlock_form.message = Some(err.to_string());
+                            self.vault_modal.unlock_method = UnlockMethod::Passphrase;
+                            self.vault_modal.error =
+                                Some(format!("{}. Enter your recovery passphrase.", err));
+                        }
+                    },
+                    None => {
+                        self.vault_modal.error = Some("No locked vault is available to unlock.".into())
+                    }
+                },
+                UnlockMethod::Passphrase => {
+                    if !self.vault_modal.can_submit() {
+                        self.vault_modal.error =
+                            Some("Enter the recovery passphrase to unlock the vault.".into());
+                    } else {
+                        let passphrase =
+                            SecretString::from(self.vault_modal.passphrase.to_string());
+                        match target_vault_id.as_deref() {
+                            Some(vault_id) => {
+                                match self.backend.unlock_vault(vault_id, &passphrase, "This Device")
+                                {
+                                    Ok(()) => {
+                                        self.vault_modal.close();
+                                        self.show_toast("Vault unlocked.");
+                                        self.refresh_saved_hosts();
+                                        self.refresh_vault_cache();
+                                    }
+                                    Err(err) => self.vault_modal.error = Some(err.to_string()),
+                                }
+                            }
+                            None => {
+                                self.vault_modal.error =
+                                    Some("No locked vault is available to unlock.".into());
+                            }
                         }
                     }
                 }
-            }
-            UnlockMode::Unlock => {
-                let passphrase = SecretString::from(self.unlock_form.passphrase.to_string());
-                let result = self.backend.unlock_vault(&passphrase, "This Device");
-                self.unlock_form.passphrase.clear();
-                self.unlock_form.confirm_passphrase.clear();
-                match result {
-                    Ok(()) => {
-                        let vault_status = self.backend.vault_status();
-                        self.unlock_form.completed = true;
-                        self.show_toast(
-                            if vault_status.device_unlock_message.is_some() {
-                                "Vault unlocked from the recovery passphrase. Touch ID is not available for this build yet."
-                            } else {
-                                "Vault unlocked from the recovery passphrase."
-                            },
-                        );
-                        self.refresh_saved_hosts();
-                        self.refresh_vault_cache();
-                    }
-                    Err(err) => {
-                        self.unlock_form.message = Some(err.to_string());
-                    }
-                }
-            }
+            },
         }
 
+        self.vault_modal.busy = false;
         self.perf_overlay.mark_input(RedrawReason::Input);
         refresh_app_menus(cx);
         cx.notify();
     }
 
     pub(crate) fn lock_vault(&mut self, cx: &mut Context<Self>) {
-        self.backend.lock_vault();
+        for vault in self
+            .managed_vaults
+            .iter()
+            .filter(|vault| vault.unlocked)
+            .map(|vault| vault.vault_id.clone())
+            .collect::<Vec<_>>()
+        {
+            let _ = self.backend.lock_vault(&vault);
+        }
+        self.refresh_managed_vaults();
         self.saved_hosts.clear();
         self.cached_credentials.clear();
         self.cached_keys.clear();
         self.selected_host_id = None;
-        self.host_editor = None;
-        self.credential_editor = None;
-        self.settings_panel.open = false;
-        self.unlock_form.reset_for_unlock();
-        self.unlock_form.message =
-            Some("Vault locked. Decrypted records were cleared from memory.".into());
+        self.secure.host_draft = None;
+        self.secure.credential_draft = None;
+        self.confirm_dialog = None;
+        self.surface = WorkspaceSurface::Terminal;
+        self.vault_modal.open(
+            UnlockMode::Unlock,
+            VaultModalOrigin::UserAction,
+            "Vault locked. Decrypted records were cleared from memory.".into(),
+        );
         self.show_toast("Vault locked.");
         self.palette_open = false;
         self.invalidate_terminal_surface();
@@ -424,9 +563,85 @@ impl SeanceWorkspace {
             self.palette_open = true;
             self.palette_query.clear();
             self.palette_selected = 0;
+            self.reset_palette_scroll_to_top();
         }
         self.perf_overlay.mark_input(RedrawReason::Palette);
         cx.notify();
+    }
+
+    pub(crate) fn palette_view_model(&self) -> PaletteViewModel {
+        let session_labels = self.palette_session_labels();
+        let remote_ids = self.remote_session_ids();
+        let sessions = self.sessions();
+        let items = build_items(
+            &sessions,
+            &session_labels,
+            &self.saved_hosts,
+            &self.cached_credentials,
+            &self.cached_keys,
+            self.active_session_id,
+            self.active_theme,
+            &self.palette_query,
+            self.vault_unlocked(),
+            &remote_ids,
+            &self.update_state,
+        );
+
+        flatten_items(items, self.palette_query.is_empty())
+    }
+
+    fn set_palette_selection(&mut self, new_index: usize, scroll_into_view: bool) {
+        let view_model = self.palette_view_model();
+        self.palette_selected = if view_model.items.is_empty() {
+            0
+        } else {
+            new_index.min(view_model.items.len().saturating_sub(1))
+        };
+
+        if scroll_into_view {
+            let row_index = view_model.item_to_row.get(self.palette_selected).copied();
+            if let Some(row_index) = row_index {
+                self.scroll_palette_selection_into_view(row_index);
+            }
+        }
+    }
+
+    fn scroll_palette_selection_into_view(&mut self, row_index: usize) {
+        self.palette_scroll_handle.scroll_to_item(row_index);
+    }
+
+    fn reset_palette_scroll_to_top(&mut self) {
+        self.palette_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
+    }
+
+    fn palette_visible_row_span(&self) -> usize {
+        if self.palette_scroll_handle.children_count() == 0 {
+            8
+        } else {
+            self.palette_scroll_handle
+                .bottom_item()
+                .saturating_sub(self.palette_scroll_handle.top_item())
+                .max(1)
+        }
+    }
+
+    fn move_palette_by_page(&mut self, direction: PageDirection) {
+        let view_model = self.palette_view_model();
+        if view_model.items.is_empty() {
+            self.palette_selected = 0;
+            return;
+        }
+
+        let next_index = page_target_index(
+            &view_model.row_to_item,
+            &view_model.item_to_row,
+            self.palette_selected
+                .min(view_model.items.len().saturating_sub(1)),
+            self.palette_visible_row_span(),
+            direction,
+        );
+        self.set_palette_selection(next_index, true);
     }
 
     pub(crate) fn execute_palette_action(
@@ -452,9 +667,12 @@ impl SeanceWorkspace {
                 self.persist_theme(tid, window, cx);
             }
             PaletteAction::UnlockVault => {
-                self.unlock_form.reset_for_unlock();
-                self.unlock_form.message =
-                    Some("Enter the recovery passphrase to unlock the vault.".into());
+                self.open_vault_modal(
+                    UnlockMode::Unlock,
+                    VaultModalOrigin::UserAction,
+                    "Enter the recovery passphrase to unlock the vault.".into(),
+                    cx,
+                );
             }
             PaletteAction::LockVault => {
                 self.lock_vault(cx);
@@ -469,14 +687,30 @@ impl SeanceWorkspace {
                 return;
             }
             PaletteAction::AddPasswordCredential => {
-                self.credential_editor = Some(CredentialEditorState::blank());
+                self.open_secure_workspace(SecureSection::Credentials, cx);
+                self.activate_credential_draft(
+                    None,
+                    crate::forms::CredentialDraftOrigin::Standalone,
+                    cx,
+                );
             }
-            PaletteAction::EditPasswordCredential(id) => {
-                self.begin_edit_credential(&id, cx);
+            PaletteAction::EditPasswordCredential {
+                vault_id,
+                credential_id,
+            } => {
+                self.open_secure_workspace(SecureSection::Credentials, cx);
+                self.activate_credential_draft(
+                    Some(&item_scope_key(&vault_id, &credential_id)),
+                    crate::forms::CredentialDraftOrigin::Standalone,
+                    cx,
+                );
                 return;
             }
-            PaletteAction::DeletePasswordCredential(id) => {
-                self.delete_credential(&id, cx);
+            PaletteAction::DeletePasswordCredential {
+                vault_id,
+                credential_id,
+            } => {
+                self.attempt_delete_credential(&item_scope_key(&vault_id, &credential_id), cx);
                 return;
             }
             PaletteAction::ImportPrivateKey => {
@@ -485,43 +719,27 @@ impl SeanceWorkspace {
                 );
             }
             PaletteAction::GenerateEd25519Key => {
-                match self
-                    .backend
-                    .generate_ed25519_key(format!("ed25519-{}", crate::now_ui_suffix()))
-                {
-                    Ok(summary) => {
-                        self.show_toast(format!("Generated vault-backed key '{}'.", summary.label));
-                        self.refresh_vault_cache();
-                    }
-                    Err(err) => self.show_toast(err.to_string()),
-                }
+                self.open_secure_workspace(SecureSection::Keys, cx);
+                self.generate_ed25519_key_for_secure(cx);
             }
             PaletteAction::GenerateRsaKey => {
-                match self
-                    .backend
-                    .generate_rsa_key(format!("rsa-{}", crate::now_ui_suffix()))
-                {
-                    Ok(summary) => {
-                        self.show_toast(format!("Generated vault-backed key '{}'.", summary.label));
-                        self.refresh_vault_cache();
-                    }
-                    Err(err) => self.show_toast(err.to_string()),
-                }
+                self.open_secure_workspace(SecureSection::Keys, cx);
+                self.generate_rsa_key_for_secure(cx);
             }
-            PaletteAction::DeletePrivateKey(id) => {
-                self.delete_private_key(&id, cx);
+            PaletteAction::DeletePrivateKey { vault_id, key_id } => {
+                self.attempt_delete_private_key(&item_scope_key(&vault_id, &key_id), cx);
                 return;
             }
-            PaletteAction::EditSavedHost(id) => {
-                self.begin_edit_host(&id, cx);
+            PaletteAction::EditSavedHost { vault_id, host_id } => {
+                self.begin_edit_host(&host_scope_key(&vault_id, &host_id), cx);
                 return;
             }
-            PaletteAction::DeleteSavedHost(id) => {
-                self.delete_saved_host(&id, cx);
+            PaletteAction::DeleteSavedHost { vault_id, host_id } => {
+                self.delete_saved_host(&host_scope_key(&vault_id, &host_id), cx);
                 return;
             }
-            PaletteAction::ConnectSavedHost(id) => {
-                self.connect_saved_host(&id, window, cx);
+            PaletteAction::ConnectSavedHost { vault_id, host_id } => {
+                self.connect_saved_host(&vault_id, &host_id, window, cx);
                 return;
             }
             PaletteAction::OpenSftpBrowser(session_id) => {
@@ -537,6 +755,7 @@ impl SeanceWorkspace {
         self.palette_open = false;
         self.palette_query.clear();
         self.palette_selected = 0;
+        self.reset_palette_scroll_to_top();
         cx.notify();
     }
 
@@ -548,16 +767,16 @@ impl SeanceWorkspace {
     ) {
         let key = event.keystroke.key.as_str();
 
-        if self.unlock_form.is_visible() {
-            self.handle_unlock_key(event, cx);
+        if self.confirm_dialog.is_some() {
+            match key {
+                "escape" => self.cancel_confirm_dialog(cx),
+                "enter" => self.confirm_dialog_primary(cx),
+                _ => {}
+            }
             return;
         }
-        if self.credential_editor.is_some() {
-            self.handle_credential_editor_key(event, cx);
-            return;
-        }
-        if self.host_editor.is_some() {
-            self.handle_host_editor_key(event, cx);
+        if self.vault_modal.is_visible() {
+            self.handle_vault_modal_key(event, cx);
             return;
         }
 
@@ -566,14 +785,19 @@ impl SeanceWorkspace {
             return;
         }
 
-        if self.sftp_browser.is_some() {
+        if self.surface == WorkspaceSurface::Sftp && self.sftp_browser.is_some() {
             self.handle_sftp_key(event, window, cx);
             return;
         }
 
-        if self.is_settings_panel_open() && key == "escape" {
+        if self.surface == WorkspaceSurface::Settings && key == "escape" {
             self.close_settings_panel(cx);
             self.perf_overlay.mark_input(RedrawReason::Input);
+            return;
+        }
+
+        if self.surface == WorkspaceSurface::Secure {
+            self.handle_secure_key(event, cx);
             return;
         }
 
@@ -604,52 +828,41 @@ impl SeanceWorkspace {
                 cx.notify();
             }
             "up" => {
-                self.palette_selected = self.palette_selected.saturating_sub(1);
+                self.set_palette_selection(self.palette_selected.saturating_sub(1), true);
                 self.perf_overlay.mark_input(RedrawReason::Palette);
                 cx.notify();
             }
             "down" => {
-                let session_labels = self.palette_session_labels();
-                let remote_ids = self.remote_session_ids();
-                let sessions = self.sessions();
-                let count = build_items(
-                    &sessions,
-                    &session_labels,
-                    &self.saved_hosts,
-                    &self.cached_credentials,
-                    &self.cached_keys,
-                    self.active_session_id,
-                    self.active_theme,
-                    &self.palette_query,
-                    self.vault_unlocked(),
-                    &remote_ids,
-                    &self.update_state,
-                )
-                .len();
-                if self.palette_selected + 1 < count {
-                    self.palette_selected += 1;
+                self.set_palette_selection(self.palette_selected.saturating_add(1), true);
+                self.perf_overlay.mark_input(RedrawReason::Palette);
+                cx.notify();
+            }
+            "home" => {
+                self.set_palette_selection(0, true);
+                self.perf_overlay.mark_input(RedrawReason::Palette);
+                cx.notify();
+            }
+            "end" => {
+                let count = self.palette_view_model().items.len();
+                if count > 0 {
+                    self.set_palette_selection(count - 1, true);
                 }
                 self.perf_overlay.mark_input(RedrawReason::Palette);
                 cx.notify();
             }
+            "pageup" => {
+                self.move_palette_by_page(PageDirection::Up);
+                self.perf_overlay.mark_input(RedrawReason::Palette);
+                cx.notify();
+            }
+            "pagedown" => {
+                self.move_palette_by_page(PageDirection::Down);
+                self.perf_overlay.mark_input(RedrawReason::Palette);
+                cx.notify();
+            }
             "enter" => {
-                let session_labels = self.palette_session_labels();
-                let remote_ids = self.remote_session_ids();
-                let sessions = self.sessions();
-                let items = build_items(
-                    &sessions,
-                    &session_labels,
-                    &self.saved_hosts,
-                    &self.cached_credentials,
-                    &self.cached_keys,
-                    self.active_session_id,
-                    self.active_theme,
-                    &self.palette_query,
-                    self.vault_unlocked(),
-                    &remote_ids,
-                    &self.update_state,
-                );
-                if let Some(item) = items.get(self.palette_selected) {
+                let view_model = self.palette_view_model();
+                if let Some(item) = view_model.items.get(self.palette_selected) {
                     let action = item.action.clone();
                     self.execute_palette_action(action, window, cx);
                 }
@@ -657,16 +870,18 @@ impl SeanceWorkspace {
             "backspace" => {
                 self.palette_query.pop();
                 self.palette_selected = 0;
+                self.reset_palette_scroll_to_top();
                 self.perf_overlay.mark_input(RedrawReason::Palette);
                 cx.notify();
             }
-            "tab" | "left" | "right" | "home" | "end" | "pageup" | "pagedown" => {}
+            "tab" | "left" | "right" => {}
             _ => {
                 if let Some(ch) = key_char {
                     let modifiers = event.keystroke.modifiers;
                     if !modifiers.platform && !modifiers.control && !modifiers.function {
                         self.palette_query.push_str(ch);
                         self.palette_selected = 0;
+                        self.reset_palette_scroll_to_top();
                         self.perf_overlay.mark_input(RedrawReason::Palette);
                         cx.notify();
                     }
@@ -675,48 +890,65 @@ impl SeanceWorkspace {
         }
     }
 
-    fn handle_unlock_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn handle_vault_modal_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let key_char = event.keystroke.key_char.as_deref();
+        let modifiers = event.keystroke.modifiers;
+        let field_count = self.vault_modal.passphrase_field_count();
 
         match key {
             "tab" | "down" => {
-                let count = if matches!(self.unlock_form.mode, UnlockMode::Create) {
-                    2
-                } else {
-                    1
-                };
-                self.unlock_form.selected_field = (self.unlock_form.selected_field + 1) % count;
+                if field_count > 0 {
+                    self.vault_modal.selected_field =
+                        (self.vault_modal.selected_field + 1) % field_count;
+                }
             }
             "up" => {
-                let count = if matches!(self.unlock_form.mode, UnlockMode::Create) {
-                    2
-                } else {
-                    1
-                };
-                self.unlock_form.selected_field =
-                    (self.unlock_form.selected_field + count - 1) % count;
+                if field_count > 0 {
+                    self.vault_modal.selected_field =
+                        (self.vault_modal.selected_field + field_count - 1) % field_count;
+                }
             }
             "backspace" => {
-                if self.unlock_form.selected_field == 0 {
-                    self.unlock_form.passphrase.pop();
-                } else {
-                    self.unlock_form.confirm_passphrase.pop();
+                if matches!(self.vault_modal.mode, UnlockMode::Create | UnlockMode::Rename)
+                    && self.vault_modal.selected_field == 0
+                {
+                    self.vault_modal.vault_name.pop();
+                } else if self.vault_modal.selected_field == 0 {
+                    self.vault_modal.passphrase.pop();
+                } else if matches!(self.vault_modal.mode, UnlockMode::Create)
+                    && self.vault_modal.selected_field == 1
+                {
+                    self.vault_modal.passphrase.pop();
+                } else if field_count > 1 {
+                    self.vault_modal.confirm_passphrase.pop();
                 }
             }
             "enter" => {
-                self.submit_unlock_form(cx);
+                self.submit_vault_modal(cx);
                 return;
             }
-            "escape" => {}
+            "escape" => {
+                if self.vault_modal.can_close() {
+                    self.vault_modal.close();
+                    cx.notify();
+                }
+            }
             _ => {
                 if let Some(ch) = key_char {
-                    let modifiers = event.keystroke.modifiers;
                     if !modifiers.platform && !modifiers.control && !modifiers.function {
-                        if self.unlock_form.selected_field == 0 {
-                            self.unlock_form.passphrase.push_str(ch);
-                        } else {
-                            self.unlock_form.confirm_passphrase.push_str(ch);
+                        if matches!(self.vault_modal.mode, UnlockMode::Create | UnlockMode::Rename)
+                            && self.vault_modal.selected_field == 0
+                        {
+                            self.vault_modal.vault_name.push_str(ch);
+                        } else if self.vault_modal.selected_field == 0 {
+                            self.vault_modal.passphrase.push_str(ch);
+                        } else if matches!(self.vault_modal.mode, UnlockMode::Create)
+                            && self.vault_modal.selected_field == 1
+                        {
+                            self.vault_modal.passphrase.push_str(ch);
+                        } else if field_count > 1 {
+                            self.vault_modal.confirm_passphrase.push_str(ch);
                         }
                     }
                 }
@@ -727,95 +959,41 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
-    fn handle_host_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn handle_secure_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let key_char = event.keystroke.key_char.as_deref();
         let modifiers = event.keystroke.modifiers;
 
         if modifiers.platform && key == "s" {
-            self.save_host_editor(cx);
+            if self.secure.host_draft.is_some() {
+                self.save_host_draft(cx);
+            } else if self.secure.credential_draft.is_some() {
+                self.save_credential_draft(cx);
+            }
             return;
         }
 
-        let Some(editor) = self.host_editor.as_mut() else {
-            return;
-        };
-
-        let in_auth = matches!(editor.field(), HostField::Auth);
-
         match key {
             "escape" => {
-                self.host_editor = None;
+                self.close_secure_workspace(cx);
             }
             "tab" => {
-                if modifiers.shift {
-                    editor.selected_field =
-                        (editor.selected_field + HostField::ALL.len() - 1) % HostField::ALL.len();
-                } else {
-                    editor.selected_field = (editor.selected_field + 1) % HostField::ALL.len();
-                }
-                editor.auth_cursor = 0;
-            }
-            "down" => {
-                if in_auth {
-                    let total = self.cached_credentials.len() + self.cached_keys.len();
-                    if total > 0 {
-                        editor.auth_cursor = (editor.auth_cursor + 1).min(total - 1);
-                    }
-                } else {
-                    editor.selected_field = (editor.selected_field + 1) % HostField::ALL.len();
-                    editor.auth_cursor = 0;
-                }
-            }
-            "up" => {
-                if in_auth {
-                    editor.auth_cursor = editor.auth_cursor.saturating_sub(1);
-                } else {
-                    editor.selected_field =
-                        (editor.selected_field + HostField::ALL.len() - 1) % HostField::ALL.len();
-                    editor.auth_cursor = 0;
-                }
-            }
-            "backspace" => match editor.field() {
-                HostField::Label => {
-                    editor.label.pop();
-                }
-                HostField::Hostname => {
-                    editor.hostname.pop();
-                }
-                HostField::Username => {
-                    editor.username.pop();
-                }
-                HostField::Port => {
-                    editor.port.pop();
-                }
-                HostField::Notes => {
-                    editor.notes.pop();
-                }
-                HostField::Auth => {}
-            },
-            "enter" | " " if in_auth => {
-                self.toggle_host_auth_at_cursor();
+                self.cycle_secure_focus(modifiers.shift);
             }
             "enter" => {
-                editor.selected_field = (editor.selected_field + 1) % HostField::ALL.len();
+                if self.secure.host_draft.is_some() {
+                    self.save_host_draft(cx);
+                } else if self.secure.credential_draft.is_some() {
+                    self.save_credential_draft(cx);
+                }
+            }
+            "backspace" => {
+                self.backspace_secure_input();
             }
             _ => {
                 if let Some(ch) = key_char {
-                    if !modifiers.platform && !modifiers.control && !modifiers.function && !in_auth
-                    {
-                        match editor.field() {
-                            HostField::Label => editor.label.push_str(ch),
-                            HostField::Hostname => editor.hostname.push_str(ch),
-                            HostField::Username => editor.username.push_str(ch),
-                            HostField::Port => {
-                                if ch.chars().all(|value| value.is_ascii_digit()) {
-                                    editor.port.push_str(ch);
-                                }
-                            }
-                            HostField::Notes => editor.notes.push_str(ch),
-                            HostField::Auth => {}
-                        }
+                    if !modifiers.platform && !modifiers.control && !modifiers.function {
+                        self.push_secure_input(ch);
                     }
                 }
             }
@@ -825,57 +1003,141 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
-    fn handle_credential_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let Some(editor) = self.credential_editor.as_mut() else {
-            return;
-        };
-        let key = event.keystroke.key.as_str();
-        let key_char = event.keystroke.key_char.as_deref();
-        let modifiers = event.keystroke.modifiers;
-
-        match key {
-            "escape" => {
-                self.credential_editor = None;
-            }
-            "tab" | "down" => {
-                editor.selected_field = (editor.selected_field + 1) % CredentialField::ALL.len();
-            }
-            "up" => {
-                editor.selected_field = (editor.selected_field + CredentialField::ALL.len() - 1)
-                    % CredentialField::ALL.len();
-            }
-            "backspace" => match editor.field() {
-                CredentialField::Label => {
-                    editor.label.pop();
-                }
-                CredentialField::UsernameHint => {
-                    editor.username_hint.pop();
-                }
-                CredentialField::Secret => {
-                    editor.secret.pop();
-                }
-            },
-            "enter" => {
-                if matches!(editor.field(), CredentialField::Secret) {
-                    self.save_credential_editor(cx);
+    fn cycle_secure_focus(&mut self, backward: bool) {
+        self.secure.input_target = match self.secure.section {
+            SecureSection::Hosts => {
+                let Some(draft) = self.secure.host_draft.as_mut() else {
                     return;
-                }
-                editor.selected_field = (editor.selected_field + 1) % CredentialField::ALL.len();
+                };
+                let position = HostDraftField::ALL
+                    .iter()
+                    .position(|field| *field == draft.selected_field)
+                    .unwrap_or(0);
+                let next = if backward {
+                    (position + HostDraftField::ALL.len() - 1) % HostDraftField::ALL.len()
+                } else {
+                    (position + 1) % HostDraftField::ALL.len()
+                };
+                draft.selected_field = HostDraftField::ALL[next];
+                SecureInputTarget::HostDraft(draft.selected_field)
             }
-            _ => {
-                if let Some(ch) = key_char {
-                    if !modifiers.platform && !modifiers.control && !modifiers.function {
-                        match editor.field() {
-                            CredentialField::Label => editor.label.push_str(ch),
-                            CredentialField::UsernameHint => editor.username_hint.push_str(ch),
-                            CredentialField::Secret => editor.secret.push_str(ch),
-                        }
-                    }
+            SecureSection::Credentials => {
+                let Some(draft) = self.secure.credential_draft.as_mut() else {
+                    return;
+                };
+                let position = CredentialDraftField::ALL
+                    .iter()
+                    .position(|field| *field == draft.selected_field)
+                    .unwrap_or(0);
+                let next = if backward {
+                    (position + CredentialDraftField::ALL.len() - 1)
+                        % CredentialDraftField::ALL.len()
+                } else {
+                    (position + 1) % CredentialDraftField::ALL.len()
+                };
+                draft.selected_field = CredentialDraftField::ALL[next];
+                SecureInputTarget::CredentialDraft(draft.selected_field)
+            }
+            SecureSection::Keys => SecureInputTarget::KeySearch,
+        };
+    }
+
+    fn backspace_secure_input(&mut self) {
+        match self.secure.input_target {
+            SecureInputTarget::HostSearch => {
+                self.secure.host_search.pop();
+            }
+            SecureInputTarget::CredentialSearch => {
+                self.secure.credential_search.pop();
+            }
+            SecureInputTarget::KeySearch => {
+                self.secure.key_search.pop();
+            }
+            SecureInputTarget::HostDraft(field) => {
+                if let Some(draft) = self.secure.host_draft.as_mut() {
+                    match field {
+                        HostDraftField::Label => draft.label.pop(),
+                        HostDraftField::Hostname => draft.hostname.pop(),
+                        HostDraftField::Username => draft.username.pop(),
+                        HostDraftField::Port => draft.port.pop(),
+                        HostDraftField::Notes => draft.notes.pop(),
+                    };
+                    draft.dirty = true;
+                }
+            }
+            SecureInputTarget::CredentialDraft(field) => {
+                if let Some(draft) = self.secure.credential_draft.as_mut() {
+                    match field {
+                        CredentialDraftField::Label => draft.label.pop(),
+                        CredentialDraftField::UsernameHint => draft.username_hint.pop(),
+                        CredentialDraftField::Secret => draft.secret.pop(),
+                    };
+                    draft.dirty = true;
                 }
             }
         }
+    }
 
-        self.perf_overlay.mark_input(RedrawReason::Input);
+    fn push_secure_input(&mut self, text: &str) {
+        match self.secure.input_target {
+            SecureInputTarget::HostSearch => self.secure.host_search.push_str(text),
+            SecureInputTarget::CredentialSearch => self.secure.credential_search.push_str(text),
+            SecureInputTarget::KeySearch => self.secure.key_search.push_str(text),
+            SecureInputTarget::HostDraft(field) => {
+                if let Some(draft) = self.secure.host_draft.as_mut() {
+                    match field {
+                        HostDraftField::Label => draft.label.push_str(text),
+                        HostDraftField::Hostname => draft.hostname.push_str(text),
+                        HostDraftField::Username => draft.username.push_str(text),
+                        HostDraftField::Port => {
+                            if text.chars().all(|value| value.is_ascii_digit()) {
+                                draft.port.push_str(text);
+                            }
+                        }
+                        HostDraftField::Notes => draft.notes.push_str(text),
+                    }
+                    draft.dirty = true;
+                }
+            }
+            SecureInputTarget::CredentialDraft(field) => {
+                if let Some(draft) = self.secure.credential_draft.as_mut() {
+                    match field {
+                        CredentialDraftField::Label => draft.label.push_str(text),
+                        CredentialDraftField::UsernameHint => draft.username_hint.push_str(text),
+                        CredentialDraftField::Secret => draft.secret.push_str(text),
+                    }
+                    draft.dirty = true;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn delete_saved_host(&mut self, host_scope_key: &str, cx: &mut Context<Self>) {
+        let Some((vault_id, host_id)) = split_scope_key(host_scope_key) else {
+            self.show_toast("Saved host scope is invalid.");
+            return;
+        };
+
+        match self.backend.delete_host(vault_id, host_id) {
+            Ok(true) => {
+                self.show_toast("Saved host removed.");
+                self.refresh_saved_hosts();
+                if self
+                    .secure
+                    .host_draft
+                    .as_ref()
+                    .is_some_and(|draft| {
+                        draft.host_id.as_deref() == Some(host_id)
+                            && draft.vault_id.as_deref() == Some(vault_id)
+                    })
+                {
+                    self.secure.host_draft = None;
+                }
+            }
+            Ok(false) => self.show_toast("Saved host already removed."),
+            Err(err) => self.show_toast(err.to_string()),
+        }
+        refresh_app_menus(cx);
         cx.notify();
     }
 }

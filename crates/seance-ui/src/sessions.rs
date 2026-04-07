@@ -8,12 +8,9 @@ use seance_ssh::{SshConnectResult, SshError};
 use seance_terminal::{TerminalGeometry, TerminalSession};
 
 use crate::{
-    SIDEBAR_FONT_MONO, SIDEBAR_MONO_SIZE_PX, SeanceWorkspace,
-    local_session_display_number_for_ids,
-    perf::RedrawReason,
-    refresh_app_menus,
-    session_kind_map_from_sessions,
-    ui_components::session_preview_text,
+    SIDEBAR_FONT_MONO, SIDEBAR_MONO_SIZE_PX, SeanceWorkspace, forms::WorkspaceSurface,
+    local_session_display_number_for_ids, perf::RedrawReason, refresh_app_menus,
+    session_kind_map_from_sessions, ui_components::session_preview_text,
 };
 
 impl SeanceWorkspace {
@@ -106,6 +103,7 @@ impl SeanceWorkspace {
 
     pub(crate) fn connect_saved_host(
         &mut self,
+        vault_id: &str,
         host_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -114,7 +112,7 @@ impl SeanceWorkspace {
             return;
         }
 
-        let request = match self.backend.build_connect_request(host_id) {
+        let request = match self.backend.build_connect_request(vault_id, host_id) {
             Ok(request) => request,
             Err(err) => {
                 self.show_toast(err.to_string());
@@ -123,8 +121,8 @@ impl SeanceWorkspace {
             }
         };
 
-        self.connecting_host_id = Some(host_id.into());
-        self.selected_host_id = Some(host_id.into());
+        self.connecting_host_id = Some(crate::workspace::host_scope_key(vault_id, host_id));
+        self.selected_host_id = Some(crate::workspace::host_scope_key(vault_id, host_id));
         self.show_toast("Connecting…");
         cx.notify();
 
@@ -166,7 +164,7 @@ impl SeanceWorkspace {
                     Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
                 }
                 self.backend.touch_session(session.id());
-                self.settings_panel.open = false;
+                self.surface = WorkspaceSurface::Terminal;
                 self.show_toast("SSH session connected.");
                 self.invalidate_terminal_surface();
             }
@@ -302,9 +300,9 @@ impl SeanceWorkspace {
                                 div()
                                     .font_family(SIDEBAR_FONT_MONO)
                                     .text_size(px(9.0))
-                                    .px(px(5.0))
+                                    .px(px(7.0))
                                     .py(px(1.0))
-                                    .rounded(px(3.0))
+                                    .rounded(px(4.0))
                                     .when(active, |el| {
                                         el.bg(theme.accent_glow).text_color(theme.accent)
                                     })
@@ -316,24 +314,11 @@ impl SeanceWorkspace {
                     )
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.0))
-                            .child(
-                                div()
-                                    .font_family(SIDEBAR_FONT_MONO)
-                                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
-                                    .text_color(theme.text_ghost)
-                                    .child("$"),
-                            )
-                            .child(
-                                div()
-                                    .font_family(SIDEBAR_FONT_MONO)
-                                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
-                                    .text_color(theme.sidebar_meta)
-                                    .line_clamp(1)
-                                    .child(preview),
-                            ),
+                            .font_family(SIDEBAR_FONT_MONO)
+                            .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                            .text_color(theme.sidebar_meta)
+                            .line_clamp(1)
+                            .child(format!("$ {}", preview)),
                     ),
             )
             .child({

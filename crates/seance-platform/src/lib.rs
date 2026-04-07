@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 pub enum IpcRequest {
     Ping,
     OpenWindow,
-    OpenHost { host_id: String },
+    OpenHost { vault_id: String, host_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,7 +28,7 @@ pub enum IpcResponse {
 #[derive(Debug, Clone)]
 pub enum PlatformEvent {
     OpenWindow,
-    OpenHost { host_id: String },
+    OpenHost { vault_id: String, host_id: String },
 }
 
 pub trait PlatformApp {
@@ -100,7 +100,9 @@ fn handle_ipc_client(mut stream: UnixStream, events: &Sender<PlatformEvent>) -> 
     let event = match request {
         IpcRequest::Ping => None,
         IpcRequest::OpenWindow => Some(PlatformEvent::OpenWindow),
-        IpcRequest::OpenHost { host_id } => Some(PlatformEvent::OpenHost { host_id }),
+        IpcRequest::OpenHost { vault_id, host_id } => {
+            Some(PlatformEvent::OpenHost { vault_id, host_id })
+        }
     };
     if let Some(event) = event {
         events

@@ -18,7 +18,7 @@ use crate::{
     OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance, SeanceWorkspace, SelectSession,
     SettingsSection, ShowAllApps, SwitchTheme, TogglePerfHud,
     backend::UiBackend,
-    forms::{SettingsPanelState, UnlockFormState},
+    forms::{SecureWorkspaceState, SettingsPanelState, VaultModalState, WorkspaceSurface},
     perf::{PerfOverlayState, RedrawReason, perf_mode_from_config, perf_mode_override_from_env},
     surface::TerminalSurfaceState,
     ui_components::theme_id_from_config,
@@ -30,7 +30,7 @@ pub enum UiCommand {
     ActivateApp,
     HideApp,
     QuitApp,
-    OpenHost { host_id: String },
+    OpenHost { vault_id: String, host_id: String },
 }
 
 #[derive(Default)]
@@ -114,12 +114,12 @@ pub fn run(runtime: UiRuntime) -> Result<()> {
                             quit_requested.store(true, Ordering::Relaxed);
                             cx.quit();
                         }
-                        UiCommand::OpenHost { host_id } => {
+                        UiCommand::OpenHost { vault_id, host_id } => {
                             let _ = open_workspace_window(
                                 cx,
                                 backend,
                                 WindowTarget::MostRecentOrNew,
-                                Some(InitialWorkspaceAction::ConnectHost(host_id)),
+                                Some(InitialWorkspaceAction::ConnectHost { vault_id, host_id }),
                             );
                             cx.activate(false);
                             refresh_app_menus(cx);
@@ -179,7 +179,7 @@ impl WorkspaceWindowRegistry {
 
 #[derive(Clone, Debug)]
 pub(crate) enum InitialWorkspaceAction {
-    ConnectHost(String),
+    ConnectHost { vault_id: String, host_id: String },
     CheckForUpdates,
     OpenPreferences,
     OpenCommandPalette,
@@ -398,16 +398,18 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
 
     let backend_for_connect_host = backend.clone();
     cx.on_action(move |action: &ConnectHost, cx| {
+        let vault_id = action.vault_id.clone();
         let host_id = action.host_id.clone();
         if !with_registered_workspace(cx, |this, window, cx| {
-            this.selected_host_id = Some(host_id.clone());
-            this.connect_saved_host(&host_id, window, cx);
+            this.selected_host_id =
+                Some(crate::workspace::host_scope_key(&vault_id, &host_id));
+            this.connect_saved_host(&vault_id, &host_id, window, cx);
         }) {
             let _ = open_workspace_window(
                 cx,
                 backend_for_connect_host.clone(),
                 WindowTarget::MostRecentOrNew,
-                Some(InitialWorkspaceAction::ConnectHost(host_id)),
+                Some(InitialWorkspaceAction::ConnectHost { vault_id, host_id }),
             );
         }
         refresh_app_menus(cx);
@@ -492,17 +494,22 @@ fn open_workspace_window(
                     active_session_id: bootstrap.attached_session_id,
                     backend: backend.clone(),
                     config: bootstrap.config.clone(),
+                    managed_vaults: bootstrap.managed_vaults.clone(),
                     saved_hosts: bootstrap.saved_hosts.clone(),
                     selected_host_id: None,
                     connecting_host_id: None,
-                    unlock_form: UnlockFormState::new(
-                        bootstrap.vault_status.initialized,
-                        bootstrap.vault_status.unlocked,
+                    surface: WorkspaceSurface::Terminal,
+                    vault_modal: VaultModalState::new(
+                        bootstrap.managed_vaults.iter().any(|vault| vault.initialized),
+                        bootstrap.managed_vaults.iter().any(|vault| vault.unlocked),
                         bootstrap.device_unlock_attempted,
-                        bootstrap.vault_status.device_unlock_message.as_deref(),
+                        bootstrap
+                            .managed_vaults
+                            .iter()
+                            .find_map(|vault| vault.device_unlock_message.as_deref()),
                     ),
-                    host_editor: None,
-                    credential_editor: None,
+                    secure: SecureWorkspaceState::default(),
+                    confirm_dialog: None,
                     settings_panel: SettingsPanelState::default(),
                     sftp_browser: None,
                     cached_credentials: bootstrap.cached_credentials.clone(),
@@ -512,6 +519,7 @@ fn open_workspace_window(
                     palette_open: false,
                     palette_query: String::new(),
                     palette_selected: 0,
+                    palette_scroll_handle: gpui::ScrollHandle::new(),
                     terminal_metrics: None,
                     last_applied_geometry: None,
                     active_terminal_rows: TerminalGeometry::default().size.rows as usize,
