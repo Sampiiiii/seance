@@ -170,7 +170,11 @@ impl SeanceWorkspace {
 
     fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
-        let open_count = self.managed_vaults.iter().filter(|vault| vault.open).count();
+        let open_count = self
+            .managed_vaults
+            .iter()
+            .filter(|vault| vault.open)
+            .count();
         let unlocked_count = self
             .managed_vaults
             .iter()
@@ -831,11 +835,15 @@ impl SeanceWorkspace {
             self.vault_modal.unlock_method == seance_vault::UnlockMethod::Passphrase;
         let show_passphrase_fields = create_mode || (!rename_mode && using_passphrase);
         let field_count = self.vault_modal.passphrase_field_count();
-        let target_vault = self.vault_modal.target_vault_id.as_deref().and_then(|vault_id| {
-            self.managed_vaults
-                .iter()
-                .find(|vault| vault.vault_id == vault_id)
-        });
+        let target_vault = self
+            .vault_modal
+            .target_vault_id
+            .as_deref()
+            .and_then(|vault_id| {
+                self.managed_vaults
+                    .iter()
+                    .find(|vault| vault.vault_id == vault_id)
+            });
         let device_available = target_vault
             .map(|vault| vault.device_unlock_available)
             .unwrap_or_else(|| self.backend.vault_status().device_unlock_available);
@@ -878,9 +886,7 @@ impl SeanceWorkspace {
             } else {
                 masked_value(&self.vault_modal.passphrase)
             },
-            field_count > 0
-                && self.vault_modal.selected_field
-                    == if create_mode { 1 } else { 0 },
+            field_count > 0 && self.vault_modal.selected_field == if create_mode { 1 } else { 0 },
             &t,
         )
         .on_mouse_down(

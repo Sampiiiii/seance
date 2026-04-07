@@ -14,16 +14,12 @@ impl SeanceWorkspace {
         self.refresh_managed_vaults();
         self.saved_hosts = self.backend.list_hosts().unwrap_or_default();
 
-        if self
-            .selected_host_id
-            .as_ref()
-            .is_some_and(|id| {
-                !self
-                    .saved_hosts
-                    .iter()
-                    .any(|host| host_scope_key(&host.vault_id, &host.host.id) == *id)
-            })
-        {
+        if self.selected_host_id.as_ref().is_some_and(|id| {
+            !self
+                .saved_hosts
+                .iter()
+                .any(|host| host_scope_key(&host.vault_id, &host.host.id) == *id)
+        }) {
             self.selected_host_id = self
                 .saved_hosts
                 .first()

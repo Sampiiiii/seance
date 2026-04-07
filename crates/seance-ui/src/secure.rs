@@ -1,12 +1,8 @@
 // Owns the secure workspace surface, host/credential drafts, key details, and confirm dialogs.
 
 use gpui::{App, Context, Div, FontWeight, MouseButton, Window, div, prelude::*, px};
-use seance_core::{
-    VaultScopedCredentialSummary, VaultScopedHostSummary, VaultScopedKeySummary,
-};
-use seance_vault::{
-    HostAuthRef, PrivateKeyAlgorithm, VaultHostProfile, VaultPasswordCredential,
-};
+use seance_core::{VaultScopedCredentialSummary, VaultScopedHostSummary, VaultScopedKeySummary};
+use seance_vault::{HostAuthRef, PrivateKeyAlgorithm, VaultHostProfile, VaultPasswordCredential};
 
 use crate::{
     SIDEBAR_FONT_MONO, SeanceWorkspace,
@@ -189,7 +185,10 @@ impl SeanceWorkspace {
                 self.show_toast("Credential scope is invalid.");
                 return;
             };
-            match self.backend.load_password_credential(vault_id, credential_id) {
+            match self
+                .backend
+                .load_password_credential(vault_id, credential_id)
+            {
                 Ok(Some(credential)) => {
                     self.secure.selected_credential_id =
                         Some(item_scope_key(vault_id, &credential.id));
@@ -427,7 +426,8 @@ impl SeanceWorkspace {
 
         let Some(vault_id) = draft.vault_id.clone() else {
             if let Some(draft) = self.secure.credential_draft.as_mut() {
-                draft.error = Some("Choose an unlocked vault before saving this credential.".into());
+                draft.error =
+                    Some("Choose an unlocked vault before saving this credential.".into());
             }
             cx.notify();
             return;
@@ -566,7 +566,10 @@ impl SeanceWorkspace {
             return;
         }
 
-        match self.backend.delete_password_credential(vault_id, credential_id) {
+        match self
+            .backend
+            .delete_password_credential(vault_id, credential_id)
+        {
             Ok(true) => {
                 self.refresh_vault_cache();
                 if self
@@ -854,14 +857,10 @@ impl SeanceWorkspace {
                     .filter(|host| self.host_matches_query(host))
                 {
                     let host_scope_key = item_scope_key(&host.vault_id, &host.host.id);
-                    let selected = self
-                        .secure
-                        .host_draft
-                        .as_ref()
-                        .is_some_and(|draft| {
-                            draft.host_id.as_deref() == Some(host.host.id.as_str())
-                                && draft.vault_id.as_deref() == Some(host.vault_id.as_str())
-                        });
+                    let selected = self.secure.host_draft.as_ref().is_some_and(|draft| {
+                        draft.host_id.as_deref() == Some(host.host.id.as_str())
+                            && draft.vault_id.as_deref() == Some(host.vault_id.as_str())
+                    });
                     rows = rows.child(
                         self.render_list_row(
                             &host.host.label,
@@ -920,15 +919,10 @@ impl SeanceWorkspace {
                 {
                     let credential_scope_key =
                         item_scope_key(&credential.vault_id, &credential.credential.id);
-                    let selected = self
-                        .secure
-                        .credential_draft
-                        .as_ref()
-                        .is_some_and(|draft| {
-                            draft.credential_id.as_deref()
-                                == Some(credential.credential.id.as_str())
-                                && draft.vault_id.as_deref() == Some(credential.vault_id.as_str())
-                        });
+                    let selected = self.secure.credential_draft.as_ref().is_some_and(|draft| {
+                        draft.credential_id.as_deref() == Some(credential.credential.id.as_str())
+                            && draft.vault_id.as_deref() == Some(credential.vault_id.as_str())
+                    });
                     rows = rows.child(
                         self.render_list_row(
                             &credential.credential.label,
@@ -1011,13 +1005,13 @@ impl SeanceWorkspace {
                             &format!("{algo}  [{}]", key.vault_name),
                             selected,
                         )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.secure.selected_key_id = Some(key_scope_key.clone());
-                                    cx.notify();
-                                }),
-                            ),
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.secure.selected_key_id = Some(key_scope_key.clone());
+                                cx.notify();
+                            }),
+                        ),
                     );
                 }
                 panel = panel.child(div().flex_1().child(rows));
@@ -1342,7 +1336,8 @@ impl SeanceWorkspace {
                     );
                     for credential in &available_credentials {
                         let credential_id = credential.credential.id.clone();
-                        let active = passphrase_id.as_deref() == Some(credential.credential.id.as_str());
+                        let active =
+                            passphrase_id.as_deref() == Some(credential.credential.id.as_str());
                         row = row.child(
                             div()
                                 .px(px(10.0))
@@ -1643,7 +1638,8 @@ impl SeanceWorkspace {
         };
 
         let Some((vault_id, key_id)) = split_scope_key(key_scope_key) else {
-            return self.render_placeholder_panel("Missing key", "The selected key scope is invalid.");
+            return self
+                .render_placeholder_panel("Missing key", "The selected key scope is invalid.");
         };
 
         let Some(key) = self

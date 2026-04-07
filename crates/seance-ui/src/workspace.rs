@@ -485,7 +485,8 @@ impl SeanceWorkspace {
                         }
                     },
                     None => {
-                        self.vault_modal.error = Some("No locked vault is available to unlock.".into())
+                        self.vault_modal.error =
+                            Some("No locked vault is available to unlock.".into())
                     }
                 },
                 UnlockMethod::Passphrase => {
@@ -497,8 +498,11 @@ impl SeanceWorkspace {
                             SecretString::from(self.vault_modal.passphrase.to_string());
                         match target_vault_id.as_deref() {
                             Some(vault_id) => {
-                                match self.backend.unlock_vault(vault_id, &passphrase, "This Device")
-                                {
+                                match self.backend.unlock_vault(
+                                    vault_id,
+                                    &passphrase,
+                                    "This Device",
+                                ) {
                                     Ok(()) => {
                                         self.vault_modal.close();
                                         self.show_toast("Vault unlocked.");
@@ -910,8 +914,10 @@ impl SeanceWorkspace {
                 }
             }
             "backspace" => {
-                if matches!(self.vault_modal.mode, UnlockMode::Create | UnlockMode::Rename)
-                    && self.vault_modal.selected_field == 0
+                if matches!(
+                    self.vault_modal.mode,
+                    UnlockMode::Create | UnlockMode::Rename
+                ) && self.vault_modal.selected_field == 0
                 {
                     self.vault_modal.vault_name.pop();
                 } else if self.vault_modal.selected_field == 0 {
@@ -937,8 +943,10 @@ impl SeanceWorkspace {
             _ => {
                 if let Some(ch) = key_char {
                     if !modifiers.platform && !modifiers.control && !modifiers.function {
-                        if matches!(self.vault_modal.mode, UnlockMode::Create | UnlockMode::Rename)
-                            && self.vault_modal.selected_field == 0
+                        if matches!(
+                            self.vault_modal.mode,
+                            UnlockMode::Create | UnlockMode::Rename
+                        ) && self.vault_modal.selected_field == 0
                         {
                             self.vault_modal.vault_name.push_str(ch);
                         } else if self.vault_modal.selected_field == 0 {
@@ -1122,15 +1130,10 @@ impl SeanceWorkspace {
             Ok(true) => {
                 self.show_toast("Saved host removed.");
                 self.refresh_saved_hosts();
-                if self
-                    .secure
-                    .host_draft
-                    .as_ref()
-                    .is_some_and(|draft| {
-                        draft.host_id.as_deref() == Some(host_id)
-                            && draft.vault_id.as_deref() == Some(vault_id)
-                    })
-                {
+                if self.secure.host_draft.as_ref().is_some_and(|draft| {
+                    draft.host_id.as_deref() == Some(host_id)
+                        && draft.vault_id.as_deref() == Some(vault_id)
+                }) {
                     self.secure.host_draft = None;
                 }
             }

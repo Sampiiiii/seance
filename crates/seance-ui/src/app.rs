@@ -401,8 +401,7 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
         let vault_id = action.vault_id.clone();
         let host_id = action.host_id.clone();
         if !with_registered_workspace(cx, |this, window, cx| {
-            this.selected_host_id =
-                Some(crate::workspace::host_scope_key(&vault_id, &host_id));
+            this.selected_host_id = Some(crate::workspace::host_scope_key(&vault_id, &host_id));
             this.connect_saved_host(&vault_id, &host_id, window, cx);
         }) {
             let _ = open_workspace_window(
@@ -500,7 +499,10 @@ fn open_workspace_window(
                     connecting_host_id: None,
                     surface: WorkspaceSurface::Terminal,
                     vault_modal: VaultModalState::new(
-                        bootstrap.managed_vaults.iter().any(|vault| vault.initialized),
+                        bootstrap
+                            .managed_vaults
+                            .iter()
+                            .any(|vault| vault.initialized),
                         bootstrap.managed_vaults.iter().any(|vault| vault.unlocked),
                         bootstrap.device_unlock_attempted,
                         bootstrap

@@ -562,7 +562,11 @@ impl AppControllerHandle {
         self.with_lock(|controller| controller.delete_private_key(vault_id, id))
     }
 
-    pub fn build_connect_request(&self, vault_id: &str, host_id: &str) -> Result<SshConnectRequest> {
+    pub fn build_connect_request(
+        &self,
+        vault_id: &str,
+        host_id: &str,
+    ) -> Result<SshConnectRequest> {
         self.with_lock(|controller| {
             let vault = controller.store(vault_id)?;
             let host = vault
@@ -774,7 +778,11 @@ impl AppController {
     }
 
     fn aggregate_vault_status(&self) -> VaultStatus {
-        let mut open_vaults = self.context.vaults.values().filter_map(|state| state.store.as_ref());
+        let mut open_vaults = self
+            .context
+            .vaults
+            .values()
+            .filter_map(|state| state.store.as_ref());
         if let Some(store) = open_vaults.next() {
             return store.status();
         }
@@ -882,14 +890,19 @@ impl AppController {
             .context
             .vaults
             .get_mut(vault_id)
-                .ok_or_else(|| anyhow!("vault not found"))?;
+            .ok_or_else(|| anyhow!("vault not found"))?;
         state.entry.name = trimmed_name.to_string();
         state.entry.updated_at = seance_vault::now_ts();
         let updated_entry = state.entry.clone();
         let summary = state.summary(&self.context.paths);
         let _ = state;
         self.update_config(|config| {
-            if let Some(entry) = config.vaults.entries.iter_mut().find(|entry| entry.id == vault_id) {
+            if let Some(entry) = config
+                .vaults
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == vault_id)
+            {
                 *entry = updated_entry.clone();
             }
         })?;
@@ -904,9 +917,8 @@ impl AppController {
             .ok_or_else(|| anyhow!("vault not found"))?;
         if state.store.is_none() {
             let path = vault_db_path(&self.context.paths, &state.entry);
-            let store = VaultStore::open(&path).with_context(|| {
-                format!("failed to open vault database at {}", path.display())
-            })?;
+            let store = VaultStore::open(&path)
+                .with_context(|| format!("failed to open vault database at {}", path.display()))?;
             state.store = Some(store);
             state.availability_error = None;
         }
@@ -973,7 +985,11 @@ impl AppController {
             .vaults
             .get(vault_id)
             .ok_or_else(|| anyhow!("vault not found"))?;
-        if state.store.as_ref().is_some_and(|store| store.status().unlocked) {
+        if state
+            .store
+            .as_ref()
+            .is_some_and(|store| store.status().unlocked)
+        {
             anyhow::bail!("lock the vault before deleting it");
         }
         let path = vault_db_path(&self.context.paths, &state.entry);
@@ -1011,23 +1027,24 @@ impl AppController {
             if !store.status().unlocked {
                 continue;
             }
-            hosts.extend(
-                store
-                    .list_host_profiles()?
-                    .into_iter()
-                    .map(|host| VaultScopedHostSummary {
-                        vault_id: vault_id.clone(),
-                        vault_name: state.entry.name.clone(),
-                        host,
-                    }),
-            );
+            hosts.extend(store.list_host_profiles()?.into_iter().map(|host| {
+                VaultScopedHostSummary {
+                    vault_id: vault_id.clone(),
+                    vault_name: state.entry.name.clone(),
+                    host,
+                }
+            }));
         }
         hosts.sort_by(|left, right| {
             left.host
                 .label
                 .to_lowercase()
                 .cmp(&right.host.label.to_lowercase())
-                .then_with(|| left.vault_name.to_lowercase().cmp(&right.vault_name.to_lowercase()))
+                .then_with(|| {
+                    left.vault_name
+                        .to_lowercase()
+                        .cmp(&right.vault_name.to_lowercase())
+                })
         });
         Ok(hosts)
     }
@@ -1036,7 +1053,11 @@ impl AppController {
         Ok(self.store(vault_id)?.load_host_profile(id)?)
     }
 
-    fn save_host(&mut self, vault_id: &str, host: VaultHostProfile) -> Result<VaultScopedHostSummary> {
+    fn save_host(
+        &mut self,
+        vault_id: &str,
+        host: VaultHostProfile,
+    ) -> Result<VaultScopedHostSummary> {
         let summary = self.store_mut(vault_id)?.store_host_profile(host)?;
         let vault_name = self.vault_entry(vault_id)?.name.clone();
         Ok(VaultScopedHostSummary {
@@ -1075,7 +1096,11 @@ impl AppController {
                 .label
                 .to_lowercase()
                 .cmp(&right.credential.label.to_lowercase())
-                .then_with(|| left.vault_name.to_lowercase().cmp(&right.vault_name.to_lowercase()))
+                .then_with(|| {
+                    left.vault_name
+                        .to_lowercase()
+                        .cmp(&right.vault_name.to_lowercase())
+                })
         });
         Ok(credentials)
     }
@@ -1093,7 +1118,9 @@ impl AppController {
         vault_id: &str,
         credential: VaultPasswordCredential,
     ) -> Result<VaultScopedCredentialSummary> {
-        let summary = self.store_mut(vault_id)?.store_password_credential(credential)?;
+        let summary = self
+            .store_mut(vault_id)?
+            .store_password_credential(credential)?;
         let vault_name = self.vault_entry(vault_id)?.name.clone();
         Ok(VaultScopedCredentialSummary {
             vault_id: vault_id.to_string(),
@@ -1131,7 +1158,11 @@ impl AppController {
                 .label
                 .to_lowercase()
                 .cmp(&right.key.label.to_lowercase())
-                .then_with(|| left.vault_name.to_lowercase().cmp(&right.vault_name.to_lowercase()))
+                .then_with(|| {
+                    left.vault_name
+                        .to_lowercase()
+                        .cmp(&right.vault_name.to_lowercase())
+                })
         });
         Ok(keys)
     }
@@ -1157,11 +1188,12 @@ impl AppController {
     fn default_target_vault_id_for_actions(&self) -> Option<String> {
         let config = self.context.config.snapshot();
         if let Some(default_id) = config.vaults.default_target_vault_id
-            && self
-                .context
-                .vaults
-                .get(&default_id)
-                .is_some_and(|state| state.store.as_ref().is_some_and(|store| store.status().unlocked))
+            && self.context.vaults.get(&default_id).is_some_and(|state| {
+                state
+                    .store
+                    .as_ref()
+                    .is_some_and(|store| store.status().unlocked)
+            })
         {
             return Some(default_id);
         }
@@ -1170,7 +1202,12 @@ impl AppController {
             .context
             .vaults
             .iter()
-            .filter(|(_, state)| state.store.as_ref().is_some_and(|store| store.status().unlocked))
+            .filter(|(_, state)| {
+                state
+                    .store
+                    .as_ref()
+                    .is_some_and(|store| store.status().unlocked)
+            })
             .map(|(vault_id, state)| (vault_id.clone(), state.entry.name.to_lowercase()))
             .collect::<Vec<_>>();
         unlocked.sort_by(|left, right| left.1.cmp(&right.1));
@@ -1277,7 +1314,12 @@ fn load_managed_vaults(
             store: None,
             availability_error: None,
         };
-        if config.vaults.open_vault_ids.iter().any(|id| id == &entry.id) {
+        if config
+            .vaults
+            .open_vault_ids
+            .iter()
+            .any(|id| id == &entry.id)
+        {
             let db_path = vault_db_path(paths, entry);
             match VaultStore::open(&db_path) {
                 Ok(store) => state.store = Some(store),

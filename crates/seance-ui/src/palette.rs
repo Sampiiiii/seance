@@ -39,16 +39,34 @@ pub enum PaletteAction {
     OpenVaultPanel,
     AddSavedHost,
     AddPasswordCredential,
-    EditPasswordCredential { vault_id: String, credential_id: String },
-    DeletePasswordCredential { vault_id: String, credential_id: String },
+    EditPasswordCredential {
+        vault_id: String,
+        credential_id: String,
+    },
+    DeletePasswordCredential {
+        vault_id: String,
+        credential_id: String,
+    },
     #[allow(dead_code)]
     ImportPrivateKey,
     GenerateEd25519Key,
     GenerateRsaKey,
-    DeletePrivateKey { vault_id: String, key_id: String },
-    EditSavedHost { vault_id: String, host_id: String },
-    DeleteSavedHost { vault_id: String, host_id: String },
-    ConnectSavedHost { vault_id: String, host_id: String },
+    DeletePrivateKey {
+        vault_id: String,
+        key_id: String,
+    },
+    EditSavedHost {
+        vault_id: String,
+        host_id: String,
+    },
+    DeleteSavedHost {
+        vault_id: String,
+        host_id: String,
+    },
+    ConnectSavedHost {
+        vault_id: String,
+        host_id: String,
+    },
     OpenSftpBrowser(u64),
     OpenPreferences,
 }

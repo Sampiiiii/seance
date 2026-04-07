@@ -98,7 +98,8 @@ impl UiBackend {
         passphrase: &SecretString,
         device_name: &str,
     ) -> Result<ManagedVaultSummary> {
-        self.controller.create_named_vault(name, passphrase, device_name)
+        self.controller
+            .create_named_vault(name, passphrase, device_name)
     }
 
     pub fn rename_vault(&self, vault_id: &str, name: String) -> Result<ManagedVaultSummary> {
@@ -119,7 +120,8 @@ impl UiBackend {
         passphrase: &SecretString,
         device_name: &str,
     ) -> Result<()> {
-        self.controller.unlock_named_vault(vault_id, passphrase, device_name)
+        self.controller
+            .unlock_named_vault(vault_id, passphrase, device_name)
     }
 
     pub fn lock_vault(&self, vault_id: &str) -> Result<()> {
@@ -174,7 +176,11 @@ impl UiBackend {
         self.controller.load_host(vault_id, id)
     }
 
-    pub fn save_host(&self, vault_id: &str, host: VaultHostProfile) -> Result<VaultScopedHostSummary> {
+    pub fn save_host(
+        &self,
+        vault_id: &str,
+        host: VaultHostProfile,
+    ) -> Result<VaultScopedHostSummary> {
         self.controller.save_host(vault_id, host)
     }
 
@@ -199,7 +205,8 @@ impl UiBackend {
         vault_id: &str,
         credential: VaultPasswordCredential,
     ) -> Result<VaultScopedCredentialSummary> {
-        self.controller.save_password_credential(vault_id, credential)
+        self.controller
+            .save_password_credential(vault_id, credential)
     }
 
     pub fn delete_password_credential(&self, vault_id: &str, id: &str) -> Result<bool> {
@@ -241,11 +248,7 @@ impl UiBackend {
         )
     }
 
-    pub fn generate_rsa_key(
-        &self,
-        vault_id: &str,
-        label: String,
-    ) -> Result<VaultScopedKeySummary> {
+    pub fn generate_rsa_key(&self, vault_id: &str, label: String) -> Result<VaultScopedKeySummary> {
         self.generate_private_key(
             vault_id,
             GenerateKeyRequest {
@@ -255,7 +258,11 @@ impl UiBackend {
         )
     }
 
-    pub fn build_connect_request(&self, vault_id: &str, host_id: &str) -> Result<SshConnectRequest> {
+    pub fn build_connect_request(
+        &self,
+        vault_id: &str,
+        host_id: &str,
+    ) -> Result<SshConnectRequest> {
         self.controller.build_connect_request(vault_id, host_id)
     }
 

@@ -148,8 +148,14 @@ impl SeanceWorkspace {
         let theme = self.theme();
         let meta = format!(
             "{} open  {} unlocked",
-            self.managed_vaults.iter().filter(|vault| vault.open).count(),
-            self.managed_vaults.iter().filter(|vault| vault.unlocked).count()
+            self.managed_vaults
+                .iter()
+                .filter(|vault| vault.open)
+                .count(),
+            self.managed_vaults
+                .iter()
+                .filter(|vault| vault.unlocked)
+                .count()
         );
 
         let sidebar_action = |label: &'static str| {
@@ -349,9 +355,9 @@ impl SeanceWorkspace {
             );
         }
 
-        section = section
-            .child(
-                div().px(px(14.0)).pt(px(2.0)).child(
+        section =
+            section
+                .child(div().px(px(14.0)).pt(px(2.0)).child(
                     sidebar_action("+ new vault").on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -363,18 +369,15 @@ impl SeanceWorkspace {
                             );
                         }),
                     ),
-                ),
-            )
-            .child(
-                div().px(px(14.0)).child(
+                ))
+                .child(div().px(px(14.0)).child(
                     sidebar_action("manage secure data").on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             this.open_vault_panel(cx);
                         }),
                     ),
-                ),
-            );
+                ));
 
         section
     }

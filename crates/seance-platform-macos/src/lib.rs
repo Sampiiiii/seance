@@ -204,7 +204,11 @@ fn build_hosts_submenu(controller: &AppControllerHandle) -> Menu {
             .label
             .to_lowercase()
             .cmp(&right.host.label.to_lowercase())
-            .then_with(|| left.vault_name.to_lowercase().cmp(&right.vault_name.to_lowercase()))
+            .then_with(|| {
+                left.vault_name
+                    .to_lowercase()
+                    .cmp(&right.vault_name.to_lowercase())
+            })
     });
 
     Menu {
@@ -265,9 +269,14 @@ fn host_menu_labels(controller: &AppControllerHandle) -> Vec<String> {
             .label
             .to_lowercase()
             .cmp(&right.host.label.to_lowercase())
-            .then_with(|| left.vault_name.to_lowercase().cmp(&right.vault_name.to_lowercase()))
+            .then_with(|| {
+                left.vault_name
+                    .to_lowercase()
+                    .cmp(&right.vault_name.to_lowercase())
+            })
     });
-    hosts.into_iter()
+    hosts
+        .into_iter()
         .map(|host| format!("{} ({})", host.host.label, host.vault_name))
         .collect()
 }
