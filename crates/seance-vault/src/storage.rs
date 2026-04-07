@@ -318,6 +318,11 @@ pub fn get_local_state(conn: &Connection, key: &str) -> VaultResult<Option<Strin
     .map_err(Into::into)
 }
 
+pub fn delete_local_state(conn: &Connection, key: &str) -> VaultResult<()> {
+    conn.execute("DELETE FROM local_state WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
 pub fn upsert_record(conn: &Connection, record: &EncryptedRecord) -> VaultResult<()> {
     conn.execute(
         "

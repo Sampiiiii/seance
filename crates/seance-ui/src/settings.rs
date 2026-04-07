@@ -10,7 +10,7 @@ use crate::{
     theme::ThemeId,
     ui_components::{
         perf_mode_label, settings_action_chip, settings_choice_chip, settings_info_card,
-        settings_nav_button, settings_stepper_card, settings_toggle_card, update_status_label,
+        settings_nav_button, settings_section_group, settings_toggle_card, update_status_label,
     },
 };
 
@@ -167,39 +167,26 @@ impl SeanceWorkspace {
             .border_color(t.sidebar_edge_bright)
             .bg(t.shell_divider_glow);
 
-        let mut nav = div()
-            .w(px(190.0))
-            .h_full()
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .bg(t.sidebar_bg_elevated)
-            .border_r_1()
-            .border_color(t.sidebar_edge)
-            .child(
-                div()
-                    .pb(px(10.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .text_size(px(18.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(t.text_primary)
-                            .child("Preferences"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(t.text_muted)
-                            .child("Live config backed by config.toml"),
-                    ),
-            );
+        let mut nav_items = div().flex().flex_col().gap(px(2.0)).child(
+            div()
+                .pb(px(14.0))
+                .mb(px(4.0))
+                .border_b_1()
+                .border_color(t.glass_border)
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(15.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(t.text_primary)
+                        .child("Preferences"),
+                ),
+        );
 
         for item in SettingsSection::ALL {
-            nav = nav.child(
+            nav_items = nav_items.child(
                 settings_nav_button(item, section == item, &t).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
@@ -209,11 +196,49 @@ impl SeanceWorkspace {
             );
         }
 
+        let nav = div()
+            .w(px(210.0))
+            .h_full()
+            .py(px(16.0))
+            .pl(px(12.0))
+            .pr(px(14.0))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .bg(t.sidebar_bg_elevated)
+            .border_r_1()
+            .border_color(t.sidebar_edge)
+            .child(nav_items)
+            .child(
+                div()
+                    .pt(px(10.0))
+                    .border_t_1()
+                    .border_color(t.glass_border)
+                    .child(
+                        div()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(t.text_ghost)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(t.text_secondary).bg(t.glass_hover))
+                            .child("← esc  back to terminal")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.close_settings_panel(cx);
+                                }),
+                            ),
+                    ),
+            );
+
         let mut content = div()
+            .id("settings-content")
             .flex_1()
             .h_full()
             .bg(t.bg_void)
-            .overflow_hidden()
+            .overflow_y_scroll()
             .track_focus(&self.focus_handle)
             .on_mouse_down(MouseButton::Left, {
                 let fh = self.focus_handle.clone();
@@ -229,49 +254,41 @@ impl SeanceWorkspace {
 
         let title = section.title();
         let subtitle = section.subtitle();
+        let glyph = section.glyph();
         content = content.child(
             div()
                 .flex()
-                .items_center()
-                .justify_between()
+                .flex_col()
+                .gap(px(4.0))
+                .pb(px(12.0))
+                .mb(px(2.0))
                 .child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap_1()
+                        .items_baseline()
+                        .gap(px(10.0))
+                        .child(div().text_size(px(22.0)).text_color(t.accent).child(glyph))
                         .child(
                             div()
-                                .text_size(px(20.0))
-                                .font_weight(FontWeight::BOLD)
+                                .text_size(px(22.0))
+                                .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(t.text_primary)
                                 .child(title),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(t.text_muted)
-                                .child(subtitle),
                         ),
                 )
                 .child(
                     div()
-                        .px_3()
-                        .py(px(6.0))
-                        .rounded_md()
-                        .bg(t.glass_tint)
-                        .border_1()
-                        .border_color(t.glass_border)
-                        .text_xs()
-                        .text_color(t.text_secondary)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(t.glass_hover).text_color(t.text_primary))
-                        .child("esc  back to terminal")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.close_settings_panel(cx);
-                            }),
-                        ),
+                        .pl(px(32.0))
+                        .text_size(px(12.0))
+                        .text_color(t.text_muted)
+                        .child(subtitle),
+                )
+                .child(
+                    div()
+                        .mt(px(8.0))
+                        .h(px(2.0))
+                        .rounded_full()
+                        .bg(t.accent_glow),
                 ),
         );
 
@@ -294,6 +311,7 @@ impl SeanceWorkspace {
             SettingsSection::General => {
                 let window_settings = self.config.window;
                 content
+                    .child(settings_section_group("Window Lifecycle", &t))
                     .child(
                         settings_toggle_card(
                             "Resident process",
@@ -345,13 +363,14 @@ impl SeanceWorkspace {
                             }),
                         ),
                     )
+                    .child(settings_section_group("Keybindings", &t))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .justify_between()
                             .p_4()
-                            .rounded_xl()
+                            .rounded_lg()
                             .bg(t.glass_tint)
                             .border_1()
                             .border_color(t.glass_border)
@@ -359,11 +378,11 @@ impl SeanceWorkspace {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(4.0))
+                                    .gap(px(3.0))
                                     .child(
                                         div()
                                             .text_sm()
-                                            .font_weight(FontWeight::BOLD)
+                                            .font_weight(FontWeight::MEDIUM)
                                             .text_color(t.text_primary)
                                             .child("Keybindings"),
                                     )
@@ -371,20 +390,11 @@ impl SeanceWorkspace {
                                         div()
                                             .text_xs()
                                             .text_color(t.text_muted)
-                                            .child("Override schema is persisted, but runtime rebinding UI is still deferred."),
+                                            .child("Override schema is persisted; runtime rebinding UI is deferred."),
                                     ),
                             )
                             .child(
-                                div()
-                                    .px_3()
-                                    .py(px(6.0))
-                                    .rounded_md()
-                                    .bg(t.accent_glow)
-                                    .text_xs()
-                                    .text_color(t.text_primary)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(t.accent))
-                                    .child("reset defaults")
+                                settings_action_chip("reset defaults", &t)
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -431,6 +441,7 @@ impl SeanceWorkspace {
                 }
 
                 content
+                    .child(settings_section_group("Auto-Update", &t))
                     .child(
                         settings_toggle_card(
                             "Automatic checks",
@@ -445,6 +456,7 @@ impl SeanceWorkspace {
                             }),
                         ),
                     )
+                    .child(settings_section_group("Build Info", &t))
                     .child(
                         settings_info_card(
                             "Current build",
@@ -461,6 +473,7 @@ impl SeanceWorkspace {
                                 .child(settings_choice_chip("prompted install", true, &t)),
                         ),
                     )
+                    .child(settings_section_group("Updater", &t))
                     .child(
                         settings_info_card(
                             "Updater state",
@@ -491,7 +504,7 @@ impl SeanceWorkspace {
                     .child(
                         div()
                             .text_sm()
-                            .font_weight(FontWeight::BOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(t.text_primary)
                             .child("Bundled Themes"),
                     )
@@ -499,7 +512,7 @@ impl SeanceWorkspace {
                         div()
                             .text_xs()
                             .text_color(t.text_muted)
-                            .child("Choose a theme and apply it live across all open windows."),
+                            .child("Applied live across all open windows."),
                     );
 
                 let mut theme_grid = div().flex().flex_wrap().gap(px(8.0));
@@ -521,7 +534,7 @@ impl SeanceWorkspace {
                 content.child(
                     div()
                         .p_4()
-                        .rounded_xl()
+                        .rounded_lg()
                         .bg(t.glass_tint)
                         .border_1()
                         .border_color(t.glass_border)
@@ -568,6 +581,7 @@ impl SeanceWorkspace {
                 }
 
                 content
+                    .child(settings_section_group("Shell", &t))
                     .child(
                         settings_info_card(
                             "Local shell",
@@ -580,6 +594,7 @@ impl SeanceWorkspace {
                         )
                         .child(shell_row),
                     )
+                    .child(settings_section_group("Typography", &t))
                     .child(
                         settings_info_card(
                             "Font family",
@@ -590,64 +605,130 @@ impl SeanceWorkspace {
                         .child(font_row),
                     )
                     .child(
-                        settings_stepper_card(
-                            "Font size",
-                            format!("{:.1}px", terminal.font_size_px),
-                            "Resize the terminal text rendering baseline.",
-                            &t,
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap(px(8.0))
-                                .child(settings_action_chip("-0.5", &t).on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        let mut next = this.config.terminal.clone();
-                                        next.font_size_px = (next.font_size_px - 0.5).max(8.0);
-                                        this.persist_terminal_settings(next, cx);
-                                    }),
-                                ))
-                                .child(settings_action_chip("+0.5", &t).on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        let mut next = this.config.terminal.clone();
-                                        next.font_size_px = (next.font_size_px + 0.5).min(32.0);
-                                        this.persist_terminal_settings(next, cx);
-                                    }),
-                                )),
-                        ),
+                        div()
+                            .p_4()
+                            .rounded_lg()
+                            .bg(t.glass_tint)
+                            .border_1()
+                            .border_color(t.glass_border)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(t.text_primary)
+                                            .child("Font size"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(t.text_muted)
+                                            .child("Terminal text rendering baseline."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(settings_action_chip("-0.5", &t).on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            let mut next = this.config.terminal.clone();
+                                            next.font_size_px = (next.font_size_px - 0.5).max(8.0);
+                                            this.persist_terminal_settings(next, cx);
+                                        }),
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(t.text_primary)
+                                            .min_w(px(48.0))
+                                            .flex()
+                                            .justify_center()
+                                            .child(format!("{:.1}px", terminal.font_size_px)),
+                                    )
+                                    .child(settings_action_chip("+0.5", &t).on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            let mut next = this.config.terminal.clone();
+                                            next.font_size_px = (next.font_size_px + 0.5).min(32.0);
+                                            this.persist_terminal_settings(next, cx);
+                                        }),
+                                    )),
+                            ),
                     )
                     .child(
-                        settings_stepper_card(
-                            "Line height",
-                            format!("{:.1}px", terminal.line_height_px),
-                            "Controls row spacing and terminal geometry.",
-                            &t,
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap(px(8.0))
-                                .child(settings_action_chip("-0.5", &t).on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        let mut next = this.config.terminal.clone();
-                                        next.line_height_px =
-                                            (next.line_height_px - 0.5).max(10.0);
-                                        this.persist_terminal_settings(next, cx);
-                                    }),
-                                ))
-                                .child(settings_action_chip("+0.5", &t).on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        let mut next = this.config.terminal.clone();
-                                        next.line_height_px =
-                                            (next.line_height_px + 0.5).min(40.0);
-                                        this.persist_terminal_settings(next, cx);
-                                    }),
-                                )),
-                        ),
+                        div()
+                            .p_4()
+                            .rounded_lg()
+                            .bg(t.glass_tint)
+                            .border_1()
+                            .border_color(t.glass_border)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(t.text_primary)
+                                            .child("Line height"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(t.text_muted)
+                                            .child("Row spacing and terminal geometry."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(settings_action_chip("-0.5", &t).on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            let mut next = this.config.terminal.clone();
+                                            next.line_height_px =
+                                                (next.line_height_px - 0.5).max(10.0);
+                                            this.persist_terminal_settings(next, cx);
+                                        }),
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(t.text_primary)
+                                            .min_w(px(48.0))
+                                            .flex()
+                                            .justify_center()
+                                            .child(format!("{:.1}px", terminal.line_height_px)),
+                                    )
+                                    .child(settings_action_chip("+0.5", &t).on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            let mut next = this.config.terminal.clone();
+                                            next.line_height_px =
+                                                (next.line_height_px + 0.5).min(40.0);
+                                            this.persist_terminal_settings(next, cx);
+                                        }),
+                                    )),
+                            ),
                     )
             }
             SettingsSection::Debug => {
@@ -677,9 +758,36 @@ impl SeanceWorkspace {
                     .child(choices),
                 )
             }
-            SettingsSection::Vault => content
-                .child(self.render_vault_credentials_card(cx))
-                .child(self.render_vault_keys_card(cx)),
+            SettingsSection::Vault => {
+                let vault_status = self.backend.vault_status();
+                let content = if let Some(message) = vault_status.device_unlock_message {
+                    content.child(
+                        div()
+                            .p_4()
+                            .rounded_lg()
+                            .bg(t.glass_tint)
+                            .border_1()
+                            .border_color(t.warning)
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t.warning)
+                                    .child("Touch ID Warning"),
+                            )
+                            .child(div().text_sm().text_color(t.text_secondary).child(message)),
+                    )
+                } else {
+                    content
+                };
+
+                content
+                    .child(self.render_vault_credentials_card(cx))
+                    .child(self.render_vault_keys_card(cx))
+            }
         };
 
         div()

@@ -181,47 +181,83 @@ pub(crate) fn perf_row(
         .child(div().text_color(value_color).child(value))
 }
 
-pub(crate) fn settings_nav_button(section: SettingsSection, active: bool, theme: &Theme) -> Div {
+pub(crate) fn settings_section_group(label: &'static str, theme: &Theme) -> Div {
     div()
-        .px(px(12.0))
-        .py(px(10.0))
-        .rounded_lg()
-        .border_1()
-        .border_color(if active {
-            theme.accent
-        } else {
-            theme.glass_border
-        })
-        .bg(if active {
-            theme.accent_glow
-        } else {
-            theme.glass_tint
-        })
-        .cursor_pointer()
-        .hover(|style| style.bg(theme.glass_hover))
+        .pt(px(10.0))
+        .pb(px(2.0))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
         .child(
             div()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if active {
-                            theme.text_primary
-                        } else {
-                            theme.text_secondary
-                        })
-                        .child(section.title()),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.text_muted)
-                        .child(section.subtitle()),
-                ),
+                .w(px(4.0))
+                .h(px(4.0))
+                .rounded_full()
+                .bg(theme.accent_glow),
         )
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text_ghost)
+                .child(label.to_uppercase()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .h(px(1.0))
+                .bg(theme.glass_border_bright),
+        )
+}
+
+pub(crate) fn settings_nav_button(section: SettingsSection, active: bool, theme: &Theme) -> Div {
+    let base = div()
+        .px(px(12.0))
+        .py(px(8.0))
+        .rounded_r_md()
+        .cursor_pointer();
+
+    let styled = if active {
+        base.border_l_2()
+            .border_color(theme.accent)
+            .bg(theme.accent_glow)
+            .hover(|style| style.bg(theme.accent_glow))
+    } else {
+        base.ml(px(2.0))
+            .hover(|style| style.bg(theme.glass_hover))
+    };
+
+    styled.child(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(if active {
+                        theme.accent
+                    } else {
+                        theme.text_ghost
+                    })
+                    .child(section.glyph()),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(if active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(if active {
+                        theme.text_primary
+                    } else {
+                        theme.text_secondary
+                    })
+                    .child(section.title()),
+            ),
+    )
 }
 
 pub(crate) fn settings_choice_chip(
@@ -233,9 +269,9 @@ pub(crate) fn settings_choice_chip(
         .flex()
         .items_center()
         .gap(px(6.0))
-        .px(px(10.0))
-        .py(px(6.0))
-        .rounded_md()
+        .px(px(12.0))
+        .py(px(5.0))
+        .rounded_full()
         .border_1()
         .border_color(if active {
             theme.accent
@@ -245,7 +281,7 @@ pub(crate) fn settings_choice_chip(
         .bg(if active {
             theme.accent_glow
         } else {
-            theme.glass_tint
+            gpui::transparent_black()
         })
         .text_xs()
         .text_color(if active {
@@ -260,13 +296,13 @@ pub(crate) fn settings_choice_chip(
 
 pub(crate) fn settings_action_chip(label: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
-        .px(px(10.0))
-        .py(px(6.0))
-        .rounded_md()
+        .px(px(12.0))
+        .py(px(5.0))
+        .rounded_full()
         .border_1()
-        .border_color(theme.glass_border)
-        .bg(theme.glass_tint)
+        .border_color(theme.glass_border_bright)
         .text_xs()
+        .font_weight(FontWeight::MEDIUM)
         .text_color(theme.text_secondary)
         .cursor_pointer()
         .hover(|style| style.bg(theme.glass_hover).text_color(theme.text_primary))
@@ -279,19 +315,22 @@ pub(crate) fn settings_toggle_card(
     enabled: bool,
     theme: &Theme,
 ) -> Div {
-    div()
+    let card = div()
         .p_4()
-        .rounded_xl()
+        .rounded_lg()
         .bg(theme.glass_tint)
-        .border_1()
-        .border_color(if enabled {
-            theme.accent
-        } else {
-            theme.glass_border
-        })
         .cursor_pointer()
-        .hover(|style| style.bg(theme.glass_hover))
-        .child(
+        .hover(|style| style.bg(theme.glass_hover));
+
+    let card = if enabled {
+        card.border_l_2()
+            .border_color(theme.accent)
+    } else {
+        card.border_1()
+            .border_color(theme.glass_border)
+    };
+
+    card.child(
             div()
                 .flex()
                 .items_center()
@@ -301,11 +340,11 @@ pub(crate) fn settings_toggle_card(
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(4.0))
+                        .gap(px(3.0))
                         .child(
                             div()
                                 .text_sm()
-                                .font_weight(FontWeight::BOLD)
+                                .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text_primary)
                                 .child(title),
                         )
@@ -317,22 +356,30 @@ pub(crate) fn settings_toggle_card(
                         ),
                 )
                 .child(
+                    // Pill-shaped toggle
                     div()
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .rounded_md()
+                        .w(px(40.0))
+                        .h(px(22.0))
+                        .rounded_full()
                         .bg(if enabled {
-                            theme.accent_glow
-                        } else {
-                            theme.glass_hover
-                        })
-                        .text_xs()
-                        .text_color(if enabled {
                             theme.accent
                         } else {
-                            theme.text_ghost
+                            theme.glass_active
                         })
-                        .child(if enabled { "on" } else { "off" }),
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .rounded_full()
+                                .bg(if enabled {
+                                    theme.text_primary
+                                } else {
+                                    theme.text_ghost
+                                })
+                                .ml(if enabled { px(21.0) } else { px(3.0) }),
+                        ),
                 ),
         )
 }
@@ -345,30 +392,37 @@ pub(crate) fn settings_info_card(
 ) -> Div {
     div()
         .p_4()
-        .rounded_xl()
+        .rounded_lg()
         .bg(theme.glass_tint)
         .border_1()
         .border_color(theme.glass_border)
         .flex()
         .flex_col()
-        .gap_3()
+        .gap(px(10.0))
         .child(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(4.0))
+                .gap(px(3.0))
                 .child(
                     div()
-                        .text_sm()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.text_primary)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.text_secondary)
-                        .child(value),
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text_primary)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.accent)
+                                .child(value),
+                        ),
                 )
                 .child(
                     div()
@@ -377,15 +431,6 @@ pub(crate) fn settings_info_card(
                         .child(description),
                 ),
         )
-}
-
-pub(crate) fn settings_stepper_card(
-    title: &'static str,
-    value: String,
-    description: &'static str,
-    theme: &Theme,
-) -> Div {
-    settings_info_card(title, value, description, theme)
 }
 
 pub(crate) fn unlock_field_card(

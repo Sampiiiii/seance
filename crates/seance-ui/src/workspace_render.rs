@@ -1,8 +1,6 @@
 // Owns render-side SeanceWorkspace methods: sidebar, terminal pane, update banner, and overlays.
 
-use gpui::{
-    App, Context, Div, FontWeight, MouseButton, Window, canvas, div, prelude::*, px,
-};
+use gpui::{App, Context, Div, FontWeight, MouseButton, Window, canvas, div, prelude::*, px};
 use seance_core::UpdateState;
 use tracing::trace;
 
@@ -129,6 +127,7 @@ impl SeanceWorkspace {
     fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
         let vault_status = self.backend.vault_status();
+        let device_unlock_warning = vault_status.device_unlock_message.clone();
 
         let vault_label = if vault_status.unlocked {
             "unlocked"
@@ -223,22 +222,58 @@ impl SeanceWorkspace {
                     )
                     .child(
                         div()
-                            .font_family(SIDEBAR_FONT_MONO)
-                            .text_size(px(SIDEBAR_MONO_SIZE_PX))
-                            .text_color(t.text_ghost)
-                            .cursor_pointer()
-                            .hover(|style| style.text_color(t.text_muted))
-                            .child("^K")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.toggle_palette(cx);
-                                }),
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .font_family(SIDEBAR_FONT_MONO)
+                                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                                    .text_color(t.text_ghost)
+                                    .cursor_pointer()
+                                    .hover(|style| style.text_color(t.text_muted))
+                                    .child("⚙")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.open_settings_panel(SettingsSection::General, cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .font_family(SIDEBAR_FONT_MONO)
+                                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                                    .text_color(t.text_ghost)
+                                    .cursor_pointer()
+                                    .hover(|style| style.text_color(t.text_muted))
+                                    .child("^K")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.toggle_palette(cx);
+                                        }),
+                                    ),
                             ),
                     ),
             );
 
-        if let Some(message) = self.status_message.clone() {
+        if let Some(message) = device_unlock_warning.as_ref().map(|message| {
+            if message.contains("re-enroll") {
+                "Touch ID needs re-enrollment.".to_string()
+            } else {
+                "Touch ID unavailable in this build.".to_string()
+            }
+        }) {
+            footer = footer.child(
+                div()
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                    .text_color(t.warning)
+                    .line_clamp(2)
+                    .child(message),
+            );
+        } else if let Some(message) = self.status_message.clone() {
             footer = footer.child(
                 div()
                     .font_family(SIDEBAR_FONT_MONO)

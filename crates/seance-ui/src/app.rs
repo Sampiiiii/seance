@@ -1,9 +1,7 @@
-use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::Receiver,
-    },
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc::Receiver,
 };
 
 use anyhow::Result;
@@ -16,9 +14,9 @@ use seance_terminal::TerminalGeometry;
 use tracing::trace;
 
 use crate::{
-    CheckForUpdates, CloseActiveSession, ConnectHost, HideOtherApps, HideSeance,
-    NewTerminal, OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance,
-    SelectSession, SeanceWorkspace, SettingsSection, ShowAllApps, SwitchTheme, TogglePerfHud,
+    CheckForUpdates, CloseActiveSession, ConnectHost, HideOtherApps, HideSeance, NewTerminal,
+    OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance, SeanceWorkspace, SelectSession,
+    SettingsSection, ShowAllApps, SwitchTheme, TogglePerfHud,
     backend::UiBackend,
     forms::{SettingsPanelState, UnlockFormState},
     perf::{PerfOverlayState, RedrawReason, perf_mode_from_config, perf_mode_override_from_env},
@@ -172,7 +170,9 @@ impl WorkspaceWindowRegistry {
     fn retain_open_windows(cx: &mut App) {
         let live_windows = cx.windows();
         cx.update_global(|registry: &mut Self, _| {
-            registry.ordered.retain(|handle| live_windows.contains(handle));
+            registry
+                .ordered
+                .retain(|handle| live_windows.contains(handle));
         });
     }
 }
@@ -499,6 +499,7 @@ fn open_workspace_window(
                         bootstrap.vault_status.initialized,
                         bootstrap.vault_status.unlocked,
                         bootstrap.device_unlock_attempted,
+                        bootstrap.vault_status.device_unlock_message.as_deref(),
                     ),
                     host_editor: None,
                     credential_editor: None,
@@ -530,8 +531,16 @@ fn open_workspace_window(
                 })
                 .detach();
                 ws.apply_active_terminal_geometry(window);
-                if let Some(notify_rx) = ws.active_session().and_then(|session| session.take_notify_rx()) {
-                    SeanceWorkspace::schedule_session_watcher(window, cx, entity.clone(), notify_rx);
+                if let Some(notify_rx) = ws
+                    .active_session()
+                    .and_then(|session| session.take_notify_rx())
+                {
+                    SeanceWorkspace::schedule_session_watcher(
+                        window,
+                        cx,
+                        entity.clone(),
+                        notify_rx,
+                    );
                 }
                 SeanceWorkspace::schedule_config_watcher(
                     window,

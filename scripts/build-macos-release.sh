@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "$0")/macos-app-common.sh"
+
 version="${1:-}"
 manifest_path="${2:-}"
 if [[ -z "${version}" || -z "${manifest_path}" ]]; then
@@ -12,7 +14,10 @@ release_dir="dist/release"
 packager_dir="dist/packager"
 app_name="Seance.app"
 bundle_id="com.seance.app"
+entitlements_template="packaging/macos/Seance.entitlements.plist.in"
+entitlements_path="${packager_dir}/Seance.entitlements.plist"
 feed_url="${SEANCE_SPARKLE_FEED_URL:-https://sampiiiii.github.io/seance/sparkle/stable/appcast.xml}"
+dylib_path=""
 
 mkdir -p "${release_dir}" "${packager_dir}"
 
@@ -30,6 +35,8 @@ if [[ -z "${app_bundle}" || -z "${dmg_path}" ]]; then
   exit 1
 fi
 
+dylib_path="$(resolve_ghostty_dylib_path release)"
+
 cp packaging/macos/Info.plist "${app_bundle}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${bundle_id}" "${app_bundle}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${version}" "${app_bundle}/Contents/Info.plist"
@@ -41,6 +48,8 @@ if [[ -n "${SPARKLE_FRAMEWORK_PATH:-}" ]]; then
   mkdir -p "${app_bundle}/Contents/Frameworks"
   rsync -a "${SPARKLE_FRAMEWORK_PATH}" "${app_bundle}/Contents/Frameworks/"
 fi
+bundle_runtime_dylibs "${app_bundle}" "${dylib_path}"
+patch_runtime_search_paths "${app_bundle}/Contents/MacOS/seance-app"
 
 if [[ -n "${APPLE_CERT_P12_BASE64:-}" ]]; then
   security create-keychain -p temp build.keychain
@@ -52,7 +61,29 @@ if [[ -n "${APPLE_CERT_P12_BASE64:-}" ]]; then
 fi
 
 if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
-  codesign --force --deep --options runtime --sign "${APPLE_SIGNING_IDENTITY}" "${app_bundle}"
+  if [[ -z "${APPLE_TEAM_ID:-}" ]]; then
+    echo "APPLE_TEAM_ID is required when APPLE_SIGNING_IDENTITY is set" >&2
+    exit 1
+  fi
+  if [[ -z "${APPLE_PROVISIONING_PROFILE:-}" ]]; then
+    echo "APPLE_PROVISIONING_PROFILE is required when APPLE_SIGNING_IDENTITY is set" >&2
+    exit 1
+  fi
+
+  render_entitlements \
+    "${entitlements_template}" \
+    "${entitlements_path}" \
+    "${APPLE_TEAM_ID}" \
+    "${bundle_id}" \
+    "${APPLE_TEAM_ID}.${bundle_id}"
+  embed_provisioning_profile \
+    "${app_bundle}" \
+    "${APPLE_PROVISIONING_PROFILE}" \
+    "${APPLE_TEAM_ID}" \
+    "${bundle_id}"
+  sign_nested_macos_code "${APPLE_SIGNING_IDENTITY}" "${app_bundle}"
+  sign_macos_app "${APPLE_SIGNING_IDENTITY}" "${entitlements_path}" "${app_bundle}"
+  verify_macos_app "${app_bundle}"
   codesign --force --sign "${APPLE_SIGNING_IDENTITY}" "${dmg_path}"
 fi
 

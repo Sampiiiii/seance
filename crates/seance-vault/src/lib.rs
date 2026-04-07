@@ -1,4 +1,5 @@
 mod crypto;
+mod device_store;
 mod kdf;
 mod model;
 mod storage;
@@ -11,7 +12,6 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use keyring::Entry;
 use rand_core::{Infallible, TryCryptoRng, TryRng};
 use rusqlite::Connection;
 use secrecy::ExposeSecret;
@@ -24,6 +24,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crypto::{SecretKey, decrypt, encrypt};
+use device_store::default_device_secret_store;
+pub use device_store::{DeviceSecretError, DeviceSecretStore};
 use kdf::KdfParams;
 pub use model::{
     CredentialSummary, DeviceEnrollment, GenerateKeyAlgorithm, GenerateKeyRequest, HostAuthRef,
@@ -36,7 +38,10 @@ use model::{EncryptedRecord, RECORD_SCHEMA_VERSION, VAULT_SCHEMA_VERSION};
 pub use secrecy::SecretString;
 
 const DEVICE_STATE_KEY: &str = "local_device_id";
-const KEYRING_SERVICE_NAME: &str = "com.seance.vault";
+const DEVICE_UNLOCK_MESSAGE_KEY: &str = "device_unlock_message";
+const DEVICE_UNLOCK_BUILD_MESSAGE: &str = "Touch ID device unlock is unavailable in this build. Launch a signed Seance.app bundle to enroll and use Touch ID.";
+const DEVICE_UNLOCK_ENROLLMENT_FAILED_MESSAGE: &str = "Vault unlocked, but Touch ID enrollment failed. Launch a signed Seance.app bundle and unlock again with your passphrase to re-enroll this device.";
+const DEVICE_UNLOCK_REENROLL_MESSAGE: &str = "Touch ID device unlock needs to be re-enrolled. Unlock the vault with your passphrase once to repair it.";
 const DEFAULT_RSA_BITS: u32 = 4096;
 
 #[derive(Default)]
@@ -131,43 +136,6 @@ pub enum VaultError {
     UnsupportedPrivateKeyAlgorithm,
 }
 
-#[derive(Debug, Error)]
-pub enum DeviceSecretError {
-    #[error("key store backend error: {0}")]
-    Backend(String),
-    #[error("device secret is missing")]
-    MissingSecret,
-}
-
-pub trait DeviceSecretStore: Send + Sync {
-    fn get_secret(&self, account: &str) -> Result<Option<String>, DeviceSecretError>;
-    fn set_secret(&self, account: &str, secret: &str) -> Result<(), DeviceSecretError>;
-}
-
-#[derive(Default)]
-struct KeyringDeviceSecretStore;
-
-impl DeviceSecretStore for KeyringDeviceSecretStore {
-    fn get_secret(&self, account: &str) -> Result<Option<String>, DeviceSecretError> {
-        let entry = Entry::new(KEYRING_SERVICE_NAME, account)
-            .map_err(|err| DeviceSecretError::Backend(err.to_string()))?;
-
-        match entry.get_password() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(DeviceSecretError::Backend(err.to_string())),
-        }
-    }
-
-    fn set_secret(&self, account: &str, secret: &str) -> Result<(), DeviceSecretError> {
-        let entry = Entry::new(KEYRING_SERVICE_NAME, account)
-            .map_err(|err| DeviceSecretError::Backend(err.to_string()))?;
-        entry
-            .set_password(secret)
-            .map_err(|err| DeviceSecretError::Backend(err.to_string()))
-    }
-}
-
 pub struct VaultStore {
     vault_path: PathBuf,
     conn: Connection,
@@ -179,7 +147,7 @@ pub struct VaultStore {
 
 impl VaultStore {
     pub fn open(path: impl AsRef<Path>) -> VaultResult<Self> {
-        Self::open_with_device_store(path, Arc::new(KeyringDeviceSecretStore))
+        Self::open_with_device_store(path, default_device_secret_store())
     }
 
     pub fn open_with_device_store(
@@ -209,21 +177,31 @@ impl VaultStore {
     }
 
     pub fn status(&self) -> VaultStatus {
-        let device_unlock_available = self
-            .header
-            .as_ref()
-            .and_then(|_| {
-                storage::get_local_state(&self.conn, DEVICE_STATE_KEY)
-                    .ok()
-                    .flatten()
-            })
-            .is_some();
+        let device_unlock_message = storage::get_local_state(&self.conn, DEVICE_UNLOCK_MESSAGE_KEY)
+            .ok()
+            .flatten();
+        let device_id = self.header.as_ref().and_then(|_| {
+            storage::get_local_state(&self.conn, DEVICE_STATE_KEY)
+                .ok()
+                .flatten()
+        });
+        let device_unlock_available = self.header.is_some()
+            && device_unlock_message.is_none()
+            && device_id
+                .as_deref()
+                .and_then(|device_id| {
+                    storage::load_device_enrollment(&self.conn, device_id)
+                        .ok()
+                        .flatten()
+                })
+                .is_some_and(|enrollment| enrollment.revoked_at.is_none());
 
         VaultStatus {
             initialized: self.header.is_some(),
             unlocked: self.master_key.is_some(),
             vault_path: self.vault_path.display().to_string(),
             device_unlock_available,
+            device_unlock_message,
         }
     }
 
@@ -277,7 +255,7 @@ impl VaultStore {
         self.header = Some(header);
         self.master_key = Some(master_key);
         self.last_unlock_method = Some(UnlockMethod::Passphrase);
-        let _ = self.ensure_device_enrollment(device_name);
+        self.refresh_device_enrollment(device_name);
         Ok(())
     }
 
@@ -294,26 +272,37 @@ impl VaultStore {
         }
 
         let account = device_account_name(&header.vault_id, &device_id);
-        let Some(secret) = self.device_store.get_secret(&account)? else {
-            return Ok(false);
+        let secret = match self.device_store.get_secret(&account) {
+            Ok(Some(secret)) => secret,
+            Ok(None) => return Ok(false),
+            Err(DeviceSecretError::UnavailableInThisBuild) => {
+                self.persist_device_unlock_message(Some(DEVICE_UNLOCK_BUILD_MESSAGE));
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
         };
 
-        let device_key_bytes = Zeroizing::new(
-            BASE64
-                .decode(secret.as_bytes())
-                .map_err(|err| VaultError::CorruptVault(err.to_string()))?,
-        );
-        let device_key = SecretKey::from_slice(device_key_bytes.as_ref())?;
-        let master_key = decrypt(
+        let Ok(device_key) = SecretKey::from_slice(secret.as_ref()) else {
+            self.persist_device_unlock_message(Some(DEVICE_UNLOCK_REENROLL_MESSAGE));
+            return Ok(false);
+        };
+        let Ok(master_key) = decrypt(
             &device_key,
             &enrollment.wrapping_nonce,
             &enrollment.wrapped_master_key,
             device_wrap_aad(&header.vault_id, &device_id).as_bytes(),
-        )?;
-        let master_key = SecretKey::from_slice(master_key.as_ref())?;
+        ) else {
+            self.persist_device_unlock_message(Some(DEVICE_UNLOCK_REENROLL_MESSAGE));
+            return Ok(false);
+        };
+        let Ok(master_key) = SecretKey::from_slice(master_key.as_ref()) else {
+            self.persist_device_unlock_message(Some(DEVICE_UNLOCK_REENROLL_MESSAGE));
+            return Ok(false);
+        };
 
         self.master_key = Some(master_key);
         self.last_unlock_method = Some(UnlockMethod::Device);
+        self.persist_device_unlock_message(None);
         storage::update_device_last_used(&self.conn, &device_id, now_ts())?;
         Ok(true)
     }
@@ -332,7 +321,7 @@ impl VaultStore {
 
         self.master_key = Some(master_key);
         self.last_unlock_method = Some(UnlockMethod::Passphrase);
-        let _ = self.ensure_device_enrollment(device_name);
+        self.refresh_device_enrollment(device_name);
         Ok(())
     }
 
@@ -737,22 +726,9 @@ impl VaultStore {
         };
 
         let account = device_account_name(&header.vault_id, &device_id);
-        let device_key = match self.device_store.get_secret(&account)? {
-            Some(secret) => {
-                let bytes = Zeroizing::new(
-                    BASE64
-                        .decode(secret.as_bytes())
-                        .map_err(|err| VaultError::CorruptVault(err.to_string()))?,
-                );
-                SecretKey::from_slice(bytes.as_ref())?
-            }
-            None => {
-                let new_key = SecretKey::generate();
-                self.device_store
-                    .set_secret(&account, &BASE64.encode(new_key.as_bytes()))?;
-                new_key
-            }
-        };
+        let device_key = SecretKey::generate();
+        self.device_store
+            .set_secret(&account, device_key.as_bytes())?;
 
         let envelope = encrypt(
             &device_key,
@@ -771,6 +747,26 @@ impl VaultStore {
         };
         storage::upsert_device_enrollment(&self.conn, &enrollment)?;
         Ok(())
+    }
+
+    fn refresh_device_enrollment(&mut self, device_name: &str) {
+        match self.ensure_device_enrollment(device_name) {
+            Ok(()) => self.persist_device_unlock_message(None),
+            Err(_) => {
+                self.persist_device_unlock_message(Some(DEVICE_UNLOCK_ENROLLMENT_FAILED_MESSAGE))
+            }
+        }
+    }
+
+    fn persist_device_unlock_message(&self, message: Option<&str>) {
+        match message {
+            Some(message) => {
+                let _ = storage::set_local_state(&self.conn, DEVICE_UNLOCK_MESSAGE_KEY, message);
+            }
+            None => {
+                let _ = storage::delete_local_state(&self.conn, DEVICE_UNLOCK_MESSAGE_KEY);
+            }
+        }
     }
 }
 
@@ -900,30 +896,56 @@ mod tests {
 
     #[derive(Default)]
     struct MemoryDeviceSecretStore {
-        secrets: Mutex<HashMap<String, String>>,
+        secrets: Mutex<HashMap<String, Vec<u8>>>,
+        fail_on_get: Mutex<Option<DeviceSecretError>>,
+        fail_on_set: Mutex<Option<DeviceSecretError>>,
+    }
+
+    impl MemoryDeviceSecretStore {
+        fn secret_for(&self, account: &str) -> Option<Vec<u8>> {
+            self.secrets.lock().unwrap().get(account).cloned()
+        }
+
+        fn fail_next_get(&self, error: DeviceSecretError) {
+            *self.fail_on_get.lock().unwrap() = Some(error);
+        }
+
+        fn fail_next_set(&self, error: DeviceSecretError) {
+            *self.fail_on_set.lock().unwrap() = Some(error);
+        }
     }
 
     impl DeviceSecretStore for MemoryDeviceSecretStore {
-        fn get_secret(&self, account: &str) -> Result<Option<String>, DeviceSecretError> {
+        fn get_secret(&self, account: &str) -> Result<Option<Vec<u8>>, DeviceSecretError> {
+            if let Some(error) = self.fail_on_get.lock().unwrap().take() {
+                return Err(error);
+            }
             Ok(self.secrets.lock().unwrap().get(account).cloned())
         }
 
-        fn set_secret(&self, account: &str, secret: &str) -> Result<(), DeviceSecretError> {
+        fn set_secret(&self, account: &str, secret: &[u8]) -> Result<(), DeviceSecretError> {
+            if let Some(error) = self.fail_on_set.lock().unwrap().take() {
+                return Err(error);
+            }
             self.secrets
                 .lock()
                 .unwrap()
-                .insert(account.into(), secret.into());
+                .insert(account.into(), secret.to_vec());
             Ok(())
         }
     }
 
     fn make_vault() -> (tempfile::TempDir, VaultStore) {
+        let (_dir, vault, _) = make_vault_with_store();
+        (_dir, vault)
+    }
+
+    fn make_vault_with_store() -> (tempfile::TempDir, VaultStore, Arc<MemoryDeviceSecretStore>) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.sqlite");
-        let vault =
-            VaultStore::open_with_device_store(path, Arc::new(MemoryDeviceSecretStore::default()))
-                .unwrap();
-        (dir, vault)
+        let store = Arc::new(MemoryDeviceSecretStore::default());
+        let vault = VaultStore::open_with_device_store(path, store.clone()).unwrap();
+        (dir, vault, store)
     }
 
     fn secret(value: &str) -> SecretString {
@@ -1130,5 +1152,137 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, VaultError::MissingCredentialReference(_)));
+    }
+
+    #[test]
+    fn stores_raw_device_secret_bytes_for_device_unlock() {
+        let (_dir, mut vault, store) = make_vault_with_store();
+        vault
+            .create_vault(&secret("correct horse battery staple"), "test-device")
+            .unwrap();
+
+        let header = storage::load_header(&vault.conn).unwrap().unwrap();
+        let device_id = storage::get_local_state(&vault.conn, DEVICE_STATE_KEY)
+            .unwrap()
+            .unwrap();
+        let account = device_account_name(&header.vault_id, &device_id);
+        let stored_secret = store.secret_for(&account).unwrap();
+
+        assert_eq!(stored_secret.len(), 32);
+
+        vault.lock();
+        assert!(vault.try_unlock_with_device().unwrap());
+    }
+
+    #[test]
+    fn passphrase_unlock_reenrolls_device_with_fresh_secret() {
+        let (_dir, mut vault, store) = make_vault_with_store();
+        vault
+            .create_vault(&secret("correct horse battery staple"), "test-device")
+            .unwrap();
+
+        let header = storage::load_header(&vault.conn).unwrap().unwrap();
+        let device_id = storage::get_local_state(&vault.conn, DEVICE_STATE_KEY)
+            .unwrap()
+            .unwrap();
+        let account = device_account_name(&header.vault_id, &device_id);
+        let original_secret = store.secret_for(&account).unwrap();
+
+        vault.lock();
+        vault
+            .unlock_with_passphrase(&secret("correct horse battery staple"), "test-device")
+            .unwrap();
+
+        let refreshed_secret = store.secret_for(&account).unwrap();
+        assert_ne!(refreshed_secret, original_secret);
+        assert_eq!(vault.status().device_unlock_message, None);
+
+        vault.lock();
+        assert!(vault.try_unlock_with_device().unwrap());
+    }
+
+    #[test]
+    fn status_reports_device_unlock_warning_and_disables_device_unlock() {
+        let (_dir, mut vault) = make_vault();
+        vault
+            .create_vault(&secret("correct horse battery staple"), "test-device")
+            .unwrap();
+        storage::set_local_state(
+            &vault.conn,
+            DEVICE_UNLOCK_MESSAGE_KEY,
+            DEVICE_UNLOCK_BUILD_MESSAGE,
+        )
+        .unwrap();
+
+        let status = vault.status();
+        assert!(!status.device_unlock_available);
+        assert_eq!(
+            status.device_unlock_message.as_deref(),
+            Some(DEVICE_UNLOCK_BUILD_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn unlock_with_passphrase_records_enrollment_warning_without_failing() {
+        let (_dir, mut vault, store) = make_vault_with_store();
+        vault
+            .create_vault(&secret("correct horse battery staple"), "test-device")
+            .unwrap();
+        vault.lock();
+        store.fail_next_set(DeviceSecretError::UnavailableInThisBuild);
+
+        vault
+            .unlock_with_passphrase(&secret("correct horse battery staple"), "test-device")
+            .unwrap();
+
+        let status = vault.status();
+        assert!(status.unlocked);
+        assert!(!status.device_unlock_available);
+        assert_eq!(
+            status.device_unlock_message.as_deref(),
+            Some(DEVICE_UNLOCK_ENROLLMENT_FAILED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn successful_passphrase_unlock_clears_previous_enrollment_warning() {
+        let (_dir, mut vault, store) = make_vault_with_store();
+        store.fail_next_set(DeviceSecretError::UnavailableInThisBuild);
+        vault
+            .create_vault(&secret("correct horse battery staple"), "test-device")
+            .unwrap();
+
+        assert_eq!(
+            vault.status().device_unlock_message.as_deref(),
+            Some(DEVICE_UNLOCK_ENROLLMENT_FAILED_MESSAGE)
+        );
+
+        vault.lock();
+        vault
+            .unlock_with_passphrase(&secret("correct horse battery staple"), "test-device")
+            .unwrap();
+
+        let status = vault.status();
+        assert_eq!(status.device_unlock_message, None);
+        assert!(status.device_unlock_available);
+
+        vault.lock();
+        assert!(vault.try_unlock_with_device().unwrap());
+    }
+
+    #[test]
+    fn device_unlock_build_failure_records_warning_and_falls_back() {
+        let (_dir, mut vault, store) = make_vault_with_store();
+        vault
+            .create_vault(&secret("correct horse battery staple"), "test-device")
+            .unwrap();
+        vault.lock();
+        store.fail_next_get(DeviceSecretError::UnavailableInThisBuild);
+
+        assert!(!vault.try_unlock_with_device().unwrap());
+        assert_eq!(
+            vault.status().device_unlock_message.as_deref(),
+            Some(DEVICE_UNLOCK_BUILD_MESSAGE)
+        );
     }
 }

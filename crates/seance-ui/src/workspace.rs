@@ -348,9 +348,15 @@ impl SeanceWorkspace {
                     self.unlock_form.confirm_passphrase.clear();
                     match result {
                         Ok(()) => {
+                            let vault_status = self.backend.vault_status();
                             self.unlock_form.completed = true;
                             self.status_message = Some(
-                                "Encrypted vault created. Device unlock is now enrolled.".into(),
+                                if vault_status.device_unlock_message.is_some() {
+                                    "Encrypted vault created. Touch ID is not available for this build yet."
+                                        .into()
+                                } else {
+                                    "Encrypted vault created. Device unlock is now enrolled.".into()
+                                },
                             );
                             self.refresh_saved_hosts();
                             self.refresh_vault_cache();
@@ -368,9 +374,16 @@ impl SeanceWorkspace {
                 self.unlock_form.confirm_passphrase.clear();
                 match result {
                     Ok(()) => {
+                        let vault_status = self.backend.vault_status();
                         self.unlock_form.completed = true;
-                        self.status_message =
-                            Some("Vault unlocked from the recovery passphrase.".into());
+                        self.status_message = Some(
+                            if vault_status.device_unlock_message.is_some() {
+                                "Vault unlocked from the recovery passphrase. Touch ID is not available for this build yet."
+                                    .into()
+                            } else {
+                                "Vault unlocked from the recovery passphrase.".into()
+                            },
+                        );
                         self.refresh_saved_hosts();
                         self.refresh_vault_cache();
                     }
@@ -517,6 +530,10 @@ impl SeanceWorkspace {
             }
             PaletteAction::OpenSftpBrowser(session_id) => {
                 self.open_sftp_browser(session_id, cx);
+                return;
+            }
+            PaletteAction::OpenPreferences => {
+                self.open_settings_panel(SettingsSection::General, cx);
                 return;
             }
         }
@@ -828,9 +845,8 @@ impl SeanceWorkspace {
                 editor.selected_field = (editor.selected_field + 1) % CredentialField::ALL.len();
             }
             "up" => {
-                editor.selected_field =
-                    (editor.selected_field + CredentialField::ALL.len() - 1)
-                        % CredentialField::ALL.len();
+                editor.selected_field = (editor.selected_field + CredentialField::ALL.len() - 1)
+                    % CredentialField::ALL.len();
             }
             "backspace" => match editor.field() {
                 CredentialField::Label => {

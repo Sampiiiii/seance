@@ -49,6 +49,7 @@ pub enum PaletteAction {
     DeleteSavedHost(String),
     ConnectSavedHost(String),
     OpenSftpBrowser(u64),
+    OpenPreferences,
 }
 
 #[derive(Clone)]
@@ -254,7 +255,7 @@ pub fn build_items(
             hint: "Manage credentials and SSH keys".into(),
             action: PaletteAction::OpenVaultPanel,
             group: PaletteGroup::Vault,
-            shortcut: Some("\u{2318},"),
+            shortcut: None,
             match_indices: Vec::new(),
         });
         items.push(PaletteItem {
@@ -371,6 +372,16 @@ pub fn build_items(
     }
 
     // --- System group ---
+
+    items.push(PaletteItem {
+        glyph: "⚙",
+        label: "Open Preferences".into(),
+        hint: "App settings and configuration".into(),
+        action: PaletteAction::OpenPreferences,
+        group: PaletteGroup::System,
+        shortcut: Some("\u{2318},"),
+        match_indices: Vec::new(),
+    });
 
     items.push(PaletteItem {
         glyph: "↑",

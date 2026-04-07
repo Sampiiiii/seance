@@ -69,11 +69,12 @@ These are referenced directly by [.github/workflows/release.yml](.github/workflo
 1. `APPLE_CERT_P12_BASE64`
 2. `APPLE_CERT_PASSWORD`
 3. `APPLE_SIGNING_IDENTITY`
-4. `APPLE_API_KEY_ID`
-5. `APPLE_API_ISSUER_ID`
-6. `APPLE_API_PRIVATE_KEY_BASE64`
-7. `SPARKLE_PUBLIC_KEY`
-8. `SPARKLE_PRIVATE_KEY`
+4. `APPLE_TEAM_ID`
+5. `APPLE_API_KEY_ID`
+6. `APPLE_API_ISSUER_ID`
+7. `APPLE_API_PRIVATE_KEY_BASE64`
+8. `SPARKLE_PUBLIC_KEY`
+9. `SPARKLE_PRIVATE_KEY`
 
 ### Expected external tooling
 
@@ -104,6 +105,25 @@ For a metadata-only dry check against an existing release directory:
 make release-validate RELEASE_DIR=dist/release
 make release-checksums RELEASE_DIR=dist/release
 ```
+
+For Touch ID validation on macOS, do not use `cargo run` or `make run`. Create a local signing file and build or launch a signed app bundle instead:
+
+```bash
+cp .env.macos-signing.example .env.macos-signing
+# edit .env.macos-signing with your Apple team id, Apple Development identity,
+# and a macOS development provisioning profile for com.seance.app.dev
+make run-macos-signed
+codesign -d --entitlements :- dist/dev-macos/Seance.app
+security cms -D -i dist/dev-macos/Seance.app/Contents/embedded.provisionprofile
+```
+
+If device unlock was enrolled from an unsigned or older build, unlock once with the recovery passphrase in the signed app bundle to re-enroll this device, then relaunch and validate the Touch ID prompt.
+
+Local Touch ID setup requires:
+
+1. An App ID for `com.seance.app.dev`
+2. A macOS development provisioning profile for that App ID
+3. `APPLE_DEV_PROVISIONING_PROFILE` set in `.env.macos-signing`
 
 If you want to exercise the manifest flow without real signing or packaging, run the manifest smoke path that was already used during implementation and verify these outputs exist:
 
@@ -214,8 +234,9 @@ Recovery:
 Likely causes:
 
 1. Apple signing or notarization secrets are missing or invalid.
-2. `cargo-packager` changed output layout.
-3. Signing identity or certificate import failed.
+2. `APPLE_TEAM_ID` or the app entitlements are missing.
+3. `cargo-packager` changed output layout.
+4. Signing identity or certificate import failed.
 
 Recovery:
 

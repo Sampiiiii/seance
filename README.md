@@ -55,17 +55,47 @@ cd seance
 make run
 ```
 
+`make run` uses `cargo run` and is fine for normal local development, but it is not a valid Touch ID test path on macOS. Touch ID-backed vault unlock requires a signed `Seance.app` bundle with keychain entitlements.
+
 Other useful targets:
 
 ```bash
 make run-perf           # Compact performance HUD
 make run-perf-expanded  # Expanded performance HUD
 make run-trace          # Tracing enabled
+make build-macos-signed-app  # Build a signed macOS app bundle for Touch ID testing
+make run-macos-signed        # Build and launch the signed macOS app bundle
 make check              # cargo check
 make clippy             # Clippy with -D warnings
 make test               # Run tests
 make fmt                # Format code
 ```
+
+For local Touch ID verification on macOS, create a local signing file once and use the signed app path instead of `cargo run`:
+
+```bash
+cp .env.macos-signing.example .env.macos-signing
+# edit .env.macos-signing with your Apple team id, Apple Development identity,
+# and a macOS development provisioning profile for com.seance.app.dev
+make run-macos-signed
+```
+
+You can verify the resulting app entitlements with:
+
+```bash
+codesign -d --entitlements :- dist/dev-macos/Seance.app
+security cms -D -i dist/dev-macos/Seance.app/Contents/embedded.provisionprofile
+```
+
+If you previously enrolled device unlock from an unsigned or older build, unlock once with the recovery passphrase in the signed app to re-enroll this device, then relaunch and test Touch ID.
+
+Local macOS Touch ID setup requires:
+
+- an App ID for `com.seance.app.dev`
+- a macOS development provisioning profile for that App ID
+- `APPLE_DEV_PROVISIONING_PROFILE` set in `.env.macos-signing`
+
+`make run-macos-signed` and `make build-macos-signed-app` will automatically load `.env.macos-signing` if it exists. If it does not, they still accept explicit `APPLE_TEAM_ID`, `APPLE_DEVELOPMENT_SIGNING_IDENTITY`, and `APPLE_DEV_PROVISIONING_PROFILE` environment variables.
 
 Release metadata and artifact naming now go through the Rust build helper:
 

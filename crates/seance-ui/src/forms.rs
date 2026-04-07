@@ -18,7 +18,12 @@ pub(crate) struct UnlockFormState {
 }
 
 impl UnlockFormState {
-    pub(crate) fn new(initialized: bool, unlocked: bool, device_unlock_attempted: bool) -> Self {
+    pub(crate) fn new(
+        initialized: bool,
+        unlocked: bool,
+        device_unlock_attempted: bool,
+        device_unlock_message: Option<&str>,
+    ) -> Self {
         let mode = if initialized {
             UnlockMode::Unlock
         } else {
@@ -27,7 +32,11 @@ impl UnlockFormState {
         let message = if unlocked {
             Some("Vault unlocked from the local device key store.".into())
         } else if initialized && device_unlock_attempted {
-            Some("Device unlock unavailable. Enter your recovery passphrase.".into())
+            Some(
+                device_unlock_message
+                    .unwrap_or("Device unlock unavailable. Enter your recovery passphrase.")
+                    .to_string(),
+            )
         } else if initialized {
             Some("Unlock the vault to decrypt saved hosts.".into())
         } else {
@@ -237,6 +246,17 @@ impl SettingsSection {
             Self::Terminal => "Shell and terminal rendering defaults",
             Self::Debug => "Performance HUD defaults",
             Self::Vault => "Encrypted credentials and SSH keys",
+        }
+    }
+
+    pub(crate) fn glyph(self) -> &'static str {
+        match self {
+            Self::General => "⚙",
+            Self::Updates => "↑",
+            Self::Appearance => "◑",
+            Self::Terminal => "▸",
+            Self::Debug => "⚡",
+            Self::Vault => "◆",
         }
     }
 }

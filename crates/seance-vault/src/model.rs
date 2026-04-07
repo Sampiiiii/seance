@@ -235,6 +235,7 @@ pub struct VaultStatus {
     pub unlocked: bool,
     pub vault_path: String,
     pub device_unlock_available: bool,
+    pub device_unlock_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
