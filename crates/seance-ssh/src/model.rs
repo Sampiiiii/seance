@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc::Receiver};
 
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 use crate::session::SshSessionHandle;
 
@@ -51,6 +52,45 @@ pub struct SshConnectResult {
     pub sftp: SftpBootstrapHandle,
 }
 
+pub struct SshConnectTask {
+    pub session_id: u64,
+    pub result_rx: Receiver<std::result::Result<SshConnectResult, SshError>>,
+    pub abort_handle: SshConnectAbortHandle,
+}
+
+#[derive(Clone, Default)]
+pub struct SshConnectAbortHandle {
+    cancel_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl std::fmt::Debug for SshConnectAbortHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshConnectAbortHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SshConnectAbortHandle {
+    pub(crate) fn new(cancel_tx: oneshot::Sender<()>) -> Self {
+        Self {
+            cancel_tx: Arc::new(Mutex::new(Some(cancel_tx))),
+        }
+    }
+
+    pub fn abort(&self) -> bool {
+        let Some(cancel_tx) = self
+            .cancel_tx
+            .lock()
+            .expect("SSH connect abort handle poisoned")
+            .take()
+        else {
+            return false;
+        };
+
+        cancel_tx.send(()).is_ok()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SshError {
     #[error("no SSH auth methods were resolved for this host")]
@@ -61,6 +101,10 @@ pub enum SshError {
     InvalidPrivateKey(String),
     #[error("SSH transport error: {0}")]
     Transport(String),
+    #[error("SSH connect timed out")]
+    TimedOut,
+    #[error("SSH connect cancelled")]
+    Cancelled,
     #[error("SFTP bootstrap failed: {0}")]
     SftpBootstrap(String),
     #[error("no SFTP session for this connection")]

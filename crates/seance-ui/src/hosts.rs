@@ -3,7 +3,7 @@
 use gpui::{Context, Div, FontWeight, MouseButton, div, prelude::*, px};
 
 use crate::{
-    SIDEBAR_FONT_MONO, SIDEBAR_MONO_SIZE_PX, SeanceWorkspace,
+    ConnectHostInNewWindow, SIDEBAR_FONT_MONO, SIDEBAR_MONO_SIZE_PX, SeanceWorkspace,
     forms::{UnlockMode, VaultModalOrigin},
     perf::RedrawReason,
     workspace::host_scope_key,
@@ -38,10 +38,8 @@ impl SeanceWorkspace {
             .selected_host_id
             .as_ref()
             .is_some_and(|id| id == &scope_key);
-        let is_connecting = self
-            .connecting_host_id
-            .as_ref()
-            .is_some_and(|id| id == &scope_key);
+        let pending_attempt_id = self.connect_attempts.attempt_id_for_host(&scope_key);
+        let is_connecting = pending_attempt_id.is_some();
         let host_id = host.host.id.clone();
         let vault_id = host.vault_id.clone();
         let label = host.host.label.clone();
@@ -50,6 +48,30 @@ impl SeanceWorkspace {
             host.host.username, host.host.hostname, host.host.port
         );
         let vault_label = host.vault_name.clone();
+        let mut meta = div().flex().items_center().gap(px(8.0)).child(
+            div()
+                .font_family(SIDEBAR_FONT_MONO)
+                .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                .text_color(theme.text_ghost)
+                .child(vault_label),
+        );
+        if let Some(attempt_id) = pending_attempt_id {
+            meta = meta.child(
+                div()
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                    .text_color(theme.warning)
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(theme.text_primary))
+                    .child("cancel")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.cancel_connect_attempt(attempt_id, cx);
+                        }),
+                    ),
+            );
+        }
 
         self.sidebar_row_shell(selected || is_connecting)
             .child(
@@ -97,18 +119,23 @@ impl SeanceWorkspace {
                             .child(target),
                     ),
             )
-            .child(
-                div()
-                    .font_family(SIDEBAR_FONT_MONO)
-                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
-                    .text_color(theme.text_ghost)
-                    .child(vault_label),
-            )
+            .child(meta)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                     this.selected_host_id = Some(scope_key.clone());
-                    this.connect_saved_host(&vault_id, &host_id, window, cx);
+                    if event.modifiers.shift {
+                        cx.dispatch_action(&ConnectHostInNewWindow {
+                            vault_id: vault_id.clone(),
+                            host_id: host_id.clone(),
+                        });
+                        return;
+                    }
+                    if is_connecting {
+                        cx.notify();
+                        return;
+                    }
+                    this.start_connect_attempt(&vault_id, &host_id, window, cx);
                 }),
             )
     }

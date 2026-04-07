@@ -1,16 +1,22 @@
 // Owns session queries, lifecycle, SSH connection finalization, and session-specific UI.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use gpui::{Context, Div, FontWeight, MouseButton, Window, div, prelude::*, px};
 use seance_core::SessionKind;
 use seance_ssh::{SshConnectResult, SshError};
 use seance_terminal::{TerminalGeometry, TerminalSession};
+use tracing::trace;
 
 use crate::{
-    SIDEBAR_FONT_MONO, SIDEBAR_MONO_SIZE_PX, SeanceWorkspace, forms::WorkspaceSurface,
-    local_session_display_number_for_ids, perf::RedrawReason, refresh_app_menus,
-    session_kind_map_from_sessions, ui_components::session_preview_text,
+    SIDEBAR_FONT_MONO, SIDEBAR_MONO_SIZE_PX, SeanceWorkspace,
+    connect::{ConnectAttemptId, PendingConnect},
+    forms::WorkspaceSurface,
+    local_session_display_number_for_ids,
+    perf::RedrawReason,
+    refresh_app_menus, session_kind_map_from_sessions,
+    ui_components::session_preview_text,
+    workspace::host_scope_key,
 };
 
 impl SeanceWorkspace {
@@ -108,7 +114,26 @@ impl SeanceWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.connecting_host_id.is_some() {
+        self.start_connect_attempt(vault_id, host_id, window, cx);
+    }
+
+    pub(crate) fn start_connect_attempt(
+        &mut self,
+        vault_id: &str,
+        host_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let scope_key = host_scope_key(vault_id, host_id);
+        self.selected_host_id = Some(scope_key.clone());
+
+        if self
+            .connect_attempts
+            .attempt_id_for_host(&scope_key)
+            .is_some()
+        {
+            trace!(%scope_key, "ignoring duplicate SSH connect request for host");
+            cx.notify();
             return;
         }
 
@@ -121,59 +146,169 @@ impl SeanceWorkspace {
             }
         };
 
-        self.connecting_host_id = Some(crate::workspace::host_scope_key(vault_id, host_id));
-        self.selected_host_id = Some(crate::workspace::host_scope_key(vault_id, host_id));
-        self.show_toast("Connecting…");
+        let host_label = request.connection.label.clone();
+        let connect_task = match self.backend.ssh_manager().start_connect(request) {
+            Ok(connect_task) => connect_task,
+            Err(err) => {
+                self.show_toast(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let session_id = connect_task.session_id;
+        let result_rx = connect_task.result_rx;
+        let abort_handle = connect_task.abort_handle;
+        let attempt_id = self.connect_attempts.next_attempt_id();
+        let pending = PendingConnect {
+            id: attempt_id,
+            host_scope_key: scope_key,
+            vault_id: vault_id.into(),
+            host_id: host_id.into(),
+            host_label: host_label.clone(),
+            session_id,
+            started_at: Instant::now(),
+            abort_handle,
+        };
+        self.connect_attempts.start(pending);
+        trace!(
+            attempt_id,
+            session_id,
+            host = %host_label,
+            "started SSH connect attempt"
+        );
+        self.show_toast(format!("Connecting to {host_label}..."));
+        self.perf_overlay.mark_input(RedrawReason::Input);
         cx.notify();
 
-        let ssh = self.backend.ssh_manager();
         let entity = cx.entity();
 
         window
             .spawn(cx, async move |cx| {
                 let result = cx
                     .background_executor()
-                    .spawn(async move { ssh.connect(request) })
+                    .spawn(async move {
+                        result_rx.recv().unwrap_or_else(|_| {
+                            Err(SshError::Transport(
+                                "SSH connect task ended unexpectedly".into(),
+                            ))
+                        })
+                    })
                     .await;
 
-                let _ = cx.update(|window, cx| {
+                let _ = cx.update(move |window, cx| {
                     entity.update(cx, |this, cx| {
-                        this.finish_connect(result, window, cx);
+                        this.complete_connect_attempt(attempt_id, result, window, cx);
                     });
                 });
             })
             .detach();
     }
 
-    fn finish_connect(
+    pub(crate) fn cancel_connect_attempt(
         &mut self,
+        attempt_id: ConnectAttemptId,
+        cx: &mut Context<Self>,
+    ) {
+        let cancelled = self
+            .connect_attempts
+            .pending(attempt_id)
+            .is_some_and(|attempt| attempt.abort_handle.abort());
+        if !cancelled {
+            trace!(
+                attempt_id,
+                "SSH connect cancel ignored because task already completed"
+            );
+            return;
+        }
+
+        let Some(removed) = self.connect_attempts.remove(attempt_id) else {
+            return;
+        };
+        let elapsed_ms = removed.pending.started_at.elapsed().as_millis();
+        trace!(
+            attempt_id,
+            session_id = removed.pending.session_id,
+            vault_id = %removed.pending.vault_id,
+            host_id = %removed.pending.host_id,
+            host = %removed.pending.host_label,
+            elapsed_ms,
+            "cancelled SSH connect attempt"
+        );
+        self.show_toast(format!("Cancelled connect: {}", removed.pending.host_label));
+        self.perf_overlay.mark_input(RedrawReason::Input);
+        cx.notify();
+    }
+
+    fn complete_connect_attempt(
+        &mut self,
+        attempt_id: ConnectAttemptId,
         result: Result<SshConnectResult, SshError>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.connecting_host_id = None;
+        let Some(removed) = self.connect_attempts.remove(attempt_id) else {
+            trace!(
+                attempt_id,
+                "ignoring late SSH connect completion for removed attempt"
+            );
+            return;
+        };
+        let elapsed_ms = removed.pending.started_at.elapsed().as_millis();
+
         match result {
             Ok(result) => {
                 let session: Arc<dyn TerminalSession> = result.session;
                 if let Some(geometry) = self.last_applied_geometry {
                     let _ = session.resize(geometry);
                 }
-                self.active_session_id = session.id();
                 self.backend.register_remote_session(Arc::clone(&session));
                 if let Some(notify_rx) = session.take_notify_rx() {
                     Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
                 }
                 self.backend.touch_session(session.id());
-                self.surface = WorkspaceSurface::Terminal;
-                self.show_toast("SSH session connected.");
-                self.invalidate_terminal_surface();
+                trace!(
+                    attempt_id,
+                    session_id = session.id(),
+                    vault_id = %removed.pending.vault_id,
+                    host_id = %removed.pending.host_id,
+                    host = %removed.pending.host_label,
+                    elapsed_ms,
+                    foreground = removed.was_foreground,
+                    "SSH connect attempt completed"
+                );
+                if removed.was_foreground {
+                    self.active_session_id = session.id();
+                    self.surface = WorkspaceSurface::Terminal;
+                    self.show_toast(format!("Connected: {}", removed.pending.host_label));
+                    self.invalidate_terminal_surface();
+                } else {
+                    self.show_toast(format!("Connected: {}", removed.pending.host_label));
+                }
             }
             Err(err) => {
-                self.show_toast(err.to_string());
+                trace!(
+                    attempt_id,
+                    session_id = removed.pending.session_id,
+                    vault_id = %removed.pending.vault_id,
+                    host_id = %removed.pending.host_id,
+                    host = %removed.pending.host_label,
+                    elapsed_ms,
+                    error = %err,
+                    "SSH connect attempt failed"
+                );
+                let message = match err {
+                    SshError::TimedOut => {
+                        format!("Connect timed out: {}", removed.pending.host_label)
+                    }
+                    SshError::Cancelled => {
+                        format!("Cancelled connect: {}", removed.pending.host_label)
+                    }
+                    other => other.to_string(),
+                };
+                self.show_toast(message);
             }
         }
-        self.palette_open = false;
-        self.perf_overlay.mark_input(RedrawReason::Palette);
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
         refresh_app_menus(cx);
         cx.notify();
     }

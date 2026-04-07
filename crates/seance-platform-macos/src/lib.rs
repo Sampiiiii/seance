@@ -387,6 +387,7 @@ mod tests {
             app_root: app_root.clone(),
             config_path: app_root.join("config.toml"),
             vault_db_path: app_root.join("vault.sqlite"),
+            vaults_dir: app_root.join("vaults"),
             ipc_socket_path: app_root.join("resident.sock"),
             instance_lock_path: app_root.join("resident.lock"),
         };
@@ -460,17 +461,26 @@ mod tests {
     fn host_menu_contains_saved_hosts() -> Result<()> {
         let controller = test_controller()?;
         controller.create_vault(&SecretString::from("passphrase".to_string()), "Test Device")?;
-        controller.save_host(VaultHostProfile {
-            id: String::new(),
-            label: "prod".into(),
-            hostname: "prod.example.com".into(),
-            port: 22,
-            username: "sam".into(),
-            notes: None,
-            auth_order: Vec::new(),
-        })?;
+        let vault_id = controller
+            .list_vaults()
+            .into_iter()
+            .next()
+            .map(|vault| vault.vault_id)
+            .expect("vault should exist after creation");
+        controller.save_host(
+            &vault_id,
+            VaultHostProfile {
+                id: String::new(),
+                label: "prod".into(),
+                hostname: "prod.example.com".into(),
+                port: 22,
+                username: "sam".into(),
+                notes: None,
+                auth_order: Vec::new(),
+            },
+        )?;
 
-        assert_eq!(host_menu_labels(&controller), vec!["prod"]);
+        assert_eq!(host_menu_labels(&controller), vec!["prod (Personal)"]);
         Ok(())
     }
 

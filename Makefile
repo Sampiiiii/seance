@@ -5,7 +5,7 @@ RELEASE_DIR ?= dist/release
 VERSION ?=
 MACOS_SIGNING_ENV_FILE ?= .env.macos-signing
 
-.PHONY: help run run-perf run-perf-expanded run-trace run-perf-trace run-macos-signed build-macos-signed-app check build fmt clippy test clean release-version release-notes release-artifacts release-validate release-checksums
+.PHONY: help run run-perf run-perf-expanded run-trace run-perf-trace run-macos-signed build-macos-signed-app check build fmt fmt-check clippy test clean release-version release-notes release-artifacts release-validate release-checksums
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "}; /^[a-zA-Z0-9_-]+:.*## / {printf "  %-10s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -56,11 +56,14 @@ build: ## Build the workspace
 fmt: ## Format the workspace
 	$(CARGO) fmt
 
-clippy: ## Run clippy with warnings denied
-	$(CARGO) clippy --all-targets --all-features -- -D warnings
+fmt-check: ## Check workspace formatting without writing changes
+	$(CARGO) fmt --check
 
-test: ## Run tests
-	$(CARGO) test
+clippy: ## Run workspace clippy with warnings denied
+	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
+
+test: ## Run workspace tests
+	$(CARGO) test --workspace
 
 release-version: ## Print the canonical seance-app release version
 	$(CARGO) run -q -p seance-build -- version

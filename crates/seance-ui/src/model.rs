@@ -14,6 +14,7 @@ pub(crate) const MAX_SIDEBAR_WIDTH: f32 = 450.0;
 
 use crate::{
     backend::UiBackend,
+    connect::ConnectAttemptTracker,
     forms::{
         ConfirmDialogState, SecureWorkspaceState, SettingsPanelState, VaultModalState,
         WorkspaceSurface,
@@ -32,7 +33,7 @@ pub(crate) struct SeanceWorkspace {
     pub(crate) managed_vaults: Vec<ManagedVaultSummary>,
     pub(crate) saved_hosts: Vec<VaultScopedHostSummary>,
     pub(crate) selected_host_id: Option<String>,
-    pub(crate) connecting_host_id: Option<String>,
+    pub(crate) connect_attempts: ConnectAttemptTracker,
     pub(crate) surface: WorkspaceSurface,
     pub(crate) vault_modal: VaultModalState,
     pub(crate) secure: SecureWorkspaceState,

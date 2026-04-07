@@ -65,6 +65,24 @@ pub struct ConnectHost {
     pub host_id: String,
 }
 
+fn build_connect_host_action<T>(
+    value: Value,
+    build: impl FnOnce(String, String) -> T,
+) -> Result<Box<dyn Action>>
+where
+    T: Action + 'static,
+{
+    let vault_id = value
+        .get("vault_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing vault_id"))?;
+    let host_id = value
+        .get("host_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing host_id"))?;
+    Ok(Box::new(build(vault_id.to_string(), host_id.to_string())))
+}
+
 impl Action for ConnectHost {
     fn boxed_clone(&self) -> Box<dyn Action> {
         Box::new(self.clone())
@@ -89,18 +107,41 @@ impl Action for ConnectHost {
     where
         Self: Sized,
     {
-        let vault_id = value
-            .get("vault_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing vault_id"))?;
-        let host_id = value
-            .get("host_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing host_id"))?;
-        Ok(Box::new(Self {
-            vault_id: vault_id.to_string(),
-            host_id: host_id.to_string(),
-        }))
+        build_connect_host_action(value, |vault_id, host_id| Self { vault_id, host_id })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectHostInNewWindow {
+    pub vault_id: String,
+    pub host_id: String,
+}
+
+impl Action for ConnectHostInNewWindow {
+    fn boxed_clone(&self) -> Box<dyn Action> {
+        Box::new(self.clone())
+    }
+
+    fn partial_eq(&self, action: &dyn Action) -> bool {
+        action.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
+    fn name(&self) -> &'static str {
+        Self::name_for_type()
+    }
+
+    fn name_for_type() -> &'static str
+    where
+        Self: Sized,
+    {
+        "seance_ui::ConnectHostInNewWindow"
+    }
+
+    fn build(value: Value) -> Result<Box<dyn Action>>
+    where
+        Self: Sized,
+    {
+        build_connect_host_action(value, |vault_id, host_id| Self { vault_id, host_id })
     }
 }
 

@@ -14,10 +14,11 @@ use seance_terminal::TerminalGeometry;
 use tracing::trace;
 
 use crate::{
-    CheckForUpdates, CloseActiveSession, ConnectHost, HideOtherApps, HideSeance, NewTerminal,
-    OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance, SeanceWorkspace, SelectSession,
-    SettingsSection, ShowAllApps, SwitchTheme, TogglePerfHud,
+    CheckForUpdates, CloseActiveSession, ConnectHost, ConnectHostInNewWindow, HideOtherApps,
+    HideSeance, NewTerminal, OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance,
+    SeanceWorkspace, SelectSession, SettingsSection, ShowAllApps, SwitchTheme, TogglePerfHud,
     backend::UiBackend,
+    connect::ConnectAttemptTracker,
     forms::{SecureWorkspaceState, SettingsPanelState, VaultModalState, WorkspaceSurface},
     perf::{PerfOverlayState, RedrawReason, perf_mode_from_config, perf_mode_override_from_env},
     surface::TerminalSurfaceState,
@@ -402,7 +403,7 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
         let host_id = action.host_id.clone();
         if !with_registered_workspace(cx, |this, window, cx| {
             this.selected_host_id = Some(crate::workspace::host_scope_key(&vault_id, &host_id));
-            this.connect_saved_host(&vault_id, &host_id, window, cx);
+            this.start_connect_attempt(&vault_id, &host_id, window, cx);
         }) {
             let _ = open_workspace_window(
                 cx,
@@ -411,6 +412,21 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
                 Some(InitialWorkspaceAction::ConnectHost { vault_id, host_id }),
             );
         }
+        refresh_app_menus(cx);
+    });
+
+    let backend_for_connect_host_new_window = backend.clone();
+    cx.on_action(move |action: &ConnectHostInNewWindow, cx| {
+        let _ = open_workspace_window(
+            cx,
+            backend_for_connect_host_new_window.clone(),
+            WindowTarget::MostRecentOrNew,
+            Some(InitialWorkspaceAction::ConnectHost {
+                vault_id: action.vault_id.clone(),
+                host_id: action.host_id.clone(),
+            }),
+        );
+        cx.activate(false);
         refresh_app_menus(cx);
     });
 
@@ -496,7 +512,7 @@ fn open_workspace_window(
                     managed_vaults: bootstrap.managed_vaults.clone(),
                     saved_hosts: bootstrap.saved_hosts.clone(),
                     selected_host_id: None,
-                    connecting_host_id: None,
+                    connect_attempts: ConnectAttemptTracker::default(),
                     surface: WorkspaceSurface::Terminal,
                     vault_modal: VaultModalState::new(
                         bootstrap

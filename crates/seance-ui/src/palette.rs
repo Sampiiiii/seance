@@ -1,4 +1,4 @@
-use crate::theme::ThemeId;
+use crate::{connect::PendingConnectSummary, theme::ThemeId};
 use std::{collections::HashMap, sync::Arc};
 
 use seance_core::{VaultScopedCredentialSummary, VaultScopedHostSummary, VaultScopedKeySummary};
@@ -62,6 +62,9 @@ pub enum PaletteAction {
     DeleteSavedHost {
         vault_id: String,
         host_id: String,
+    },
+    CancelSavedHostConnect {
+        attempt_id: u64,
     },
     ConnectSavedHost {
         vault_id: String,
@@ -172,6 +175,7 @@ pub fn build_items(
     sessions: &[Arc<dyn TerminalSession>],
     session_labels: &HashMap<u64, String>,
     saved_hosts: &[VaultScopedHostSummary],
+    pending_connects: &[PendingConnectSummary],
     credentials: &[VaultScopedCredentialSummary],
     keys: &[VaultScopedKeySummary],
     active_id: u64,
@@ -182,6 +186,10 @@ pub fn build_items(
     update_state: &seance_core::UpdateState,
 ) -> Vec<PaletteItem> {
     let mut items: Vec<PaletteItem> = Vec::new();
+    let pending_by_scope = pending_connects
+        .iter()
+        .map(|pending| (pending.host_scope_key.as_str(), pending))
+        .collect::<HashMap<_, _>>();
 
     // --- Sessions group ---
 
@@ -257,21 +265,40 @@ pub fn build_items(
         });
 
         for host in saved_hosts {
-            items.push(PaletteItem {
-                glyph: "→",
-                label: format!("Connect: {} [{}]", host.host.label, host.vault_name),
-                hint: format!(
-                    "{}@{}:{}",
-                    host.host.username, host.host.hostname, host.host.port
-                ),
-                action: PaletteAction::ConnectSavedHost {
-                    vault_id: host.vault_id.clone(),
-                    host_id: host.host.id.clone(),
-                },
-                group: PaletteGroup::Hosts,
-                shortcut: None,
-                match_indices: Vec::new(),
-            });
+            let scope_key = crate::workspace::host_scope_key(&host.vault_id, &host.host.id);
+            let target = format!(
+                "{}@{}:{}",
+                host.host.username, host.host.hostname, host.host.port
+            );
+            if let Some(pending) = pending_by_scope.get(scope_key.as_str()) {
+                items.push(PaletteItem {
+                    glyph: "×",
+                    label: format!(
+                        "Cancel Connect: {} [{}]",
+                        pending.host_label, host.vault_name
+                    ),
+                    hint: format!("connecting to {target}"),
+                    action: PaletteAction::CancelSavedHostConnect {
+                        attempt_id: pending.id,
+                    },
+                    group: PaletteGroup::Hosts,
+                    shortcut: None,
+                    match_indices: Vec::new(),
+                });
+            } else {
+                items.push(PaletteItem {
+                    glyph: "→",
+                    label: format!("Connect: {} [{}]", host.host.label, host.vault_name),
+                    hint: target.clone(),
+                    action: PaletteAction::ConnectSavedHost {
+                        vault_id: host.vault_id.clone(),
+                        host_id: host.host.id.clone(),
+                    },
+                    group: PaletteGroup::Hosts,
+                    shortcut: None,
+                    match_indices: Vec::new(),
+                });
+            }
             items.push(PaletteItem {
                 glyph: "✎",
                 label: format!("Edit: {} [{}]", host.host.label, host.vault_name),
@@ -655,6 +682,7 @@ mod tests {
         let items = build_items(
             &sessions,
             &session_labels,
+            &[],
             &[],
             &[],
             &[],

@@ -10,7 +10,7 @@ mod sftp;
 
 pub use manager::SshSessionManager;
 pub use model::{
-    ResolvedAuthMethod, SftpBootstrapHandle, SftpEntry, SshConnectRequest, SshConnectResult,
-    SshConnectionConfig, SshError,
+    ResolvedAuthMethod, SftpBootstrapHandle, SftpEntry, SshConnectAbortHandle, SshConnectRequest,
+    SshConnectResult, SshConnectTask, SshConnectionConfig, SshError,
 };
 pub use session::SshSessionHandle;

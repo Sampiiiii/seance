@@ -1,18 +1,26 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
 use russh::client;
 use russh_sftp::client::SftpSession;
 use seance_terminal::{SharedSessionState, TerminalGeometry, next_session_id};
-use tokio::{runtime::Runtime, sync::mpsc};
+use tokio::{
+    runtime::Runtime,
+    sync::{mpsc, oneshot},
+};
+use tracing::{debug, trace, warn};
 
 use crate::{
     auth::{AcceptAnyHostKeyHandler, authenticate},
     backend::run_ssh_session,
-    model::{SftpBootstrapHandle, SshConnectRequest, SshConnectResult, SshError},
+    model::{
+        SftpBootstrapHandle, SshConnectAbortHandle, SshConnectRequest, SshConnectResult,
+        SshConnectTask, SshError,
+    },
     session::{SessionCommand, SshSessionHandle},
 };
 
@@ -20,6 +28,8 @@ pub struct SshSessionManager {
     pub(crate) runtime: Runtime,
     pub(crate) sftp_sessions: Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<SftpSession>>>>>,
 }
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 const _: () = {
     fn _assert_send_sync<T: Send + Sync>() {}
@@ -43,9 +53,20 @@ impl SshSessionManager {
         &self,
         request: SshConnectRequest,
     ) -> std::result::Result<SshConnectResult, SshError> {
+        if request.auth_order.is_empty() {
+            return Err(SshError::MissingAuthMethods);
+        }
+
         let session_id = next_session_id();
-        self.runtime
-            .block_on(self.connect_async(session_id, request))
+        let sftp_sessions = Arc::clone(&self.sftp_sessions);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        self.runtime.block_on(Self::run_connect_future(
+            session_id,
+            Self::connect_async(session_id, request, Arc::clone(&sftp_sessions)),
+            cancel_rx,
+            CONNECT_TIMEOUT,
+            &sftp_sessions,
+        ))
     }
 
     pub fn sftp_ready(&self, session_id: u64) -> bool {
@@ -55,15 +76,48 @@ impl SshSessionManager {
             .contains_key(&session_id)
     }
 
-    async fn connect_async(
+    pub fn start_connect(
         &self,
-        session_id: u64,
         request: SshConnectRequest,
-    ) -> std::result::Result<SshConnectResult, SshError> {
+    ) -> std::result::Result<SshConnectTask, SshError> {
         if request.auth_order.is_empty() {
             return Err(SshError::MissingAuthMethods);
         }
 
+        let session_id = next_session_id();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let sftp_sessions = Arc::clone(&self.sftp_sessions);
+        let host = format!(
+            "{}@{}:{}",
+            request.connection.username, request.connection.hostname, request.connection.port
+        );
+
+        trace!(session_id, host = %host, "starting SSH connect task");
+        let _ = self.runtime.spawn(async move {
+            let result = Self::run_connect_future(
+                session_id,
+                Self::connect_async(session_id, request, Arc::clone(&sftp_sessions)),
+                cancel_rx,
+                CONNECT_TIMEOUT,
+                &sftp_sessions,
+            )
+            .await;
+            let _ = result_tx.send(result);
+        });
+
+        Ok(SshConnectTask {
+            session_id,
+            result_rx,
+            abort_handle: SshConnectAbortHandle::new(cancel_tx),
+        })
+    }
+
+    async fn connect_async(
+        session_id: u64,
+        request: SshConnectRequest,
+        sftp_sessions: Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<SftpSession>>>>>,
+    ) -> std::result::Result<SshConnectResult, SshError> {
         let config = Arc::new(client::Config::default());
         let addr = (
             request.connection.hostname.as_str(),
@@ -103,7 +157,7 @@ impl SshSessionManager {
             .await
             .map_err(|err| SshError::Transport(err.to_string()))?;
 
-        let sftp = self.bootstrap_sftp(session_id, &session).await?;
+        let sftp = Self::bootstrap_sftp(session_id, &session, &sftp_sessions).await?;
 
         let (state, notify_rx) = SharedSessionState::new(format!(
             "Connected to {}@{}:{}",
@@ -138,9 +192,9 @@ impl SshSessionManager {
     }
 
     async fn bootstrap_sftp(
-        &self,
         session_id: u64,
         session: &client::Handle<AcceptAnyHostKeyHandler>,
+        sftp_sessions: &Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<SftpSession>>>>>,
     ) -> std::result::Result<SftpBootstrapHandle, SshError> {
         let channel = session
             .channel_open_session()
@@ -153,7 +207,7 @@ impl SshSessionManager {
         let sftp = SftpSession::new(channel.into_stream())
             .await
             .map_err(|err| SshError::SftpBootstrap(err.to_string()))?;
-        self.sftp_sessions
+        sftp_sessions
             .lock()
             .expect("sftp session map poisoned")
             .insert(session_id, Arc::new(tokio::sync::Mutex::new(sftp)));
@@ -162,6 +216,61 @@ impl SshSessionManager {
             session_id,
             ready: true,
         })
+    }
+
+    async fn run_connect_future<T, F>(
+        session_id: u64,
+        connect_future: F,
+        mut cancel_rx: oneshot::Receiver<()>,
+        timeout: Duration,
+        sftp_sessions: &Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<SftpSession>>>>>,
+    ) -> std::result::Result<T, SshError>
+    where
+        F: std::future::Future<Output = std::result::Result<T, SshError>>,
+    {
+        let timeout_future = tokio::time::timeout(timeout, connect_future);
+        tokio::pin!(timeout_future);
+
+        let result = tokio::select! {
+            biased;
+            cancel_result = &mut cancel_rx => {
+                match cancel_result {
+                    Ok(()) => {
+                        debug!(session_id, "SSH connect cancelled");
+                        Err(SshError::Cancelled)
+                    }
+                    Err(_) => {
+                        trace!(session_id, "SSH connect cancellation handle dropped");
+                        Err(SshError::Cancelled)
+                    }
+                }
+            }
+            result = &mut timeout_future => {
+                match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(session_id, timeout_secs = timeout.as_secs(), "SSH connect timed out");
+                        Err(SshError::TimedOut)
+                    }
+                }
+            }
+        };
+
+        if result.is_err() {
+            Self::clear_sftp_session(session_id, sftp_sessions);
+        }
+
+        result
+    }
+
+    fn clear_sftp_session(
+        session_id: u64,
+        sftp_sessions: &Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<SftpSession>>>>>,
+    ) {
+        sftp_sessions
+            .lock()
+            .expect("sftp session map poisoned")
+            .remove(&session_id);
     }
 
     pub(crate) fn get_sftp(
@@ -179,6 +288,10 @@ impl SshSessionManager {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::pending, time::Duration};
+
+    use tokio::sync::oneshot;
+
     use crate::model::{SshConnectRequest, SshConnectionConfig, SshError};
 
     use super::SshSessionManager;
@@ -199,5 +312,43 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, SshError::MissingAuthMethods));
+    }
+
+    #[test]
+    fn connect_wrapper_maps_timeout() {
+        let manager = SshSessionManager::new().unwrap();
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let sftp_sessions = manager.sftp_sessions.clone();
+        let err = manager
+            .runtime
+            .block_on(SshSessionManager::run_connect_future(
+                41,
+                pending::<std::result::Result<(), SshError>>(),
+                cancel_rx,
+                Duration::from_millis(10),
+                &sftp_sessions,
+            ));
+
+        assert!(matches!(err, Err(SshError::TimedOut)));
+    }
+
+    #[test]
+    fn connect_wrapper_maps_cancel() {
+        let manager = SshSessionManager::new().unwrap();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let sftp_sessions = manager.sftp_sessions.clone();
+        let err = manager.runtime.block_on(async {
+            cancel_tx.send(()).unwrap();
+            SshSessionManager::run_connect_future(
+                42,
+                pending::<std::result::Result<(), SshError>>(),
+                cancel_rx,
+                Duration::from_secs(1),
+                &sftp_sessions,
+            )
+            .await
+        });
+
+        assert!(matches!(err, Err(SshError::Cancelled)));
     }
 }

@@ -581,6 +581,7 @@ impl SeanceWorkspace {
             &sessions,
             &session_labels,
             &self.saved_hosts,
+            &self.connect_attempts.pending_summaries(),
             &self.cached_credentials,
             &self.cached_keys,
             self.active_session_id,
@@ -742,8 +743,24 @@ impl SeanceWorkspace {
                 self.delete_saved_host(&host_scope_key(&vault_id, &host_id), cx);
                 return;
             }
+            PaletteAction::CancelSavedHostConnect { attempt_id } => {
+                self.cancel_connect_attempt(attempt_id, cx);
+                self.palette_open = false;
+                self.palette_query.clear();
+                self.palette_selected = 0;
+                self.reset_palette_scroll_to_top();
+                self.perf_overlay.mark_input(RedrawReason::Palette);
+                cx.notify();
+                return;
+            }
             PaletteAction::ConnectSavedHost { vault_id, host_id } => {
-                self.connect_saved_host(&vault_id, &host_id, window, cx);
+                self.start_connect_attempt(&vault_id, &host_id, window, cx);
+                self.palette_open = false;
+                self.palette_query.clear();
+                self.palette_selected = 0;
+                self.reset_palette_scroll_to_top();
+                self.perf_overlay.mark_input(RedrawReason::Palette);
+                cx.notify();
                 return;
             }
             PaletteAction::OpenSftpBrowser(session_id) => {
@@ -913,23 +930,30 @@ impl SeanceWorkspace {
                         (self.vault_modal.selected_field + field_count - 1) % field_count;
                 }
             }
-            "backspace" => {
-                if matches!(
-                    self.vault_modal.mode,
-                    UnlockMode::Create | UnlockMode::Rename
-                ) && self.vault_modal.selected_field == 0
-                {
-                    self.vault_modal.vault_name.pop();
-                } else if self.vault_modal.selected_field == 0 {
-                    self.vault_modal.passphrase.pop();
-                } else if matches!(self.vault_modal.mode, UnlockMode::Create)
-                    && self.vault_modal.selected_field == 1
-                {
-                    self.vault_modal.passphrase.pop();
-                } else if field_count > 1 {
-                    self.vault_modal.confirm_passphrase.pop();
+            "backspace" => match self.vault_modal.mode {
+                UnlockMode::Create => match self.vault_modal.selected_field {
+                    0 => {
+                        self.vault_modal.vault_name.pop();
+                    }
+                    1 => {
+                        self.vault_modal.passphrase.pop();
+                    }
+                    _ if field_count > 1 => {
+                        self.vault_modal.confirm_passphrase.pop();
+                    }
+                    _ => {}
+                },
+                UnlockMode::Rename => {
+                    if self.vault_modal.selected_field == 0 {
+                        self.vault_modal.vault_name.pop();
+                    }
                 }
-            }
+                UnlockMode::Unlock => {
+                    if self.vault_modal.selected_field == 0 {
+                        self.vault_modal.passphrase.pop();
+                    }
+                }
+            },
             "enter" => {
                 self.submit_vault_modal(cx);
                 return;
@@ -943,20 +967,25 @@ impl SeanceWorkspace {
             _ => {
                 if let Some(ch) = key_char {
                     if !modifiers.platform && !modifiers.control && !modifiers.function {
-                        if matches!(
-                            self.vault_modal.mode,
-                            UnlockMode::Create | UnlockMode::Rename
-                        ) && self.vault_modal.selected_field == 0
-                        {
-                            self.vault_modal.vault_name.push_str(ch);
-                        } else if self.vault_modal.selected_field == 0 {
-                            self.vault_modal.passphrase.push_str(ch);
-                        } else if matches!(self.vault_modal.mode, UnlockMode::Create)
-                            && self.vault_modal.selected_field == 1
-                        {
-                            self.vault_modal.passphrase.push_str(ch);
-                        } else if field_count > 1 {
-                            self.vault_modal.confirm_passphrase.push_str(ch);
+                        match self.vault_modal.mode {
+                            UnlockMode::Create => match self.vault_modal.selected_field {
+                                0 => self.vault_modal.vault_name.push_str(ch),
+                                1 => self.vault_modal.passphrase.push_str(ch),
+                                _ if field_count > 1 => {
+                                    self.vault_modal.confirm_passphrase.push_str(ch)
+                                }
+                                _ => {}
+                            },
+                            UnlockMode::Rename => {
+                                if self.vault_modal.selected_field == 0 {
+                                    self.vault_modal.vault_name.push_str(ch);
+                                }
+                            }
+                            UnlockMode::Unlock => {
+                                if self.vault_modal.selected_field == 0 {
+                                    self.vault_modal.passphrase.push_str(ch);
+                                }
+                            }
                         }
                     }
                 }

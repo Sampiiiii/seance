@@ -10,6 +10,7 @@
 mod actions;
 mod app;
 mod backend;
+mod connect;
 mod forms;
 mod hosts;
 mod model;
@@ -32,9 +33,9 @@ use std::time::Instant;
 use gpui::{Context, MouseButton, Render, Window, deferred, div, prelude::*, px};
 
 pub use actions::{
-    CheckForUpdates, CloseActiveSession, ConnectHost, HideOtherApps, HideSeance, NewTerminal,
-    OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance, SelectSession, ShowAllApps,
-    SwitchTheme, TogglePerfHud,
+    CheckForUpdates, CloseActiveSession, ConnectHost, ConnectHostInNewWindow, HideOtherApps,
+    HideSeance, NewTerminal, OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance,
+    SelectSession, ShowAllApps, SwitchTheme, TogglePerfHud,
 };
 pub(crate) use app::refresh_app_menus;
 pub use app::{UiCommand, UiIntegration, UiRuntime, run};
@@ -141,7 +142,7 @@ impl Render for SeanceWorkspace {
                     &action.vault_id,
                     &action.host_id,
                 ));
-                this.connect_saved_host(&action.vault_id, &action.host_id, window, cx);
+                this.start_connect_attempt(&action.vault_id, &action.host_id, window, cx);
             }))
             .on_action(cx.listener(|this, action: &SelectSession, _window, cx| {
                 if this.backend.session(action.session_id).is_some() {
