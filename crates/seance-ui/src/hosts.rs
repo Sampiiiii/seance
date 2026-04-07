@@ -49,11 +49,11 @@ impl SeanceWorkspace {
                 self.selected_host_id = Some(host_id.into());
             }
             Ok(None) => {
-                self.status_message = Some("Saved host not found.".into());
+                self.show_toast("Saved host not found.");
                 self.refresh_saved_hosts();
             }
             Err(err) => {
-                self.status_message = Some(err.to_string());
+                self.show_toast(err.to_string());
             }
         }
         self.palette_open = false;
@@ -64,14 +64,14 @@ impl SeanceWorkspace {
     pub(crate) fn delete_saved_host(&mut self, host_id: &str, cx: &mut Context<Self>) {
         match self.backend.delete_host(host_id) {
             Ok(true) => {
-                self.status_message = Some("Saved host tombstoned for future sync.".into());
+                self.show_toast("Saved host tombstoned for future sync.");
                 self.refresh_saved_hosts();
             }
             Ok(false) => {
-                self.status_message = Some("Saved host already removed.".into());
+                self.show_toast("Saved host already removed.");
             }
             Err(err) => {
-                self.status_message = Some(err.to_string());
+                self.show_toast(err.to_string());
             }
         }
         self.palette_open = false;
@@ -97,7 +97,7 @@ impl SeanceWorkspace {
 
         match self.backend.save_host(draft) {
             Ok(summary) => {
-                self.status_message = Some(format!(
+                self.show_toast(format!(
                     "Saved host '{}' encrypted into the vault.",
                     summary.label
                 ));

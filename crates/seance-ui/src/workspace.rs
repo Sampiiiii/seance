@@ -98,17 +98,17 @@ impl SeanceWorkspace {
         self.update_state = next_state.clone();
         match next_state {
             UpdateState::Available(ref update) => {
-                self.status_message = Some(format!("Update {} is available.", update.version));
+                self.show_toast(format!("Update {} is available.", update.version));
             }
             UpdateState::Checking
             | UpdateState::Downloading
             | UpdateState::Installing
             | UpdateState::ReadyToRelaunch
             | UpdateState::UpToDate => {
-                self.status_message = Some(update_status_label(&self.update_state).to_string());
+                self.show_toast(update_status_label(&self.update_state).to_string());
             }
             UpdateState::Failed(error) => {
-                self.status_message = Some(error);
+                self.show_toast(error);
             }
             UpdateState::Idle => {}
         }
@@ -153,7 +153,7 @@ impl SeanceWorkspace {
         };
 
         let metrics = self.terminal_metrics(window);
-        let geometry = compute_terminal_geometry(window.viewport_size(), metrics)
+        let geometry = compute_terminal_geometry(window.viewport_size(), metrics, self.sidebar_width)
             .unwrap_or_else(TerminalGeometry::default);
         self.active_terminal_rows = geometry.size.rows as usize;
 
@@ -350,12 +350,11 @@ impl SeanceWorkspace {
                         Ok(()) => {
                             let vault_status = self.backend.vault_status();
                             self.unlock_form.completed = true;
-                            self.status_message = Some(
+                            self.show_toast(
                                 if vault_status.device_unlock_message.is_some() {
                                     "Encrypted vault created. Touch ID is not available for this build yet."
-                                        .into()
                                 } else {
-                                    "Encrypted vault created. Device unlock is now enrolled.".into()
+                                    "Encrypted vault created. Device unlock is now enrolled."
                                 },
                             );
                             self.refresh_saved_hosts();
@@ -376,12 +375,11 @@ impl SeanceWorkspace {
                     Ok(()) => {
                         let vault_status = self.backend.vault_status();
                         self.unlock_form.completed = true;
-                        self.status_message = Some(
+                        self.show_toast(
                             if vault_status.device_unlock_message.is_some() {
                                 "Vault unlocked from the recovery passphrase. Touch ID is not available for this build yet."
-                                    .into()
                             } else {
-                                "Vault unlocked from the recovery passphrase.".into()
+                                "Vault unlocked from the recovery passphrase."
                             },
                         );
                         self.refresh_saved_hosts();
@@ -411,7 +409,7 @@ impl SeanceWorkspace {
         self.unlock_form.reset_for_unlock();
         self.unlock_form.message =
             Some("Vault locked. Decrypted records were cleared from memory.".into());
-        self.status_message = Some("Vault locked.".into());
+        self.show_toast("Vault locked.");
         self.palette_open = false;
         self.invalidate_terminal_surface();
         self.perf_overlay.mark_input(RedrawReason::Input);
@@ -482,8 +480,8 @@ impl SeanceWorkspace {
                 return;
             }
             PaletteAction::ImportPrivateKey => {
-                self.status_message = Some(
-                    "Private key import backend is ready; UI import form is still pending.".into(),
+                self.show_toast(
+                    "Private key import backend is ready; UI import form is still pending.",
                 );
             }
             PaletteAction::GenerateEd25519Key => {
@@ -492,11 +490,10 @@ impl SeanceWorkspace {
                     .generate_ed25519_key(format!("ed25519-{}", crate::now_ui_suffix()))
                 {
                     Ok(summary) => {
-                        self.status_message =
-                            Some(format!("Generated vault-backed key '{}'.", summary.label));
+                        self.show_toast(format!("Generated vault-backed key '{}'.", summary.label));
                         self.refresh_vault_cache();
                     }
-                    Err(err) => self.status_message = Some(err.to_string()),
+                    Err(err) => self.show_toast(err.to_string()),
                 }
             }
             PaletteAction::GenerateRsaKey => {
@@ -505,11 +502,10 @@ impl SeanceWorkspace {
                     .generate_rsa_key(format!("rsa-{}", crate::now_ui_suffix()))
                 {
                     Ok(summary) => {
-                        self.status_message =
-                            Some(format!("Generated vault-backed key '{}'.", summary.label));
+                        self.show_toast(format!("Generated vault-backed key '{}'.", summary.label));
                         self.refresh_vault_cache();
                     }
-                    Err(err) => self.status_message = Some(err.to_string()),
+                    Err(err) => self.show_toast(err.to_string()),
                 }
             }
             PaletteAction::DeletePrivateKey(id) => {

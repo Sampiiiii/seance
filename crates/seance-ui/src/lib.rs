@@ -28,7 +28,7 @@ mod workspace_render;
 
 use std::time::Instant;
 
-use gpui::{Context, Render, Window, deferred, div, prelude::*};
+use gpui::{Context, MouseButton, Render, Window, deferred, div, prelude::*, px};
 
 pub use actions::{
     CheckForUpdates, CloseActiveSession, ConnectHost, HideOtherApps, HideSeance, NewTerminal,
@@ -37,6 +37,7 @@ pub use actions::{
 };
 pub use app::{UiCommand, UiIntegration, UiRuntime, run};
 use forms::SettingsSection;
+use model::{MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH};
 pub(crate) use app::refresh_app_menus;
 pub(crate) use model::{
     SeanceWorkspace, TerminalMetrics, TerminalRendererMetrics, local_session_display_number_for_ids,
@@ -56,6 +57,13 @@ impl Render for SeanceWorkspace {
         let perf_enabled = self.perf_overlay.mode.is_enabled();
         let render_started_at = perf_enabled.then(Instant::now);
 
+        // Auto-dismiss toast after 3 seconds
+        if let Some(toast) = &self.toast {
+            if toast.shown_at.elapsed() >= std::time::Duration::from_secs(3) {
+                self.toast = None;
+            }
+        }
+
         let t = self.theme();
 
         let main_content = if self.is_settings_panel_open() {
@@ -66,11 +74,45 @@ impl Render for SeanceWorkspace {
             self.render_terminal_shell(window, cx)
         };
 
+        let sidebar_resizing = self.sidebar_resizing;
+
+        let drag_handle = div()
+            .w(px(6.0))
+            .h_full()
+            .flex_shrink_0()
+            .cursor_col_resize()
+            .when(sidebar_resizing, |el| el.bg(t.accent_glow))
+            .hover(|s| s.bg(t.glass_hover))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.sidebar_resizing = true;
+                    cx.notify();
+                }),
+            );
+
         let mut root = div()
             .size_full()
             .flex()
             .bg(t.bg_deep)
             .text_color(t.text_primary)
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, window, _cx| {
+                if this.sidebar_resizing {
+                    let new_width = f32::from(event.position.x);
+                    this.sidebar_width = new_width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+                    this.invalidate_terminal_surface();
+                    this.apply_active_terminal_geometry(window);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.sidebar_resizing {
+                        this.sidebar_resizing = false;
+                        cx.notify();
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| {
                 this.check_for_updates(cx);
             }))
@@ -104,6 +146,7 @@ impl Render for SeanceWorkspace {
                 this.persist_theme(action.theme_id, window, cx);
             }))
             .child(self.render_sidebar(cx))
+            .child(drag_handle)
             .child(main_content);
 
         if self.palette_open {
@@ -120,6 +163,9 @@ impl Render for SeanceWorkspace {
         }
         if self.perf_overlay.mode.is_enabled() {
             root = root.child(deferred(self.render_perf_overlay()).with_priority(4));
+        }
+        if self.toast.is_some() {
+            root = root.child(deferred(self.render_toast()).with_priority(6));
         }
 
         if let Some(started_at) = render_started_at {

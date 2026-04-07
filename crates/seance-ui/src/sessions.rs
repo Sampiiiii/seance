@@ -117,7 +117,7 @@ impl SeanceWorkspace {
         let request = match self.backend.build_connect_request(host_id) {
             Ok(request) => request,
             Err(err) => {
-                self.status_message = Some(err.to_string());
+                self.show_toast(err.to_string());
                 cx.notify();
                 return;
             }
@@ -125,7 +125,7 @@ impl SeanceWorkspace {
 
         self.connecting_host_id = Some(host_id.into());
         self.selected_host_id = Some(host_id.into());
-        self.status_message = Some("Connecting…".into());
+        self.show_toast("Connecting…");
         cx.notify();
 
         let ssh = self.backend.ssh_manager();
@@ -167,11 +167,11 @@ impl SeanceWorkspace {
                 }
                 self.backend.touch_session(session.id());
                 self.settings_panel.open = false;
-                self.status_message = Some("SSH session connected.".into());
+                self.show_toast("SSH session connected.");
                 self.invalidate_terminal_surface();
             }
             Err(err) => {
-                self.status_message = Some(err.to_string());
+                self.show_toast(err.to_string());
             }
         }
         self.palette_open = false;

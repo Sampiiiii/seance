@@ -1,10 +1,14 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use gpui::FocusHandle;
 use seance_config::AppConfig;
 use seance_core::{SessionKind, UpdateState};
 use seance_terminal::{TerminalGeometry, TerminalSession};
 use seance_vault::{CredentialSummary, HostSummary, KeySummary};
+
+pub(crate) const DEFAULT_SIDEBAR_WIDTH: f32 = 260.0;
+pub(crate) const MIN_SIDEBAR_WIDTH: f32 = 180.0;
+pub(crate) const MAX_SIDEBAR_WIDTH: f32 = 450.0;
 
 use crate::{
     backend::UiBackend,
@@ -30,7 +34,6 @@ pub(crate) struct SeanceWorkspace {
     pub(crate) sftp_browser: Option<SftpBrowserState>,
     pub(crate) cached_credentials: Vec<CredentialSummary>,
     pub(crate) cached_keys: Vec<KeySummary>,
-    pub(crate) status_message: Option<String>,
     pub(crate) update_state: UpdateState,
     pub(crate) active_theme: ThemeId,
     pub(crate) palette_open: bool,
@@ -42,6 +45,15 @@ pub(crate) struct SeanceWorkspace {
     pub(crate) terminal_surface: TerminalSurfaceState,
     pub(crate) perf_mode_env_override: Option<UiPerfMode>,
     pub(crate) perf_overlay: PerfOverlayState,
+    pub(crate) sidebar_width: f32,
+    pub(crate) sidebar_resizing: bool,
+    pub(crate) toast: Option<ToastState>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ToastState {
+    pub(crate) message: String,
+    pub(crate) shown_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

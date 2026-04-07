@@ -2,25 +2,64 @@
 
 use gpui::{App, Context, Div, FontWeight, MouseButton, Window, canvas, div, prelude::*, px};
 use seance_core::UpdateState;
+use std::time::Instant;
 use tracing::trace;
 
 use crate::{
     SIDEBAR_FONT_MONO, SIDEBAR_MONO_SIZE_PX, SeanceWorkspace,
     forms::{CredentialField, SettingsSection, UnlockMode},
-    model::TerminalMetrics,
+    model::{TerminalMetrics, ToastState},
     palette::{PaletteGroup, build_items},
     perf::{RedrawReason, UiPerfMode},
     surface::PreparedTerminalSurface,
     terminal_paint::paint_terminal_surface,
     theme::ThemeId,
     ui_components::{
-        SIDEBAR_WIDTH, compact_perf_strings, editor_field_card, expanded_perf_strings,
+        compact_perf_strings, editor_field_card, expanded_perf_strings,
         frame_budget_color, masked_value, perf_mode_label, perf_row, perf_status_color,
         settings_action_chip, unlock_field_card, update_status_label,
     },
 };
 
 impl SeanceWorkspace {
+    pub(crate) fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast = Some(ToastState {
+            message: message.into(),
+            shown_at: Instant::now(),
+        });
+    }
+
+    pub(crate) fn render_toast(&self) -> impl IntoElement {
+        let t = self.theme();
+        let message = self
+            .toast
+            .as_ref()
+            .map(|t| t.message.clone())
+            .unwrap_or_default();
+
+        div()
+            .absolute()
+            .bottom(px(24.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .px(px(16.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(t.glass_strong)
+                    .border_1()
+                    .border_color(t.glass_border)
+                    .shadow_md()
+                    .font_family(SIDEBAR_FONT_MONO)
+                    .text_size(px(12.0))
+                    .text_color(t.text_secondary)
+                    .child(message),
+            )
+    }
+
     pub(crate) fn sidebar_row_shell(&self, active: bool) -> Div {
         let t = self.theme();
         let row = div()
@@ -162,10 +201,8 @@ impl SeanceWorkspace {
                             .hover(|s| s.border_1().border_color(t.sidebar_edge_bright))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.open_settings_panel(SettingsSection::Appearance, cx);
-                                    this.settings_panel.message =
-                                        Some(format!("Current theme: {}", tid.display_name()));
+                                cx.listener(move |this, _, window, cx| {
+                                    this.persist_theme(tid, window, cx);
                                     this.perf_overlay.mark_input(RedrawReason::Input);
                                 }),
                             ),
@@ -231,8 +268,8 @@ impl SeanceWorkspace {
                                     .text_size(px(SIDEBAR_MONO_SIZE_PX))
                                     .text_color(t.text_ghost)
                                     .cursor_pointer()
-                                    .hover(|style| style.text_color(t.text_muted))
-                                    .child("⚙")
+                                    .hover(|style| style.text_color(t.text_secondary))
+                                    .child("⚙ settings")
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -273,15 +310,6 @@ impl SeanceWorkspace {
                     .line_clamp(2)
                     .child(message),
             );
-        } else if let Some(message) = self.status_message.clone() {
-            footer = footer.child(
-                div()
-                    .font_family(SIDEBAR_FONT_MONO)
-                    .text_size(px(SIDEBAR_MONO_SIZE_PX))
-                    .text_color(t.sidebar_meta)
-                    .line_clamp(2)
-                    .child(message),
-            );
         }
 
         footer
@@ -291,15 +319,12 @@ impl SeanceWorkspace {
         let t = self.theme();
 
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width))
             .h_full()
             .flex()
             .flex_col()
             .justify_between()
             .bg(t.sidebar_bg_elevated)
-            .border_r_1()
-            .border_color(t.sidebar_edge)
-            .shadow_lg()
             .child({
                 let mut content = div()
                     .flex_1()
@@ -322,20 +347,10 @@ impl SeanceWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let t = self.theme();
-
         div()
             .flex_1()
             .h_full()
             .flex()
-            .child(
-                div()
-                    .w(px(2.0))
-                    .h_full()
-                    .border_l_1()
-                    .border_color(t.sidebar_edge_bright)
-                    .bg(t.shell_divider_glow),
-            )
             .child(self.render_terminal_pane(window, cx))
     }
 

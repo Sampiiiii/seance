@@ -10,7 +10,6 @@ use crate::{
     theme::{Theme, ThemeId},
 };
 
-pub(crate) const SIDEBAR_WIDTH: f32 = 260.0;
 pub(crate) const TERMINAL_PANE_PADDING_PX: f32 = 16.0;
 
 pub(crate) fn theme_id_from_config(config: &AppConfig) -> ThemeId {
@@ -500,8 +499,9 @@ pub(crate) fn masked_value(value: &str) -> String {
 pub(crate) fn compute_terminal_geometry(
     viewport_size: Size<Pixels>,
     metrics: TerminalMetrics,
+    sidebar_width: f32,
 ) -> Option<TerminalGeometry> {
-    let pane_width_px = (f32::from(viewport_size.width) - SIDEBAR_WIDTH).max(0.0);
+    let pane_width_px = (f32::from(viewport_size.width) - sidebar_width).max(0.0);
     let pane_height_px = f32::from(viewport_size.height).max(0.0);
     let usable_width_px = (pane_width_px - (TERMINAL_PANE_PADDING_PX * 2.0)).max(1.0);
     let usable_height_px = (pane_height_px - (TERMINAL_PANE_PADDING_PX * 2.0)).max(1.0);
@@ -607,6 +607,7 @@ mod tests {
     use gpui::{px, size};
     use seance_terminal::{TerminalCell, TerminalCellStyle, TerminalRow};
 
+    use crate::model::DEFAULT_SIDEBAR_WIDTH;
     use crate::perf::RedrawReason;
 
     #[test]
@@ -619,6 +620,7 @@ mod tests {
                 line_height_px: 19.0,
                 font_size_px: 13.0,
             },
+            DEFAULT_SIDEBAR_WIDTH,
         )
         .expect("geometry");
 
@@ -638,6 +640,7 @@ mod tests {
                 line_height_px: 40.0,
                 font_size_px: 13.0,
             },
+            DEFAULT_SIDEBAR_WIDTH,
         )
         .expect("geometry");
 

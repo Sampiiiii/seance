@@ -203,7 +203,7 @@ impl SeanceWorkspace {
                 let dest = downloads.join(&file_name);
                 match fs::write(&dest, &data) {
                     Ok(()) => {
-                        self.status_message = Some(format!(
+                        self.show_toast(format!(
                             "Downloaded {} ({} bytes) to {}",
                             file_name,
                             data.len(),
@@ -211,12 +211,12 @@ impl SeanceWorkspace {
                         ));
                     }
                     Err(err) => {
-                        self.status_message = Some(format!("Failed to save {file_name}: {err}"));
+                        self.show_toast(format!("Failed to save {file_name}: {err}"));
                     }
                 }
             }
             Err(err) => {
-                self.status_message = Some(format!("Download failed: {err}"));
+                self.show_toast(format!("Download failed: {err}"));
             }
         }
         cx.notify();
@@ -245,16 +245,16 @@ impl SeanceWorkspace {
                 .sftp_write_file(session_id, &remote_path, &data)
             {
                 Ok(()) => {
-                    self.status_message = Some(format!("Uploaded {file_name}"));
+                    self.show_toast(format!("Uploaded {file_name}"));
                     self.sftp_refresh(cx);
                     return;
                 }
                 Err(err) => {
-                    self.status_message = Some(format!("Upload failed: {err}"));
+                    self.show_toast(format!("Upload failed: {err}"));
                 }
             },
             Err(err) => {
-                self.status_message = Some(format!("Failed to read local file: {err}"));
+                self.show_toast(format!("Failed to read local file: {err}"));
             }
         }
         cx.notify();
@@ -273,10 +273,10 @@ impl SeanceWorkspace {
 
         match self.backend.sftp_remove(session_id, &path, is_dir) {
             Ok(()) => {
-                self.status_message = Some(format!("Deleted {path}"));
+                self.show_toast(format!("Deleted {path}"));
             }
             Err(err) => {
-                self.status_message = Some(format!("Delete failed: {err}"));
+                self.show_toast(format!("Delete failed: {err}"));
             }
         }
         if let Some(browser) = &mut self.sftp_browser {
@@ -307,10 +307,10 @@ impl SeanceWorkspace {
 
         match self.backend.sftp_mkdir(session_id, &full_path) {
             Ok(()) => {
-                self.status_message = Some(format!("Created {full_path}"));
+                self.show_toast(format!("Created {full_path}"));
             }
             Err(err) => {
-                self.status_message = Some(format!("mkdir failed: {err}"));
+                self.show_toast(format!("mkdir failed: {err}"));
             }
         }
         if let Some(browser) = &mut self.sftp_browser {
@@ -344,10 +344,10 @@ impl SeanceWorkspace {
 
         match self.backend.sftp_rename(session_id, &old_path, &new_path) {
             Ok(()) => {
-                self.status_message = Some(format!("Renamed to {new_path}"));
+                self.show_toast(format!("Renamed to {new_path}"));
             }
             Err(err) => {
-                self.status_message = Some(format!("Rename failed: {err}"));
+                self.show_toast(format!("Rename failed: {err}"));
             }
         }
         if let Some(browser) = &mut self.sftp_browser {
@@ -544,13 +544,6 @@ impl SeanceWorkspace {
         let Some(browser) = &self.sftp_browser else {
             return div();
         };
-
-        let shell_divider = div()
-            .w(px(2.0))
-            .h_full()
-            .border_l_1()
-            .border_color(t.sidebar_edge_bright)
-            .bg(t.shell_divider_glow);
 
         let mut content = div()
             .flex_1()
@@ -939,7 +932,6 @@ impl SeanceWorkspace {
             .flex_1()
             .h_full()
             .flex()
-            .child(shell_divider)
             .child(content)
     }
 

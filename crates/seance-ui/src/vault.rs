@@ -31,11 +31,11 @@ impl SeanceWorkspace {
                 self.credential_editor = Some(CredentialEditorState::from_credential(credential));
             }
             Ok(None) => {
-                self.status_message = Some("Credential not found.".into());
+                self.show_toast("Credential not found.");
                 self.refresh_vault_cache();
             }
             Err(err) => {
-                self.status_message = Some(err.to_string());
+                self.show_toast(err.to_string());
             }
         }
         cx.notify();
@@ -54,7 +54,7 @@ impl SeanceWorkspace {
         };
         match self.backend.save_password_credential(draft) {
             Ok(summary) => {
-                self.status_message = Some(format!("Saved credential '{}'.", summary.label));
+                self.show_toast(format!("Saved credential '{}'.", summary.label));
                 self.credential_editor = None;
                 self.refresh_vault_cache();
             }
@@ -71,14 +71,14 @@ impl SeanceWorkspace {
     pub(crate) fn delete_credential(&mut self, id: &str, cx: &mut Context<Self>) {
         match self.backend.delete_password_credential(id) {
             Ok(true) => {
-                self.status_message = Some("Credential deleted.".into());
+                self.show_toast("Credential deleted.");
                 self.refresh_vault_cache();
             }
             Ok(false) => {
-                self.status_message = Some("Credential already removed.".into());
+                self.show_toast("Credential already removed.");
             }
             Err(err) => {
-                self.status_message = Some(err.to_string());
+                self.show_toast(err.to_string());
             }
         }
         cx.notify();
@@ -87,14 +87,14 @@ impl SeanceWorkspace {
     pub(crate) fn delete_private_key(&mut self, id: &str, cx: &mut Context<Self>) {
         match self.backend.delete_private_key(id) {
             Ok(true) => {
-                self.status_message = Some("Key deleted.".into());
+                self.show_toast("Key deleted.");
                 self.refresh_vault_cache();
             }
             Ok(false) => {
-                self.status_message = Some("Key already removed.".into());
+                self.show_toast("Key already removed.");
             }
             Err(err) => {
-                self.status_message = Some(err.to_string());
+                self.show_toast(err.to_string());
             }
         }
         cx.notify();
@@ -168,13 +168,13 @@ impl SeanceWorkspace {
                             .generate_ed25519_key(format!("ed25519-{}", crate::now_ui_suffix()))
                         {
                             Ok(summary) => {
-                                this.status_message = Some(format!(
+                                this.show_toast(format!(
                                     "Generated key '{}'.",
                                     summary.label
                                 ));
                                 this.refresh_vault_cache();
                             }
-                            Err(err) => this.status_message = Some(err.to_string()),
+                            Err(err) => this.show_toast(err.to_string()),
                         }
                         this.perf_overlay.mark_input(RedrawReason::Input);
                         cx.notify();
@@ -188,13 +188,13 @@ impl SeanceWorkspace {
                             .generate_rsa_key(format!("rsa-{}", crate::now_ui_suffix()))
                         {
                             Ok(summary) => {
-                                this.status_message = Some(format!(
+                                this.show_toast(format!(
                                     "Generated key '{}'.",
                                     summary.label
                                 ));
                                 this.refresh_vault_cache();
                             }
-                            Err(err) => this.status_message = Some(err.to_string()),
+                            Err(err) => this.show_toast(err.to_string()),
                         }
                         this.perf_overlay.mark_input(RedrawReason::Input);
                         cx.notify();
@@ -436,13 +436,13 @@ impl SeanceWorkspace {
                                             crate::now_ui_suffix()
                                         )) {
                                             Ok(summary) => {
-                                                this.status_message = Some(format!(
+                                                this.show_toast(format!(
                                                     "Generated key '{}'.",
                                                     summary.label
                                                 ));
                                                 this.refresh_vault_cache();
                                             }
-                                            Err(err) => this.status_message = Some(err.to_string()),
+                                            Err(err) => this.show_toast(err.to_string()),
                                         }
                                         cx.notify();
                                     }),
@@ -467,13 +467,13 @@ impl SeanceWorkspace {
                                             .generate_rsa_key(format!("rsa-{}", crate::now_ui_suffix()))
                                         {
                                             Ok(summary) => {
-                                                this.status_message = Some(format!(
+                                                this.show_toast(format!(
                                                     "Generated key '{}'.",
                                                     summary.label
                                                 ));
                                                 this.refresh_vault_cache();
                                             }
-                                            Err(err) => this.status_message = Some(err.to_string()),
+                                            Err(err) => this.show_toast(err.to_string()),
                                         }
                                         cx.notify();
                                     }),

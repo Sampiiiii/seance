@@ -507,7 +507,6 @@ fn open_workspace_window(
                     sftp_browser: None,
                     cached_credentials: bootstrap.cached_credentials.clone(),
                     cached_keys: bootstrap.cached_keys.clone(),
-                    status_message: None,
                     update_state: bootstrap.update_state.clone(),
                     active_theme: theme_id_from_config(&bootstrap.config),
                     palette_open: false,
@@ -522,6 +521,9 @@ fn open_workspace_window(
                     },
                     perf_mode_env_override: perf_mode_override_from_env(),
                     perf_overlay: PerfOverlayState::new(perf_mode_from_config(&bootstrap.config)),
+                    sidebar_width: crate::model::DEFAULT_SIDEBAR_WIDTH,
+                    sidebar_resizing: false,
+                    toast: None,
                 };
                 cx.observe_window_bounds(window, |this: &mut SeanceWorkspace, window, cx| {
                     this.apply_active_terminal_geometry(window);

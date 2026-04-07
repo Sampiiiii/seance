@@ -52,11 +52,11 @@ impl SeanceWorkspace {
         match self.backend.set_theme(theme_id.key().to_string()) {
             Ok(_) => {
                 self.settings_panel.message = None;
-                self.status_message = Some(format!("Theme set to {}.", theme_id.display_name()));
+                self.show_toast(format!("Theme set to {}.", theme_id.display_name()));
             }
             Err(error) => {
                 self.settings_panel.message = Some(error.to_string());
-                self.status_message = Some(error.to_string());
+                self.show_toast(error.to_string());
             }
         }
         self.perf_overlay
@@ -120,7 +120,7 @@ impl SeanceWorkspace {
 
     pub(crate) fn check_for_updates(&mut self, cx: &mut Context<Self>) {
         self.backend.check_for_updates();
-        self.status_message = Some("Checking for updates…".into());
+        self.show_toast("Checking for updates…");
         self.update_state = UpdateState::Checking;
         self.perf_overlay
             .mark_input(crate::perf::RedrawReason::UiRefresh);
@@ -159,13 +159,6 @@ impl SeanceWorkspace {
     ) -> Div {
         let t = self.theme();
         let section = self.settings_panel.section;
-
-        let shell_divider = div()
-            .w(px(2.0))
-            .h_full()
-            .border_l_1()
-            .border_color(t.sidebar_edge_bright)
-            .bg(t.shell_divider_glow);
 
         let mut nav_items = div().flex().flex_col().gap(px(2.0)).child(
             div()
@@ -795,7 +788,6 @@ impl SeanceWorkspace {
             .h_full()
             .flex()
             .child(nav)
-            .child(shell_divider)
             .child(content)
     }
 }
