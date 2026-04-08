@@ -45,6 +45,7 @@ impl From<PerfHudDefault> for UiPerfMode {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum RedrawReason {
+    DisplayProbe,
     Input,
     TerminalUpdate,
     Palette,
@@ -56,6 +57,7 @@ pub(crate) enum RedrawReason {
 impl RedrawReason {
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::DisplayProbe => "probe",
             Self::Input => "input",
             Self::TerminalUpdate => "terminal",
             Self::Palette => "palette",
@@ -68,13 +70,17 @@ impl RedrawReason {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FrameStats {
     pub(crate) frame_count_total: u64,
-    pub(crate) fps_1s: f32,
+    pub(crate) presented_fps_1s: f32,
+    pub(crate) display_hz_1s: f32,
     pub(crate) frame_time_last_ms: f32,
     pub(crate) frame_time_avg_ms: f32,
     pub(crate) frame_time_p95_ms: f32,
     pub(crate) present_interval_last_ms: f32,
     pub(crate) present_interval_avg_ms: f32,
     pub(crate) present_interval_p95_ms: f32,
+    pub(crate) display_interval_last_ms: f32,
+    pub(crate) display_interval_avg_ms: f32,
+    pub(crate) display_interval_p95_ms: f32,
     pub(crate) redraw_reason: RedrawReason,
 }
 
@@ -84,6 +90,12 @@ pub(crate) struct PerfOverlayState {
     pub(crate) last_present_timestamp: Option<Instant>,
     pub(crate) present_timestamps: VecDeque<Instant>,
     pub(crate) present_intervals: VecDeque<(Instant, Duration)>,
+    pub(crate) last_display_probe_timestamp: Option<Instant>,
+    pub(crate) display_probe_timestamps: VecDeque<Instant>,
+    pub(crate) display_probe_intervals: VecDeque<(Instant, Duration)>,
+    pub(crate) display_probe_enabled: bool,
+    pub(crate) display_probe_scheduled: bool,
+    pub(crate) display_probe_epoch: u64,
     pub(crate) render_cost_samples: VecDeque<(Instant, Duration)>,
     pub(crate) ui_refresh_timestamps: VecDeque<Instant>,
     pub(crate) terminal_refresh_timestamps: VecDeque<Instant>,
@@ -100,6 +112,12 @@ impl PerfOverlayState {
             last_present_timestamp: None,
             present_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
             present_intervals: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
+            last_display_probe_timestamp: None,
+            display_probe_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
+            display_probe_intervals: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
+            display_probe_enabled: false,
+            display_probe_scheduled: false,
+            display_probe_epoch: 0,
             render_cost_samples: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
             ui_refresh_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
             terminal_refresh_timestamps: VecDeque::with_capacity(PERF_HISTORY_LIMIT),
@@ -114,6 +132,9 @@ impl PerfOverlayState {
         self.last_present_timestamp = None;
         self.present_timestamps.clear();
         self.present_intervals.clear();
+        self.last_display_probe_timestamp = None;
+        self.display_probe_timestamps.clear();
+        self.display_probe_intervals.clear();
         self.render_cost_samples.clear();
         self.ui_refresh_timestamps.clear();
         self.terminal_refresh_timestamps.clear();
@@ -145,29 +166,89 @@ impl PerfOverlayState {
         self.pending_redraw_reason = reason;
     }
 
+    pub(crate) fn mark_display_probe(&mut self) {
+        if matches!(
+            self.pending_redraw_reason,
+            RedrawReason::Unknown | RedrawReason::DisplayProbe
+        ) {
+            self.pending_redraw_reason = RedrawReason::DisplayProbe;
+        }
+    }
+
+    pub(crate) fn start_display_probe(&mut self) {
+        self.display_probe_enabled = true;
+        self.display_probe_scheduled = false;
+        self.display_probe_epoch = self.display_probe_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn stop_display_probe(&mut self) {
+        self.display_probe_enabled = false;
+        self.display_probe_scheduled = false;
+        self.display_probe_epoch = self.display_probe_epoch.wrapping_add(1);
+        self.last_display_probe_timestamp = None;
+        self.display_probe_timestamps.clear();
+        self.display_probe_intervals.clear();
+    }
+
+    pub(crate) fn schedule_display_probe_callback(&mut self) -> Option<u64> {
+        if !self.display_probe_enabled || self.display_probe_scheduled {
+            return None;
+        }
+
+        self.display_probe_scheduled = true;
+        Some(self.display_probe_epoch)
+    }
+
+    pub(crate) fn begin_display_probe_callback(&mut self, epoch: u64) -> bool {
+        if !self.display_probe_enabled
+            || self.display_probe_epoch != epoch
+            || !self.display_probe_scheduled
+        {
+            return false;
+        }
+
+        self.display_probe_scheduled = false;
+        true
+    }
+
+    pub(crate) fn record_display_probe(&mut self, now: Instant) {
+        if let Some(previous) = self.last_display_probe_timestamp.replace(now) {
+            self.display_probe_intervals
+                .push_back((now, now.saturating_duration_since(previous)));
+            trim_timed_durations(&mut self.display_probe_intervals, now, PERF_WINDOW);
+        }
+        self.display_probe_timestamps.push_back(now);
+        trim_instants(&mut self.display_probe_timestamps, now, PERF_WINDOW);
+    }
+
     pub(crate) fn finish_render(&mut self, started_at: Instant, ended_at: Instant) {
         self.render_cost_samples
             .push_back((ended_at, ended_at.saturating_duration_since(started_at)));
         trim_timed_durations(&mut self.render_cost_samples, ended_at, PERF_WINDOW);
-        if let Some(previous) = self.last_present_timestamp.replace(ended_at) {
-            self.present_intervals
-                .push_back((ended_at, ended_at.saturating_duration_since(previous)));
-            trim_timed_durations(&mut self.present_intervals, ended_at, PERF_WINDOW);
+        if !matches!(self.pending_redraw_reason, RedrawReason::DisplayProbe) {
+            if let Some(previous) = self.last_present_timestamp.replace(ended_at) {
+                self.present_intervals
+                    .push_back((ended_at, ended_at.saturating_duration_since(previous)));
+                trim_timed_durations(&mut self.present_intervals, ended_at, PERF_WINDOW);
+            }
+            self.present_timestamps.push_back(ended_at);
+            trim_instants(&mut self.present_timestamps, ended_at, PERF_WINDOW);
         }
-        self.present_timestamps.push_back(ended_at);
-        trim_instants(&mut self.present_timestamps, ended_at, PERF_WINDOW);
         self.frame_stats = build_frame_stats(
             self.frame_stats.frame_count_total.saturating_add(1),
             &self.render_cost_samples,
             &self.present_intervals,
             &self.present_timestamps,
+            &self.display_probe_intervals,
+            &self.display_probe_timestamps,
             self.pending_redraw_reason,
         );
         self.pending_redraw_reason = RedrawReason::Unknown;
 
         trace!(
             frame_count_total = self.frame_stats.frame_count_total,
-            fps_1s = self.frame_stats.fps_1s,
+            presented_fps_1s = self.frame_stats.presented_fps_1s,
+            display_hz_1s = self.frame_stats.display_hz_1s,
             frame_time_last_ms = self.frame_stats.frame_time_last_ms,
             redraw_reason = self.frame_stats.redraw_reason.label(),
             "perf render sampled"
@@ -245,6 +326,8 @@ pub(crate) fn build_frame_stats(
     render_cost_samples: &VecDeque<(Instant, Duration)>,
     present_intervals: &VecDeque<(Instant, Duration)>,
     present_timestamps: &VecDeque<Instant>,
+    display_probe_intervals: &VecDeque<(Instant, Duration)>,
+    display_probe_timestamps: &VecDeque<Instant>,
     redraw_reason: RedrawReason,
 ) -> FrameStats {
     let frame_time_last_ms = render_cost_samples
@@ -259,16 +342,26 @@ pub(crate) fn build_frame_stats(
         .unwrap_or_default();
     let present_interval_avg_ms = average_duration_ms(present_intervals);
     let present_interval_p95_ms = percentile_duration_ms(present_intervals, 0.95);
+    let display_interval_last_ms = display_probe_intervals
+        .back()
+        .map(|(_, duration)| duration.as_secs_f32() * 1_000.0)
+        .unwrap_or_default();
+    let display_interval_avg_ms = average_duration_ms(display_probe_intervals);
+    let display_interval_p95_ms = percentile_duration_ms(display_probe_intervals, 0.95);
 
     FrameStats {
         frame_count_total,
-        fps_1s: normalized_fps_1s(present_timestamps),
+        presented_fps_1s: normalized_fps_1s(present_timestamps),
+        display_hz_1s: normalized_fps_1s(display_probe_timestamps),
         frame_time_last_ms,
         frame_time_avg_ms,
         frame_time_p95_ms,
         present_interval_last_ms,
         present_interval_avg_ms,
         present_interval_p95_ms,
+        display_interval_last_ms,
+        display_interval_avg_ms,
+        display_interval_p95_ms,
         redraw_reason,
     }
 }
@@ -330,33 +423,50 @@ mod tests {
             (now + Duration::from_millis(9), Duration::from_millis(5)),
             (now + Duration::from_millis(16), Duration::from_millis(7)),
         ]);
-        let cadence_samples = VecDeque::from(vec![
+        let present_samples = VecDeque::from(vec![
             (now + Duration::from_millis(10), Duration::from_millis(10)),
             (now + Duration::from_millis(43), Duration::from_millis(33)),
             (now + Duration::from_millis(93), Duration::from_millis(50)),
         ]);
-        let timestamps = VecDeque::from(vec![
+        let present_timestamps = VecDeque::from(vec![
             now,
             now + Duration::from_millis(100),
             now + Duration::from_millis(200),
+        ]);
+        let display_samples = VecDeque::from(vec![
+            (now + Duration::from_millis(8), Duration::from_millis(8)),
+            (now + Duration::from_millis(24), Duration::from_millis(16)),
+            (now + Duration::from_millis(32), Duration::from_millis(8)),
+        ]);
+        let display_timestamps = VecDeque::from(vec![
+            now,
+            now + Duration::from_millis(8),
+            now + Duration::from_millis(16),
+            now + Duration::from_millis(24),
         ]);
 
         let stats = build_frame_stats(
             9,
             &render_samples,
-            &cadence_samples,
-            &timestamps,
+            &present_samples,
+            &present_timestamps,
+            &display_samples,
+            &display_timestamps,
             RedrawReason::TerminalUpdate,
         );
 
         assert_eq!(stats.frame_count_total, 9);
-        assert!((stats.fps_1s - 3.0).abs() < 0.01);
+        assert!((stats.presented_fps_1s - 3.0).abs() < 0.01);
+        assert!((stats.display_hz_1s - 4.0).abs() < 0.01);
         assert_eq!(stats.frame_time_last_ms, 7.0);
         assert!((stats.frame_time_avg_ms - 5.3333335).abs() < 0.01);
         assert_eq!(stats.frame_time_p95_ms, 7.0);
         assert_eq!(stats.present_interval_last_ms, 50.0);
         assert!((stats.present_interval_avg_ms - 31.0).abs() < 0.01);
         assert_eq!(stats.present_interval_p95_ms, 50.0);
+        assert_eq!(stats.display_interval_last_ms, 8.0);
+        assert!((stats.display_interval_avg_ms - 10.666667).abs() < 0.01);
+        assert_eq!(stats.display_interval_p95_ms, 16.0);
         assert_eq!(stats.redraw_reason, RedrawReason::TerminalUpdate);
     }
 
@@ -444,6 +554,8 @@ mod tests {
         let now = Instant::now();
 
         state.mark_ui_refresh_request(now, RedrawReason::UiRefresh);
+        state.start_display_probe();
+        state.record_display_probe(now + Duration::from_millis(4));
         state.finish_render(
             now + Duration::from_millis(8),
             now + Duration::from_millis(16),
@@ -453,10 +565,13 @@ mod tests {
 
         assert!(state.present_timestamps.is_empty());
         assert!(state.present_intervals.is_empty());
+        assert!(state.display_probe_timestamps.is_empty());
+        assert!(state.display_probe_intervals.is_empty());
         assert!(state.render_cost_samples.is_empty());
         assert!(state.ui_refresh_timestamps.is_empty());
         assert!(state.terminal_refresh_timestamps.is_empty());
         assert!(state.last_present_timestamp.is_none());
+        assert!(state.last_display_probe_timestamp.is_none());
         assert_eq!(state.frame_stats.frame_count_total, 0);
     }
 
@@ -501,12 +616,12 @@ mod tests {
             (now + Duration::from_millis(9), Duration::from_millis(5)),
             (now + Duration::from_millis(16), Duration::from_millis(7)),
         ]);
-        let cadence_samples = VecDeque::from(vec![
+        let present_samples = VecDeque::from(vec![
             (now + Duration::from_millis(16), Duration::from_millis(16)),
             (now + Duration::from_millis(49), Duration::from_millis(33)),
             (now + Duration::from_millis(99), Duration::from_millis(50)),
         ]);
-        let timestamps = VecDeque::from(vec![
+        let present_timestamps = VecDeque::from(vec![
             now,
             now + Duration::from_millis(250),
             now + Duration::from_millis(500),
@@ -515,8 +630,10 @@ mod tests {
         let stats = build_frame_stats(
             3,
             &render_samples,
-            &cadence_samples,
-            &timestamps,
+            &present_samples,
+            &present_timestamps,
+            &VecDeque::default(),
+            &VecDeque::default(),
             RedrawReason::Input,
         );
 
@@ -578,5 +695,49 @@ mod tests {
         assert!(state.frame_stats.frame_time_last_ms <= 6.0);
         assert!(state.frame_stats.frame_time_avg_ms <= 5.1);
         assert!(state.frame_stats.present_interval_last_ms >= 100.0);
+    }
+
+    #[test]
+    fn display_probe_samples_are_tracked_separately() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.start_display_probe();
+        state.record_display_probe(now);
+        state.record_display_probe(now + Duration::from_millis(8));
+        state.record_display_probe(now + Duration::from_millis(16));
+
+        assert_eq!(state.display_probe_timestamps.len(), 3);
+        assert_eq!(state.display_probe_intervals.len(), 2);
+    }
+
+    #[test]
+    fn display_probe_scheduling_is_gated_by_epoch() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+
+        state.start_display_probe();
+        let epoch = state.schedule_display_probe_callback().unwrap();
+
+        assert!(state.begin_display_probe_callback(epoch));
+        assert!(!state.begin_display_probe_callback(epoch));
+
+        state.start_display_probe();
+        let newer_epoch = state.schedule_display_probe_callback().unwrap();
+        state.stop_display_probe();
+
+        assert!(newer_epoch > epoch || state.display_probe_epoch == 0);
+        assert!(!state.begin_display_probe_callback(newer_epoch));
+    }
+
+    #[test]
+    fn display_probe_frames_do_not_count_as_presented_fps() {
+        let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
+        let now = Instant::now();
+
+        state.mark_display_probe();
+        state.finish_render(now, now + Duration::from_millis(8));
+
+        assert_eq!(state.frames_presented_last_second(), 0);
+        assert_eq!(state.frame_stats.presented_fps_1s, 0.0);
     }
 }

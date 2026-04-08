@@ -16,13 +16,16 @@ mod hosts;
 mod model;
 mod palette;
 mod perf;
+mod perf_runtime;
 mod secure;
 mod sessions;
 mod settings;
 mod sftp;
 mod surface;
 mod terminal_paint;
+mod terminal_runtime;
 mod theme;
+mod tunnels;
 mod ui_components;
 mod vault;
 mod workspace;
@@ -103,8 +106,7 @@ impl Render for SeanceWorkspace {
                     if this.sidebar_resizing {
                         let new_width = f32::from(event.position.x);
                         this.sidebar_width = new_width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
-                        this.invalidate_terminal_surface();
-                        this.apply_active_terminal_geometry(window);
+                        this.schedule_active_terminal_geometry_refresh(window, _cx);
                     }
                 }),
             )
@@ -129,9 +131,9 @@ impl Render for SeanceWorkspace {
             .on_action(cx.listener(|this, _: &OpenPreferences, _window, cx| {
                 this.open_settings_panel(SettingsSection::General, cx);
             }))
-            .on_action(cx.listener(|this, _: &CloseActiveSession, _window, cx| {
+            .on_action(cx.listener(|this, _: &CloseActiveSession, window, cx| {
                 if this.active_session_id != 0 {
-                    this.close_session(this.active_session_id, cx);
+                    this.close_session(this.active_session_id, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &TogglePerfHud, window, cx| {
@@ -144,9 +146,9 @@ impl Render for SeanceWorkspace {
                 ));
                 this.start_connect_attempt(&action.vault_id, &action.host_id, window, cx);
             }))
-            .on_action(cx.listener(|this, action: &SelectSession, _window, cx| {
+            .on_action(cx.listener(|this, action: &SelectSession, window, cx| {
                 if this.backend.session(action.session_id).is_some() {
-                    this.select_session(action.session_id, cx);
+                    this.select_session(action.session_id, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, action: &SwitchTheme, window, cx| {

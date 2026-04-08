@@ -1,0 +1,19 @@
+name: Setup Zig
+description: Install and verify the Zig toolchain required for vendored Ghostty builds.
+
+inputs:
+  version:
+    description: Zig version to install.
+    required: false
+    default: "0.15.2"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Zig
+      uses: mlugg/setup-zig@v2.2.1
+      with:
+        version: ${{ inputs.version }}
+    - name: Verify Zig
+      shell: bash
+      run: zig version

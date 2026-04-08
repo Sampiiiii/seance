@@ -1,7 +1,9 @@
 use gpui::{Div, FontWeight, IntoElement, Pixels, SharedString, Size, div, prelude::*, px};
 use seance_config::AppConfig;
 use seance_core::UpdateState;
-use seance_terminal::{TerminalGeometry, TerminalRow};
+use seance_terminal::TerminalGeometry;
+#[cfg(test)]
+use seance_terminal::TerminalRow;
 
 use crate::{
     TerminalMetrics, TerminalRendererMetrics,
@@ -16,10 +18,20 @@ pub(crate) fn theme_id_from_config(config: &AppConfig) -> ThemeId {
     ThemeId::from_key(&config.appearance.theme).unwrap_or(ThemeId::ObsidianSmoke)
 }
 
-pub(crate) fn frame_budget_color(frame_ms: f32, theme: &Theme) -> gpui::Hsla {
-    if frame_ms <= 16.7 {
+pub(crate) fn perf_budget_color(metric_ms: f32, theme: &Theme) -> gpui::Hsla {
+    if metric_ms <= 8.3 {
         theme.accent
-    } else if frame_ms <= 25.0 {
+    } else if metric_ms <= 16.7 {
+        theme.warning
+    } else {
+        theme.text_secondary
+    }
+}
+
+pub(crate) fn display_hz_color(hz: f32, theme: &Theme) -> gpui::Hsla {
+    if hz >= 110.0 {
+        theme.accent
+    } else if hz >= 55.0 {
         theme.warning
     } else {
         theme.text_secondary
@@ -57,9 +69,25 @@ pub(crate) fn compact_perf_strings(state: &PerfOverlayState) -> Vec<(&'static st
         .as_ref()
         .map(|snapshot| &snapshot.terminal);
     vec![
-        ("fps", format!("{:.0}", state.frame_stats.fps_1s)),
         (
-            "frame",
+            "display hz",
+            format!("{:.0}", state.frame_stats.display_hz_1s),
+        ),
+        (
+            "display cadence",
+            format!(
+                "{:.1}/{:.1}/{:.1} ms",
+                state.frame_stats.display_interval_last_ms,
+                state.frame_stats.display_interval_avg_ms,
+                state.frame_stats.display_interval_p95_ms
+            ),
+        ),
+        (
+            "presented fps",
+            format!("{:.0}", state.frame_stats.presented_fps_1s),
+        ),
+        (
+            "ui cost",
             format!(
                 "{:.1}/{:.1}/{:.1} ms",
                 state.frame_stats.frame_time_last_ms,
@@ -68,14 +96,135 @@ pub(crate) fn compact_perf_strings(state: &PerfOverlayState) -> Vec<(&'static st
             ),
         ),
         (
-            "snapshot",
+            "term hz",
             format!(
-                "{:.2} ms",
+                "{:.0}",
                 terminal
-                    .map(|metrics| metrics.last_snapshot_duration.as_secs_f32() * 1_000.0)
+                    .map(|metrics| metrics.snapshot_rate_1s)
                     .unwrap_or_default()
             ),
         ),
+    ]
+}
+
+pub(crate) fn expanded_perf_strings(
+    state: &PerfOverlayState,
+    renderer: TerminalRendererMetrics,
+) -> Vec<(&'static str, String)> {
+    let terminal = state
+        .active_session_perf_snapshot
+        .as_ref()
+        .map(|snapshot| &snapshot.terminal);
+    vec![
+        (
+            "display hz",
+            format!("{:.0}", state.frame_stats.display_hz_1s),
+        ),
+        (
+            "display cadence",
+            format!(
+                "{:.1}/{:.1}/{:.1} ms",
+                state.frame_stats.display_interval_last_ms,
+                state.frame_stats.display_interval_avg_ms,
+                state.frame_stats.display_interval_p95_ms
+            ),
+        ),
+        ("target", "120 Hz (8.3 ms) / 60 Hz (16.7 ms)".into()),
+        (
+            "presented fps",
+            format!("{:.0}", state.frame_stats.presented_fps_1s),
+        ),
+        (
+            "ui cost",
+            format!(
+                "{:.1}/{:.1}/{:.1} ms",
+                state.frame_stats.frame_time_last_ms,
+                state.frame_stats.frame_time_avg_ms,
+                state.frame_stats.frame_time_p95_ms
+            ),
+        ),
+        (
+            "ui redraw req",
+            state.ui_refreshes_last_second().to_string(),
+        ),
+        (
+            "presented",
+            state.frames_presented_last_second().to_string(),
+        ),
+        (
+            "terminal redraw req",
+            state.terminal_refreshes_last_second().to_string(),
+        ),
+        (
+            "present/ui",
+            format!(
+                "{}/{}",
+                state.frames_presented_last_second(),
+                state.ui_refreshes_last_second()
+            ),
+        ),
+        (
+            "reason",
+            state.frame_stats.redraw_reason.label().to_string(),
+        ),
+        (
+            "term hz",
+            format!(
+                "{:.0}",
+                terminal
+                    .map(|metrics| metrics.snapshot_rate_1s)
+                    .unwrap_or_default()
+            ),
+        ),
+        (
+            "term cadence",
+            format!(
+                "{:.1}/{:.1}/{:.1} ms",
+                terminal
+                    .map(|metrics| metrics.snapshot_interval_last_ms)
+                    .unwrap_or_default(),
+                terminal
+                    .map(|metrics| metrics.snapshot_interval_avg_ms)
+                    .unwrap_or_default(),
+                terminal
+                    .map(|metrics| metrics.snapshot_interval_p95_ms)
+                    .unwrap_or_default()
+            ),
+        ),
+        (
+            "ui cadence",
+            format!(
+                "{:.1}/{:.1}/{:.1} ms",
+                state.frame_stats.present_interval_last_ms,
+                state.frame_stats.present_interval_avg_ms,
+                state.frame_stats.present_interval_p95_ms
+            ),
+        ),
+        (
+            "snapshot",
+            format!(
+                "{:.2}/{:.2}/{:.2} ms",
+                terminal
+                    .map(|metrics| metrics.last_snapshot_duration.as_secs_f32() * 1_000.0)
+                    .unwrap_or_default(),
+                terminal
+                    .map(|metrics| metrics.avg_snapshot_duration.as_secs_f32() * 1_000.0)
+                    .unwrap_or_default(),
+                terminal
+                    .map(|metrics| metrics.p95_snapshot_duration_ms)
+                    .unwrap_or_default()
+            ),
+        ),
+        ("vt bytes", state.vt_bytes_per_second().to_string()),
+        (
+            "dirty",
+            if state.active_session_dirty() {
+                "yes".into()
+            } else {
+                "no".into()
+            },
+        ),
+        ("visible", state.visible_line_count.to_string()),
         (
             "rows",
             terminal
@@ -88,80 +237,48 @@ pub(crate) fn compact_perf_strings(state: &PerfOverlayState) -> Vec<(&'static st
                 .map(|metrics| metrics.rendered_cell_count.to_string())
                 .unwrap_or_else(|| "0".into()),
         ),
-    ]
-}
-
-pub(crate) fn expanded_perf_strings(
-    state: &PerfOverlayState,
-    active_session_id: u64,
-    palette_open: bool,
-    renderer: TerminalRendererMetrics,
-) -> Vec<(&'static str, String)> {
-    let terminal = state
-        .active_session_perf_snapshot
-        .as_ref()
-        .map(|snapshot| &snapshot.terminal);
-    vec![
-        ("ui refresh", state.ui_refreshes_last_second().to_string()),
         (
-            "terminal refresh",
-            state.terminal_refreshes_last_second().to_string(),
-        ),
-        (
-            "presented",
-            state.frames_presented_last_second().to_string(),
-        ),
-        (
-            "present/ui",
-            format!(
-                "{}/{}",
-                state.frames_presented_last_second(),
-                state.ui_refreshes_last_second()
-            ),
-        ),
-        (
-            "cadence",
-            format!(
-                "{:.1}/{:.1}/{:.1} ms",
-                state.frame_stats.present_interval_last_ms,
-                state.frame_stats.present_interval_avg_ms,
-                state.frame_stats.present_interval_p95_ms
-            ),
-        ),
-        (
-            "dirty",
-            if state.active_session_dirty() {
-                "yes".into()
-            } else {
-                "no".into()
-            },
-        ),
-        ("vt bytes", state.vt_bytes_per_second().to_string()),
-        (
-            "truncated",
+            "dirty rows",
             terminal
-                .map(|metrics| metrics.truncated_row_count.to_string())
+                .map(|metrics| metrics.dirty_row_count.to_string())
                 .unwrap_or_else(|| "0".into()),
         ),
-        ("session", active_session_id.to_string()),
         (
-            "palette",
-            if palette_open {
-                "open".into()
-            } else {
-                "closed".into()
-            },
+            "ghostty",
+            terminal
+                .map(|metrics| format!("{:?}", metrics.ghostty_dirty_state).to_lowercase())
+                .unwrap_or_else(|| "clean".into()),
         ),
-        ("visible", state.visible_line_count.to_string()),
         (
-            "reason",
-            state.frame_stats.redraw_reason.label().to_string(),
+            "scrollback",
+            terminal
+                .map(|metrics| metrics.scrollback_rows.to_string())
+                .unwrap_or_else(|| "0".into()),
+        ),
+        (
+            "bottom",
+            terminal
+                .map(|metrics| {
+                    if metrics.at_bottom {
+                        "yes".into()
+                    } else {
+                        "no".into()
+                    }
+                })
+                .unwrap_or_else(|| "yes".into()),
         ),
         ("plan rows", renderer.visible_rows.to_string()),
+        ("rebuilt", renderer.rebuilt_rows.to_string()),
         ("fragments", renderer.fragments.to_string()),
         ("bg quads", renderer.background_quads.to_string()),
         ("shape hits", renderer.shape_hits.to_string()),
         ("shape misses", renderer.shape_misses.to_string()),
+        (
+            "drops",
+            terminal
+                .map(|metrics| metrics.transcript_dropped_events.to_string())
+                .unwrap_or_else(|| "0".into()),
+        ),
     ]
 }
 
@@ -458,25 +575,133 @@ pub(crate) fn editor_field_card(
     selected: bool,
     theme: &Theme,
 ) -> Div {
+    let is_empty = value.is_empty();
     let mut card = div()
         .p_3()
         .rounded_lg()
         .border_1()
         .border_color(theme.glass_border)
         .bg(theme.glass_tint)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.glass_hover))
         .flex()
         .flex_col()
         .gap_1();
     if selected {
-        card = card.border_color(theme.accent_glow).bg(theme.glass_active);
+        card = card.border_color(theme.accent).bg(theme.glass_active);
     }
 
-    card.child(div().text_xs().text_color(theme.text_muted).child(label))
+    card.child(
+        div()
+            .text_size(px(10.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(if selected {
+                theme.accent
+            } else {
+                theme.text_muted
+            })
+            .child(label),
+    )
+    .child(
+        div()
+            .text_sm()
+            .text_color(if is_empty {
+                theme.text_ghost
+            } else {
+                theme.text_primary
+            })
+            .child(if is_empty { label.to_string() } else { value }),
+    )
+}
+
+/// Primary action button — filled accent background, prominent hover state.
+/// Used for save/submit actions. Pass `enabled = false` for disabled state.
+pub(crate) fn primary_button(label: impl Into<SharedString>, enabled: bool, theme: &Theme) -> Div {
+    let base = div()
+        .px(px(16.0))
+        .py(px(8.0))
+        .rounded_lg()
+        .text_sm()
+        .font_weight(FontWeight::SEMIBOLD)
+        .cursor_pointer();
+
+    if enabled {
+        base.bg(theme.accent)
+            .text_color(theme.bg_void)
+            .hover(|s| s.bg(theme.accent_glow).text_color(theme.text_primary))
+            .child(label.into())
+    } else {
+        base.bg(theme.glass_active)
+            .text_color(theme.text_ghost)
+            .child(label.into())
+    }
+}
+
+/// Danger action button — tinted red, used for delete operations.
+pub(crate) fn danger_button(label: impl Into<SharedString>, theme: &Theme) -> Div {
+    div()
+        .px(px(14.0))
+        .py(px(7.0))
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.danger)
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme.danger)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.danger).text_color(theme.bg_void))
+        .child(label.into())
+}
+
+/// Status badge — small pill indicating item state. Color-coded via theme.
+pub(crate) fn status_badge(label: &'static str, color: gpui::Hsla, _theme: &Theme) -> Div {
+    div()
+        .px(px(8.0))
+        .py(px(2.0))
+        .rounded_full()
+        .bg(gpui::transparent_black())
+        .border_1()
+        .border_color(color)
+        .text_size(px(10.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .font_family("JetBrains Mono")
+        .text_color(color)
+        .child(label)
+}
+
+/// Empty state placeholder for list panels when no items exist.
+pub(crate) fn empty_state(
+    glyph: &'static str,
+    title: &str,
+    description: &str,
+    theme: &Theme,
+) -> Div {
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(12.0))
+        .py(px(40.0))
+        .child(
+            div()
+                .text_size(px(28.0))
+                .text_color(theme.text_ghost)
+                .child(glyph),
+        )
         .child(
             div()
                 .text_sm()
-                .text_color(theme.text_primary)
-                .child(if value.is_empty() { " ".into() } else { value }),
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text_muted)
+                .child(title.to_string()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.text_ghost)
+                .child(description.to_string()),
         )
 }
 
@@ -511,6 +736,7 @@ pub(crate) fn compute_terminal_geometry(
     .ok()
 }
 
+#[cfg(test)]
 pub(crate) fn is_tui_artifact(line: &str) -> bool {
     let non_ws: Vec<char> = line.chars().filter(|c| !c.is_whitespace()).collect();
     if non_ws.is_empty() {
@@ -530,6 +756,7 @@ pub(crate) fn is_tui_artifact(line: &str) -> bool {
     (special as f64 / non_ws.len() as f64) > 0.5
 }
 
+#[cfg(test)]
 pub(crate) fn session_preview_text(rows: &[TerminalRow]) -> Option<String> {
     rows.iter()
         .rev()
@@ -620,6 +847,8 @@ mod tests {
         assert_eq!(geometry.pixel_size.height_px, 788);
         assert_eq!(geometry.size.cols, 123);
         assert_eq!(geometry.size.rows, 41);
+        assert_eq!(geometry.cell_width_px, 8);
+        assert_eq!(geometry.cell_height_px, 19);
     }
 
     #[test]
@@ -740,13 +969,23 @@ mod tests {
     #[test]
     fn compact_perf_strings_include_primary_metrics() {
         let mut state = PerfOverlayState::new(UiPerfMode::Compact);
-        state.frame_stats.fps_1s = 59.0;
+        state.frame_stats.display_hz_1s = 120.0;
+        state.frame_stats.presented_fps_1s = 2.0;
         state.frame_stats.frame_time_last_ms = 12.0;
 
         let rows = compact_perf_strings(&state);
         let labels = rows.into_iter().map(|(label, _)| label).collect::<Vec<_>>();
 
-        assert_eq!(labels, vec!["fps", "frame", "snapshot", "rows", "cells"]);
+        assert_eq!(
+            labels,
+            vec![
+                "display hz",
+                "display cadence",
+                "presented fps",
+                "ui cost",
+                "term hz",
+            ]
+        );
     }
 
     #[test]
@@ -756,21 +995,27 @@ mod tests {
         state.pending_redraw_reason = RedrawReason::Palette;
         state.frame_stats.redraw_reason = RedrawReason::Palette;
 
-        let rows = expanded_perf_strings(&state, 7, true, TerminalRendererMetrics::default());
+        let rows = expanded_perf_strings(&state, TerminalRendererMetrics::default());
         let labels = rows.into_iter().map(|(label, _)| label).collect::<Vec<_>>();
 
-        assert!(labels.contains(&"ui refresh"));
-        assert!(labels.contains(&"terminal refresh"));
-        assert!(labels.contains(&"presented"));
-        assert!(labels.contains(&"present/ui"));
-        assert!(labels.contains(&"cadence"));
+        assert!(labels.contains(&"display hz"));
+        assert!(labels.contains(&"display cadence"));
+        assert!(labels.contains(&"target"));
+        assert!(labels.contains(&"presented fps"));
+        assert!(labels.contains(&"ui redraw req"));
+        assert!(labels.contains(&"terminal redraw req"));
+        assert!(labels.contains(&"term hz"));
+        assert!(labels.contains(&"term cadence"));
+        assert!(labels.contains(&"snapshot"));
         assert!(labels.contains(&"visible"));
+        assert!(labels.contains(&"rows"));
+        assert!(labels.contains(&"cells"));
         assert!(labels.contains(&"reason"));
         assert!(labels.contains(&"fragments"));
     }
 
     #[test]
-    fn presented_and_ui_refresh_are_comparable() {
+    fn redraw_request_labels_are_exposed_separately() {
         let mut state = PerfOverlayState::new(UiPerfMode::Expanded);
         let now = Instant::now();
 
@@ -781,13 +1026,13 @@ mod tests {
             now + Duration::from_millis(20),
         );
 
-        let rows = expanded_perf_strings(&state, 1, false, TerminalRendererMetrics::default());
-        let ratio = rows
+        let rows = expanded_perf_strings(&state, TerminalRendererMetrics::default());
+        let ui_redraw_req = rows
             .into_iter()
-            .find(|(label, _)| *label == "present/ui")
+            .find(|(label, _)| *label == "ui redraw req")
             .map(|(_, value)| value)
             .unwrap();
 
-        assert_eq!(ratio, "1/2");
+        assert_eq!(ui_redraw_req, "2");
     }
 }

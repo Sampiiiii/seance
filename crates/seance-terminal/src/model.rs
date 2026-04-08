@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Result, ensure};
 
 const DEFAULT_COLS: u16 = 120;
@@ -117,6 +119,56 @@ impl TerminalRow {
 
     pub fn terminal_width(&self) -> usize {
         self.cells.iter().map(|cell| usize::from(cell.width)).sum()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalCursor {
+    pub x: u16,
+    pub y: u16,
+    pub at_wide_tail: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminalScreenKind {
+    #[default]
+    Primary,
+    Alternate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalScrollCommand {
+    Top,
+    Bottom,
+    DeltaRows(isize),
+    PageUp,
+    PageDown,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SessionSummary {
+    pub exit_status: Option<String>,
+    pub preview_line: String,
+    pub viewport_revision: u64,
+    pub scrollback_rows: usize,
+    pub active_screen: TerminalScreenKind,
+    pub mouse_tracking: bool,
+    pub at_bottom: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TerminalViewportSnapshot {
+    pub rows: Arc<[Arc<TerminalRow>]>,
+    pub row_revisions: Arc<[u64]>,
+    pub cursor: Option<TerminalCursor>,
+    pub revision: u64,
+    pub cols: u16,
+    pub rows_visible: u16,
+}
+
+impl TerminalViewportSnapshot {
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
     }
 }
 

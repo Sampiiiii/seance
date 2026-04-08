@@ -1,13 +1,15 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc::Receiver},
     time::Duration,
 };
 
 use anyhow::{Context, Result};
 use russh::client;
 use russh_sftp::client::SftpSession;
-use seance_terminal::{SharedSessionState, TerminalGeometry, next_session_id};
+use seance_terminal::{
+    SharedSessionState, TerminalGeometry, TerminalTranscriptSink, next_session_id,
+};
 use tokio::{
     runtime::Runtime,
     sync::{mpsc, oneshot},
@@ -15,18 +17,23 @@ use tokio::{
 use tracing::{debug, trace, warn};
 
 use crate::{
-    auth::{AcceptAnyHostKeyHandler, authenticate},
+    auth::{SshClientHandler, authenticate},
     backend::run_ssh_session,
     model::{
-        SftpBootstrapHandle, SshConnectAbortHandle, SshConnectRequest, SshConnectResult,
-        SshConnectTask, SshError,
+        PortForwardRuntimeSnapshot, SftpBootstrapHandle, SshConnectAbortHandle, SshConnectRequest,
+        SshConnectResult, SshConnectTask, SshError, SshPortForwardRequest,
     },
     session::{SessionCommand, SshSessionHandle},
+    tunnel::{TunnelRegistry, run_port_forward},
 };
+
+type SharedSftpSession = Arc<tokio::sync::Mutex<SftpSession>>;
+type SftpSessionMap = Arc<Mutex<HashMap<u64, SharedSftpSession>>>;
 
 pub struct SshSessionManager {
     pub(crate) runtime: Runtime,
-    pub(crate) sftp_sessions: Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<SftpSession>>>>>,
+    pub(crate) sftp_sessions: SftpSessionMap,
+    pub(crate) tunnel_registry: Arc<TunnelRegistry>,
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -46,12 +53,14 @@ impl SshSessionManager {
                 .build()
                 .context("failed to initialize SSH runtime")?,
             sftp_sessions: Arc::new(Mutex::new(HashMap::new())),
+            tunnel_registry: Arc::new(TunnelRegistry::new()),
         })
     }
 
     pub fn connect(
         &self,
         request: SshConnectRequest,
+        transcript_sink: Arc<dyn TerminalTranscriptSink>,
     ) -> std::result::Result<SshConnectResult, SshError> {
         if request.auth_order.is_empty() {
             return Err(SshError::MissingAuthMethods);
@@ -62,7 +71,12 @@ impl SshSessionManager {
         let (_cancel_tx, cancel_rx) = oneshot::channel();
         self.runtime.block_on(Self::run_connect_future(
             session_id,
-            Self::connect_async(session_id, request, Arc::clone(&sftp_sessions)),
+            Self::connect_async(
+                session_id,
+                request,
+                Arc::clone(&sftp_sessions),
+                transcript_sink,
+            ),
             cancel_rx,
             CONNECT_TIMEOUT,
             &sftp_sessions,
@@ -79,6 +93,7 @@ impl SshSessionManager {
     pub fn start_connect(
         &self,
         request: SshConnectRequest,
+        transcript_sink: Arc<dyn TerminalTranscriptSink>,
     ) -> std::result::Result<SshConnectTask, SshError> {
         if request.auth_order.is_empty() {
             return Err(SshError::MissingAuthMethods);
@@ -94,17 +109,22 @@ impl SshSessionManager {
         );
 
         trace!(session_id, host = %host, "starting SSH connect task");
-        let _ = self.runtime.spawn(async move {
+        std::mem::drop(self.runtime.spawn(async move {
             let result = Self::run_connect_future(
                 session_id,
-                Self::connect_async(session_id, request, Arc::clone(&sftp_sessions)),
+                Self::connect_async(
+                    session_id,
+                    request,
+                    Arc::clone(&sftp_sessions),
+                    transcript_sink,
+                ),
                 cancel_rx,
                 CONNECT_TIMEOUT,
                 &sftp_sessions,
             )
             .await;
             let _ = result_tx.send(result);
-        });
+        }));
 
         Ok(SshConnectTask {
             session_id,
@@ -113,17 +133,63 @@ impl SshSessionManager {
         })
     }
 
+    pub fn start_port_forward(
+        &self,
+        request: SshPortForwardRequest,
+    ) -> std::result::Result<PortForwardRuntimeSnapshot, SshError> {
+        if request.auth_order.is_empty() {
+            return Err(SshError::MissingAuthMethods);
+        }
+        if self.tunnel_registry.has_active_handle(&request.id) {
+            return Err(SshError::PortForwardAlreadyRunning(request.id));
+        }
+
+        let snapshot = self.tunnel_registry.upsert_starting(&request);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        self.tunnel_registry.insert_handle(
+            request.id.clone(),
+            crate::model::SshPortForwardHandle::new(cancel_tx),
+        )?;
+
+        let registry = Arc::clone(&self.tunnel_registry);
+        let id = request.id.clone();
+        std::mem::drop(self.runtime.spawn(async move {
+            let result = run_port_forward(request, Arc::clone(&registry), cancel_rx).await;
+            registry.remove_handle(&id);
+            match result {
+                Ok(()) => registry.remove_snapshot(&id),
+                Err(SshError::Cancelled) => registry.remove_snapshot(&id),
+                Err(error) => registry.mark_failed(&id, error.to_string()),
+            }
+        }));
+
+        Ok(snapshot)
+    }
+
+    pub fn stop_port_forward(&self, id: &str) -> bool {
+        self.tunnel_registry.stop(id)
+    }
+
+    pub fn list_port_forwards(&self) -> Vec<PortForwardRuntimeSnapshot> {
+        self.tunnel_registry.list()
+    }
+
+    pub fn subscribe_tunnel_state_changes(&self) -> Receiver<Vec<PortForwardRuntimeSnapshot>> {
+        self.tunnel_registry.subscribe()
+    }
+
     async fn connect_async(
         session_id: u64,
         request: SshConnectRequest,
-        sftp_sessions: Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<SftpSession>>>>>,
+        sftp_sessions: SftpSessionMap,
+        transcript_sink: Arc<dyn TerminalTranscriptSink>,
     ) -> std::result::Result<SshConnectResult, SshError> {
         let config = Arc::new(client::Config::default());
         let addr = (
             request.connection.hostname.as_str(),
             request.connection.port,
         );
-        let mut session = client::connect(config, addr, AcceptAnyHostKeyHandler)
+        let mut session = client::connect(config, addr, SshClientHandler::default())
             .await
             .map_err(|err| SshError::Transport(err.to_string()))?;
 
@@ -159,10 +225,13 @@ impl SshSessionManager {
 
         let sftp = Self::bootstrap_sftp(session_id, &session, &sftp_sessions).await?;
 
-        let (state, notify_rx) = SharedSessionState::new(format!(
-            "Connected to {}@{}:{}",
-            request.connection.username, request.connection.hostname, request.connection.port
-        ));
+        let (state, notify_rx) = SharedSessionState::new(
+            format!(
+                "Connected to {}@{}:{}",
+                request.connection.username, request.connection.hostname, request.connection.port
+            ),
+            geometry,
+        );
         let (command_tx, command_rx) = mpsc::unbounded_channel::<SessionCommand>();
         let handle = Arc::new(SshSessionHandle::new(
             session_id,
@@ -180,7 +249,12 @@ impl SshSessionManager {
                     .build()
                     .expect("failed to initialize SSH session runtime");
                 runtime.block_on(run_ssh_session(
-                    session, channel, state, geometry, command_rx,
+                    session,
+                    channel,
+                    state,
+                    geometry,
+                    command_rx,
+                    transcript_sink,
                 ));
             })
             .map_err(|err| SshError::Transport(err.to_string()))?;
@@ -193,8 +267,8 @@ impl SshSessionManager {
 
     async fn bootstrap_sftp(
         session_id: u64,
-        session: &client::Handle<AcceptAnyHostKeyHandler>,
-        sftp_sessions: &Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<SftpSession>>>>>,
+        session: &client::Handle<SshClientHandler>,
+        sftp_sessions: &SftpSessionMap,
     ) -> std::result::Result<SftpBootstrapHandle, SshError> {
         let channel = session
             .channel_open_session()
@@ -223,7 +297,7 @@ impl SshSessionManager {
         connect_future: F,
         mut cancel_rx: oneshot::Receiver<()>,
         timeout: Duration,
-        sftp_sessions: &Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<SftpSession>>>>>,
+        sftp_sessions: &SftpSessionMap,
     ) -> std::result::Result<T, SshError>
     where
         F: std::future::Future<Output = std::result::Result<T, SshError>>,
@@ -263,10 +337,7 @@ impl SshSessionManager {
         result
     }
 
-    fn clear_sftp_session(
-        session_id: u64,
-        sftp_sessions: &Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<SftpSession>>>>>,
-    ) {
+    fn clear_sftp_session(session_id: u64, sftp_sessions: &SftpSessionMap) {
         sftp_sessions
             .lock()
             .expect("sftp session map poisoned")
@@ -290,6 +361,7 @@ impl SshSessionManager {
 mod tests {
     use std::{future::pending, time::Duration};
 
+    use seance_terminal::NoopTranscriptSink;
     use tokio::sync::oneshot;
 
     use crate::model::{SshConnectRequest, SshConnectionConfig, SshError};
@@ -300,15 +372,18 @@ mod tests {
     fn rejects_missing_auth_methods() {
         let manager = SshSessionManager::new().unwrap();
         let err = manager
-            .connect(SshConnectRequest {
-                connection: SshConnectionConfig {
-                    label: "demo".into(),
-                    hostname: "localhost".into(),
-                    port: 22,
-                    username: "demo".into(),
+            .connect(
+                SshConnectRequest {
+                    connection: SshConnectionConfig {
+                        label: "demo".into(),
+                        hostname: "localhost".into(),
+                        port: 22,
+                        username: "demo".into(),
+                    },
+                    auth_order: Vec::new(),
                 },
-                auth_order: Vec::new(),
-            })
+                std::sync::Arc::new(NoopTranscriptSink),
+            )
             .unwrap_err();
 
         assert!(matches!(err, SshError::MissingAuthMethods));

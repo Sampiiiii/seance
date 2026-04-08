@@ -8,6 +8,8 @@ For the operator procedure, preflight checks, recovery rules, and post-release v
 
 `seance-build` is the source of truth for release metadata. GitHub Actions and packaging scripts should exchange files, not computed shell strings.
 
+Platform build jobs provision Zig 0.15.2 as part of the workflow because vendored `libghostty-vt-sys` builds Ghostty from source via `zig build` during Rust compilation.
+
 The core rule is:
 
 - one step runs one command

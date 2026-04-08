@@ -30,10 +30,10 @@ pub use device_store::{DeviceSecretError, DeviceSecretStore};
 use kdf::KdfParams;
 pub use model::{
     ApplyDeltaReport, CredentialSummary, DeviceEnrollment, GenerateKeyAlgorithm,
-    GenerateKeyRequest, HostAuthRef, HostSummary, ImportKeyRequest, KeySummary,
-    PrivateKeyAlgorithm, PrivateKeySource, RecordKind, RecoveryBundle, SyncCursor, UnlockMethod,
-    VaultDelta, VaultDeltaRecord, VaultHeader, VaultHostProfile, VaultPasswordCredential,
-    VaultPrivateKey, VaultSnapshot, VaultStatus,
+    GenerateKeyRequest, HostAuthRef, HostSummary, ImportKeyRequest, KeySummary, PortForwardMode,
+    PortForwardSummary, PrivateKeyAlgorithm, PrivateKeySource, RecordKind, RecoveryBundle,
+    SyncCursor, UnlockMethod, VaultDelta, VaultDeltaRecord, VaultHeader, VaultHostProfile,
+    VaultPasswordCredential, VaultPortForwardProfile, VaultPrivateKey, VaultSnapshot, VaultStatus,
 };
 
 use model::{EncryptedRecord, RECORD_SCHEMA_VERSION, RecordSyncState, VAULT_SCHEMA_VERSION};
@@ -130,10 +130,22 @@ pub enum VaultError {
     EmptyPrivateKeyLabel,
     #[error("private key contents cannot be empty")]
     EmptyPrivateKey,
+    #[error("port forward label cannot be empty")]
+    EmptyPortForwardLabel,
+    #[error("port forward host reference cannot be empty")]
+    EmptyPortForwardHostReference,
+    #[error("port forward listen address cannot be empty")]
+    EmptyPortForwardListenAddress,
+    #[error("port forward target address cannot be empty")]
+    EmptyPortForwardTargetAddress,
+    #[error("port forward port values must be in the range 1-65535")]
+    InvalidPortForwardPort,
     #[error("host auth order references missing credential {0}")]
     MissingCredentialReference(String),
     #[error("host auth order references missing private key {0}")]
     MissingPrivateKeyReference(String),
+    #[error("port forward references missing host {0}")]
+    MissingHostReference(String),
     #[error("unsupported private key algorithm")]
     UnsupportedPrivateKeyAlgorithm,
     #[error("credential {credential_id} is still referenced by host {host_id}")]
@@ -143,6 +155,20 @@ pub enum VaultError {
     },
     #[error("private key {key_id} is still referenced by host {host_id}")]
     PrivateKeyInUse { key_id: String, host_id: String },
+    #[error("host {host_id} is still referenced by port forward {port_forward_id}")]
+    HostInUseByPortForward {
+        host_id: String,
+        port_forward_id: String,
+    },
+    #[error(
+        "port forward {label} duplicates existing listen endpoint for host {host_id} ({listen_address}:{listen_port})"
+    )]
+    DuplicatePortForwardListenEndpoint {
+        host_id: String,
+        label: String,
+        listen_address: String,
+        listen_port: u16,
+    },
     #[error("a full snapshot must be applied before importing deltas")]
     SyncBootstrapRequired,
     #[error("cannot apply a full snapshot to an initialized vault")]
@@ -549,6 +575,7 @@ impl VaultStore {
     }
 
     pub fn delete_host_profile(&mut self, host_id: &str) -> VaultResult<bool> {
+        self.ensure_host_not_referenced(host_id)?;
         self.delete_record(host_id, RecordKind::Host)
     }
 
@@ -617,6 +644,38 @@ impl VaultStore {
     pub fn delete_private_key(&mut self, id: &str) -> VaultResult<bool> {
         self.ensure_private_key_not_referenced(id)?;
         self.delete_record(id, RecordKind::PrivateKey)
+    }
+
+    pub fn store_port_forward(
+        &mut self,
+        mut port_forward: VaultPortForwardProfile,
+    ) -> VaultResult<PortForwardSummary> {
+        self.validate_port_forward(&port_forward)?;
+        if port_forward.id.is_empty() {
+            port_forward.id = Uuid::new_v4().to_string();
+        }
+        self.store_record(&mut port_forward, RecordKind::PortForward)?;
+        let modified_at = self.record_modified_at(&port_forward.id, RecordKind::PortForward)?;
+        Ok(port_forward.summary(modified_at))
+    }
+
+    pub fn list_port_forwards(&self) -> VaultResult<Vec<PortForwardSummary>> {
+        let records = storage::list_records_by_kind(&self.conn, RecordKind::PortForward)?;
+        records
+            .into_iter()
+            .map(|record| {
+                let port_forward: VaultPortForwardProfile = self.decrypt_record(&record)?;
+                Ok(port_forward.summary(record.modified_at))
+            })
+            .collect()
+    }
+
+    pub fn load_port_forward(&self, id: &str) -> VaultResult<Option<VaultPortForwardProfile>> {
+        self.load_record_payload(id, RecordKind::PortForward)
+    }
+
+    pub fn delete_port_forward(&mut self, id: &str) -> VaultResult<bool> {
+        self.delete_record(id, RecordKind::PortForward)
     }
 
     pub fn generate_private_key(&mut self, request: GenerateKeyRequest) -> VaultResult<KeySummary> {
@@ -880,8 +939,28 @@ impl VaultStore {
         Ok(())
     }
 
+    fn ensure_host_not_referenced(&self, host_id: &str) -> VaultResult<()> {
+        for port_forward in self.active_port_forwards()? {
+            if port_forward.host_id == host_id {
+                return Err(VaultError::HostInUseByPortForward {
+                    host_id: host_id.to_string(),
+                    port_forward_id: port_forward.id,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn active_hosts(&self) -> VaultResult<Vec<VaultHostProfile>> {
         let records = storage::list_records_by_kind(&self.conn, RecordKind::Host)?;
+        records
+            .into_iter()
+            .map(|record| self.decrypt_record(&record))
+            .collect()
+    }
+
+    fn active_port_forwards(&self) -> VaultResult<Vec<VaultPortForwardProfile>> {
+        let records = storage::list_records_by_kind(&self.conn, RecordKind::PortForward)?;
         records
             .into_iter()
             .map(|record| self.decrypt_record(&record))
@@ -915,6 +994,51 @@ impl VaultStore {
             return Err(VaultError::CorruptVault(
                 "private key algorithm metadata does not match the encoded key".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_port_forward(&self, port_forward: &VaultPortForwardProfile) -> VaultResult<()> {
+        if port_forward.label.trim().is_empty() {
+            return Err(VaultError::EmptyPortForwardLabel);
+        }
+        if port_forward.host_id.trim().is_empty() {
+            return Err(VaultError::EmptyPortForwardHostReference);
+        }
+        if port_forward.listen_address.trim().is_empty() {
+            return Err(VaultError::EmptyPortForwardListenAddress);
+        }
+        if port_forward.target_address.trim().is_empty() {
+            return Err(VaultError::EmptyPortForwardTargetAddress);
+        }
+        if port_forward.listen_port == 0 || port_forward.target_port == 0 {
+            return Err(VaultError::InvalidPortForwardPort);
+        }
+        if self.load_host_profile(&port_forward.host_id)?.is_none() {
+            return Err(VaultError::MissingHostReference(
+                port_forward.host_id.clone(),
+            ));
+        }
+
+        let normalized_listen_address = port_forward.listen_address.trim();
+        for existing in self.active_port_forwards()? {
+            if existing.id == port_forward.id {
+                continue;
+            }
+            if existing.host_id == port_forward.host_id
+                && existing.mode == port_forward.mode
+                && existing.listen_port == port_forward.listen_port
+                && existing
+                    .listen_address
+                    .eq_ignore_ascii_case(normalized_listen_address)
+            {
+                return Err(VaultError::DuplicatePortForwardListenEndpoint {
+                    host_id: port_forward.host_id.clone(),
+                    label: existing.label,
+                    listen_address: existing.listen_address,
+                    listen_port: existing.listen_port,
+                });
+            }
         }
         Ok(())
     }
@@ -1006,6 +1130,16 @@ impl RecordIdentity for VaultPasswordCredential {
 }
 
 impl RecordIdentity for VaultPrivateKey {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+
+    fn set_record_id(&mut self, id: String) {
+        self.id = id;
+    }
+}
+
+impl RecordIdentity for VaultPortForwardProfile {
     fn record_id(&self) -> &str {
         &self.id
     }
@@ -1743,6 +1877,110 @@ mod tests {
         assert!(matches!(
             key_err,
             VaultError::PrivateKeyInUse { key_id, .. } if key_id == key.id
+        ));
+    }
+
+    #[test]
+    fn stores_lists_and_loads_port_forwards() {
+        let (_dir, mut vault) = make_vault();
+        vault
+            .create_vault(&secret("tunnel passphrase"), "source")
+            .unwrap();
+        let (_, _, host) = seed_password_and_key(&mut vault);
+
+        let summary = vault
+            .store_port_forward(VaultPortForwardProfile {
+                id: String::new(),
+                host_id: host.id.clone(),
+                label: "postgres local".into(),
+                mode: PortForwardMode::Local,
+                listen_address: "127.0.0.1".into(),
+                listen_port: 5433,
+                target_address: "127.0.0.1".into(),
+                target_port: 5432,
+                notes: Some("app tunnel".into()),
+            })
+            .unwrap();
+
+        let loaded = vault.load_port_forward(&summary.id).unwrap().unwrap();
+        assert_eq!(loaded.label, "postgres local");
+        assert_eq!(vault.list_port_forwards().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_port_forward_listen_endpoints_are_rejected_per_host_and_mode() {
+        let (_dir, mut vault) = make_vault();
+        vault
+            .create_vault(&secret("tunnel passphrase"), "source")
+            .unwrap();
+        let (_, _, host) = seed_password_and_key(&mut vault);
+
+        vault
+            .store_port_forward(VaultPortForwardProfile {
+                id: String::new(),
+                host_id: host.id.clone(),
+                label: "first".into(),
+                mode: PortForwardMode::Local,
+                listen_address: "127.0.0.1".into(),
+                listen_port: 8080,
+                target_address: "127.0.0.1".into(),
+                target_port: 80,
+                notes: None,
+            })
+            .unwrap();
+
+        let err = vault
+            .store_port_forward(VaultPortForwardProfile {
+                id: String::new(),
+                host_id: host.id.clone(),
+                label: "second".into(),
+                mode: PortForwardMode::Local,
+                listen_address: "127.0.0.1".into(),
+                listen_port: 8080,
+                target_address: "127.0.0.1".into(),
+                target_port: 8081,
+                notes: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            VaultError::DuplicatePortForwardListenEndpoint {
+                host_id,
+                listen_port: 8080,
+                ..
+            } if host_id == host.id
+        ));
+    }
+
+    #[test]
+    fn deleting_host_referenced_by_port_forward_is_rejected() {
+        let (_dir, mut vault) = make_vault();
+        vault
+            .create_vault(&secret("tunnel passphrase"), "source")
+            .unwrap();
+        let (_, _, host) = seed_password_and_key(&mut vault);
+        let port_forward = vault
+            .store_port_forward(VaultPortForwardProfile {
+                id: String::new(),
+                host_id: host.id.clone(),
+                label: "reverse web".into(),
+                mode: PortForwardMode::Remote,
+                listen_address: "127.0.0.1".into(),
+                listen_port: 9000,
+                target_address: "127.0.0.1".into(),
+                target_port: 3000,
+                notes: None,
+            })
+            .unwrap();
+
+        let err = vault.delete_host_profile(&host.id).unwrap_err();
+        assert!(matches!(
+            err,
+            VaultError::HostInUseByPortForward {
+                host_id,
+                port_forward_id
+            } if host_id == host.id && port_forward_id == port_forward.id
         ));
     }
 

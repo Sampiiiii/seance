@@ -2,3 +2,6 @@ target/**
 .DS_Store
 .env.macos-signing
 dist/**
+node_modules/
+.wrangler/
+services/seance-sync/.dev.vars

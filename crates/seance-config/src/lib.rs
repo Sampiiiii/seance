@@ -8,7 +8,7 @@ mod validation;
 
 pub use defaults::{DEFAULT_THEME_KEY, SUPPORTED_KEYBINDING_ACTIONS, SUPPORTED_THEME_KEYS};
 pub use model::{
-    AppConfig, AppearanceConfig, DebugConfig, KeybindingOverride, KeybindingsConfig,
+    AppConfig, AppearanceConfig, DebugConfig, KeybindingOverride, KeybindingsConfig, LoggingConfig,
     PerfHudDefault, TerminalConfig, UpdateConfig, UpdateInstallMode, UpdateReleaseChannel,
     VaultRegistryConfig, VaultRegistryEntry, WindowConfig,
 };

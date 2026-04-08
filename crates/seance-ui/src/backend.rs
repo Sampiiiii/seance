@@ -3,14 +3,15 @@ use std::sync::{Arc, mpsc::Receiver};
 use anyhow::Result;
 use seance_config::{AppConfig, PerfHudDefault, TerminalConfig, WindowConfig};
 use seance_core::{
-    AppControllerHandle, ManagedVaultSummary, SessionId, SessionKind, UpdateState,
-    VaultScopedCredentialSummary, VaultScopedHostSummary, VaultScopedKeySummary,
+    AppControllerHandle, ManagedVaultSummary, SessionId, SessionKind, SessionMetadataSummary,
+    SessionOrigin, UpdateState, VaultScopedCredentialSummary, VaultScopedHostSummary,
+    VaultScopedKeySummary, VaultScopedPortForwardSummary, VaultUiSnapshot,
 };
-use seance_ssh::{SftpEntry, SshConnectRequest, SshSessionManager};
+use seance_ssh::{PortForwardRuntimeSnapshot, SftpEntry, SshConnectRequest, SshPortForwardRequest};
 use seance_terminal::TerminalSession;
 use seance_vault::{
     GenerateKeyAlgorithm, GenerateKeyRequest, ImportKeyRequest, KeySummary, SecretString,
-    VaultHostProfile, VaultPasswordCredential, VaultStatus,
+    VaultHostProfile, VaultPasswordCredential, VaultPortForwardProfile, VaultStatus,
 };
 
 #[derive(Clone)]
@@ -27,12 +28,24 @@ impl UiBackend {
         &self.controller
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub fn subscribe_config_changes(&self) -> Receiver<AppConfig> {
         self.controller.subscribe_config_changes()
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub fn subscribe_update_changes(&self) -> Receiver<UpdateState> {
         self.controller.subscribe_update_changes()
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn subscribe_vault_changes(&self) -> Receiver<VaultUiSnapshot> {
+        self.controller.subscribe_vault_changes()
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn subscribe_tunnel_state_changes(&self) -> Receiver<Vec<PortForwardRuntimeSnapshot>> {
+        self.controller.subscribe_tunnel_state_changes()
     }
 
     pub fn set_theme(&self, theme: String) -> Result<AppConfig> {
@@ -75,8 +88,11 @@ impl UiBackend {
         self.controller.dismiss_update();
     }
 
-    pub fn ssh_manager(&self) -> Arc<SshSessionManager> {
-        self.controller.ssh_manager()
+    pub fn start_connect(
+        &self,
+        request: SshConnectRequest,
+    ) -> std::result::Result<seance_ssh::SshConnectTask, seance_ssh::SshError> {
+        self.controller.start_connect(request)
     }
 
     pub fn vault_status(&self) -> VaultStatus {
@@ -140,8 +156,13 @@ impl UiBackend {
         self.controller.spawn_local_session()
     }
 
-    pub fn register_remote_session(&self, session: Arc<dyn TerminalSession>) {
-        self.controller.register_remote_session(session);
+    pub fn register_remote_session_with_origin(
+        &self,
+        session: Arc<dyn TerminalSession>,
+        origin: SessionOrigin,
+    ) {
+        self.controller
+            .register_remote_session_with_origin(session, origin);
     }
 
     pub fn list_sessions(&self) -> Vec<Arc<dyn TerminalSession>> {
@@ -154,6 +175,10 @@ impl UiBackend {
 
     pub fn session_kind(&self, id: SessionId) -> Option<SessionKind> {
         self.controller.session_kind(id)
+    }
+
+    pub fn session_metadata(&self, id: SessionId) -> Option<SessionMetadataSummary> {
+        self.controller.session_metadata(id)
     }
 
     pub fn session(&self, id: SessionId) -> Option<Arc<dyn TerminalSession>> {
@@ -186,6 +211,30 @@ impl UiBackend {
 
     pub fn delete_host(&self, vault_id: &str, id: &str) -> Result<bool> {
         self.controller.delete_host(vault_id, id)
+    }
+
+    pub fn list_port_forwards(&self) -> Result<Vec<VaultScopedPortForwardSummary>> {
+        self.controller.list_port_forwards()
+    }
+
+    pub fn load_port_forward(
+        &self,
+        vault_id: &str,
+        id: &str,
+    ) -> Result<Option<VaultPortForwardProfile>> {
+        self.controller.load_port_forward(vault_id, id)
+    }
+
+    pub fn save_port_forward(
+        &self,
+        vault_id: &str,
+        port_forward: VaultPortForwardProfile,
+    ) -> Result<VaultScopedPortForwardSummary> {
+        self.controller.save_port_forward(vault_id, port_forward)
+    }
+
+    pub fn delete_port_forward(&self, vault_id: &str, id: &str) -> Result<bool> {
+        self.controller.delete_port_forward(vault_id, id)
     }
 
     pub fn list_password_credentials(&self) -> Result<Vec<VaultScopedCredentialSummary>> {
@@ -264,6 +313,26 @@ impl UiBackend {
         host_id: &str,
     ) -> Result<SshConnectRequest> {
         self.controller.build_connect_request(vault_id, host_id)
+    }
+
+    pub fn build_port_forward_request(
+        &self,
+        vault_id: &str,
+        port_forward_id: &str,
+    ) -> Result<SshPortForwardRequest> {
+        self.controller
+            .build_port_forward_request(vault_id, port_forward_id)
+    }
+
+    pub fn start_port_forward(
+        &self,
+        request: SshPortForwardRequest,
+    ) -> Result<PortForwardRuntimeSnapshot> {
+        self.controller.start_port_forward(request)
+    }
+
+    pub fn stop_port_forward(&self, id: &str) -> bool {
+        self.controller.stop_port_forward(id)
     }
 
     pub fn sftp_canonicalize(&self, session_id: u64, path: &str) -> Result<String> {

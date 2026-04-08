@@ -4,8 +4,9 @@ use gpui::{FocusHandle, ScrollHandle};
 use seance_config::AppConfig;
 use seance_core::{
     ManagedVaultSummary, SessionKind, UpdateState, VaultScopedCredentialSummary,
-    VaultScopedHostSummary, VaultScopedKeySummary,
+    VaultScopedHostSummary, VaultScopedKeySummary, VaultScopedPortForwardSummary,
 };
+use seance_ssh::PortForwardRuntimeSnapshot;
 use seance_terminal::{TerminalGeometry, TerminalSession};
 
 pub(crate) const DEFAULT_SIDEBAR_WIDTH: f32 = 260.0;
@@ -42,6 +43,8 @@ pub(crate) struct SeanceWorkspace {
     pub(crate) sftp_browser: Option<SftpBrowserState>,
     pub(crate) cached_credentials: Vec<VaultScopedCredentialSummary>,
     pub(crate) cached_keys: Vec<VaultScopedKeySummary>,
+    pub(crate) cached_port_forwards: Vec<VaultScopedPortForwardSummary>,
+    pub(crate) active_port_forwards: Vec<PortForwardRuntimeSnapshot>,
     pub(crate) update_state: UpdateState,
     pub(crate) active_theme: ThemeId,
     pub(crate) palette_open: bool,
@@ -50,8 +53,10 @@ pub(crate) struct SeanceWorkspace {
     pub(crate) palette_scroll_handle: ScrollHandle,
     pub(crate) terminal_metrics: Option<TerminalMetrics>,
     pub(crate) last_applied_geometry: Option<TerminalGeometry>,
+    pub(crate) terminal_resize_epoch: u64,
     pub(crate) active_terminal_rows: usize,
     pub(crate) terminal_surface: TerminalSurfaceState,
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) perf_mode_env_override: Option<UiPerfMode>,
     pub(crate) perf_overlay: PerfOverlayState,
     pub(crate) sidebar_width: f32,
@@ -77,6 +82,7 @@ pub(crate) struct TerminalMetrics {
 pub(crate) struct TerminalRendererMetrics {
     pub(crate) visible_rows: usize,
     pub(crate) visible_cells: usize,
+    pub(crate) rebuilt_rows: usize,
     pub(crate) fragments: usize,
     pub(crate) background_quads: usize,
     pub(crate) special_glyph_cells: usize,

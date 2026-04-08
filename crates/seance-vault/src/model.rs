@@ -12,6 +12,7 @@ pub enum RecordKind {
     PasswordCredential,
     PrivateKey,
     Snippet,
+    PortForward,
 }
 
 impl RecordKind {
@@ -21,6 +22,7 @@ impl RecordKind {
             Self::PasswordCredential => "password_credential",
             Self::PrivateKey => "private_key",
             Self::Snippet => "snippet",
+            Self::PortForward => "port_forward",
         }
     }
 }
@@ -34,6 +36,7 @@ impl std::str::FromStr for RecordKind {
             "password_credential" => Ok(Self::PasswordCredential),
             "private_key" => Ok(Self::PrivateKey),
             "snippet" => Ok(Self::Snippet),
+            "port_forward" => Ok(Self::PortForward),
             _ => Err(()),
         }
     }
@@ -171,6 +174,27 @@ pub struct VaultHostProfile {
     pub auth_order: Vec<HostAuthRef>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PortForwardMode {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultPortForwardProfile {
+    pub id: String,
+    pub host_id: String,
+    pub label: String,
+    pub mode: PortForwardMode,
+    pub listen_address: String,
+    pub listen_port: u16,
+    pub target_address: String,
+    pub target_port: u16,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostAuthRef {
@@ -264,6 +288,19 @@ pub struct KeySummary {
     pub modified_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortForwardSummary {
+    pub id: String,
+    pub host_id: String,
+    pub label: String,
+    pub mode: PortForwardMode,
+    pub listen_address: String,
+    pub listen_port: u16,
+    pub target_address: String,
+    pub target_port: u16,
+    pub modified_at: i64,
+}
+
 impl VaultHostProfile {
     pub fn summary(&self, modified_at: i64) -> HostSummary {
         HostSummary {
@@ -296,6 +333,22 @@ impl VaultPrivateKey {
             algorithm: self.algorithm.clone(),
             encrypted_at_rest: self.encrypted_at_rest,
             source: self.source.clone(),
+            modified_at,
+        }
+    }
+}
+
+impl VaultPortForwardProfile {
+    pub fn summary(&self, modified_at: i64) -> PortForwardSummary {
+        PortForwardSummary {
+            id: self.id.clone(),
+            host_id: self.host_id.clone(),
+            label: self.label.clone(),
+            mode: self.mode,
+            listen_address: self.listen_address.clone(),
+            listen_port: self.listen_port,
+            target_address: self.target_address.clone(),
+            target_port: self.target_port,
             modified_at,
         }
     }

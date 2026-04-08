@@ -10,6 +10,8 @@ anyhow = "1.0"
 seance-core = { path = "../seance-core" }
 seance-platform = { path = "../seance-platform" }
 seance-ui = { path = "../seance-ui" }
+time = { version = "0.3", features = ["formatting"] }
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

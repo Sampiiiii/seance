@@ -1,52 +1,11 @@
 use gpui::{App, Bounds, Pixels, SharedString, TextRun, Window, fill, font, point, px, size};
-use seance_terminal::{
-    TerminalCell, TerminalCellStyle, TerminalColor, TerminalGeometry, TerminalRow,
-};
+use seance_terminal::{TerminalCell, TerminalCellStyle, TerminalColor, TerminalRow};
 
 use crate::{
     CachedShapeLine, HslaKey, PreparedTerminalSurface, ShapeCache, ShapeCacheKey,
     TerminalFragmentPlan, TerminalGlyphPolicy, TerminalMetrics, TerminalPaintFragment,
     TerminalPaintQuad, TerminalPaintRow, TerminalRendererMetrics, ThemeId, theme::Theme,
 };
-
-pub(crate) fn build_terminal_surface_rows(
-    rows: &[TerminalRow],
-    geometry: TerminalGeometry,
-    metrics: TerminalMetrics,
-    theme_id: ThemeId,
-    theme: &Theme,
-    font_family: String,
-    shape_cache: &mut ShapeCache,
-    window: &mut Window,
-) -> (Vec<TerminalPaintRow>, TerminalRendererMetrics) {
-    let visible_cols = geometry.size.cols as usize;
-    let visible_rows = geometry.size.rows as usize;
-    let start = rows.len().saturating_sub(visible_rows);
-    let visible = &rows[start..];
-    let mut renderer_metrics = TerminalRendererMetrics {
-        visible_rows: visible.len(),
-        visible_cells: visible.len() * visible_cols,
-        ..Default::default()
-    };
-    let mut paint_rows = Vec::with_capacity(visible.len());
-
-    for (row_index, row) in visible.iter().enumerate() {
-        paint_rows.push(build_terminal_paint_row(
-            row,
-            row_index,
-            visible_cols,
-            metrics,
-            theme_id,
-            theme,
-            font_family.as_str(),
-            shape_cache,
-            window,
-            &mut renderer_metrics,
-        ));
-    }
-
-    (paint_rows, renderer_metrics)
-}
 
 pub(crate) fn build_terminal_paint_row(
     row: &TerminalRow,
@@ -371,10 +330,10 @@ pub(crate) fn paint_terminal_surface(
 ) {
     let line_height = px(surface.line_height_px);
 
-    for row in surface.rows {
+    for row in surface.rows.iter() {
         let row_origin = point(bounds.origin.x, bounds.origin.y + row.y);
 
-        for background in row.backgrounds {
+        for background in &row.backgrounds {
             window.paint_quad(fill(
                 Bounds::new(
                     point(row_origin.x + background.x, row_origin.y),
@@ -384,7 +343,7 @@ pub(crate) fn paint_terminal_surface(
             ));
         }
 
-        for fragment in row.fragments {
+        for fragment in &row.fragments {
             let _ = fragment.line.paint(
                 point(row_origin.x + fragment.x, row_origin.y),
                 line_height,
@@ -393,7 +352,7 @@ pub(crate) fn paint_terminal_surface(
             );
         }
 
-        for underline in row.underlines {
+        for underline in &row.underlines {
             window.paint_quad(fill(
                 Bounds::new(
                     point(

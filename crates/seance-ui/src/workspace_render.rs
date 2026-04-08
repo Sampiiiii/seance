@@ -15,9 +15,9 @@ use crate::{
     terminal_paint::paint_terminal_surface,
     theme::ThemeId,
     ui_components::{
-        compact_perf_strings, expanded_perf_strings, frame_budget_color, masked_value,
-        perf_mode_label, perf_row, perf_status_color, settings_action_chip, unlock_field_card,
-        update_status_label,
+        compact_perf_strings, display_hz_color, expanded_perf_strings, masked_value,
+        perf_budget_color, perf_mode_label, perf_row, perf_status_color, settings_action_chip,
+        unlock_field_card, update_status_label,
     },
 };
 
@@ -341,6 +341,7 @@ impl SeanceWorkspace {
                     .child(self.render_sidebar_header(cx))
                     .child(self.render_vault_section(cx))
                     .child(self.render_hosts_section(cx))
+                    .child(self.render_tunnel_monitor_section(cx))
                     .child(self.render_sessions_section(cx)),
             )
             .child(self.render_sidebar_footer(cx))
@@ -376,6 +377,11 @@ impl SeanceWorkspace {
                     window.focus(&fh);
                 }
             })
+            .on_scroll_wheel(
+                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                    this.handle_terminal_scroll_wheel(event, cx);
+                }),
+            )
             .on_key_down(cx.listener(Self::handle_key_down));
 
         let sessions = self.sessions();
@@ -441,7 +447,7 @@ impl SeanceWorkspace {
         };
         let exit_status = self
             .active_session()
-            .and_then(|session| session.snapshot().exit_status);
+            .and_then(|session| session.summary().exit_status);
 
         let mut content = div().flex_1().flex().flex_col().gap(px(12.0));
 
@@ -482,6 +488,7 @@ impl SeanceWorkspace {
         trace!(
             visible_line_count = self.perf_overlay.visible_line_count,
             visible_cell_count = self.terminal_surface.metrics.visible_cells,
+            rebuilt_rows = self.terminal_surface.metrics.rebuilt_rows,
             fragments = self.terminal_surface.metrics.fragments,
             background_quads = self.terminal_surface.metrics.background_quads,
             special_glyph_cells = self.terminal_surface.metrics.special_glyph_cells,
@@ -1150,12 +1157,8 @@ impl SeanceWorkspace {
         let terminal = session_perf.map(|snapshot| &snapshot.terminal);
         let mode_label = perf_mode_label(self.perf_overlay.mode);
         let compact_rows = compact_perf_strings(&self.perf_overlay);
-        let expanded_rows = expanded_perf_strings(
-            &self.perf_overlay,
-            self.active_session_id,
-            self.palette_open,
-            self.terminal_surface.metrics,
-        );
+        let expanded_rows =
+            expanded_perf_strings(&self.perf_overlay, self.terminal_surface.metrics);
 
         let mut panel = div()
             .absolute()
@@ -1163,9 +1166,9 @@ impl SeanceWorkspace {
             .right(px(16.0))
             .w(px(
                 if matches!(self.perf_overlay.mode, UiPerfMode::Expanded) {
-                    260.0
+                    340.0
                 } else {
-                    220.0
+                    260.0
                 },
             ))
             .p_3()
@@ -1189,11 +1192,16 @@ impl SeanceWorkspace {
 
         for (label, value) in compact_rows {
             let color = match label {
-                "fps" => perf_status_color(stats.fps_1s >= 30.0, &t),
-                "frame" => {
-                    frame_budget_color(stats.frame_time_p95_ms.max(stats.frame_time_last_ms), &t)
+                "display hz" => display_hz_color(stats.display_hz_1s, &t),
+                "display cadence" => perf_budget_color(
+                    stats
+                        .display_interval_p95_ms
+                        .max(stats.display_interval_last_ms),
+                    &t,
+                ),
+                "ui cost" => {
+                    perf_budget_color(stats.frame_time_p95_ms.max(stats.frame_time_last_ms), &t)
                 }
-                "snapshot" => perf_status_color(terminal.is_some(), &t),
                 _ => t.text_secondary,
             };
             panel = panel.child(perf_row(label, value, color, &t));
@@ -1202,14 +1210,18 @@ impl SeanceWorkspace {
         if matches!(self.perf_overlay.mode, UiPerfMode::Expanded) {
             for (label, value) in expanded_rows {
                 let color = match label {
-                    "present/ui" => {
-                        let ui_refreshes = self.perf_overlay.ui_refreshes_last_second();
-                        let ok = ui_refreshes == 0
-                            || self.perf_overlay.frames_presented_last_second() <= ui_refreshes;
-                        perf_status_color(ok, &t)
+                    "display hz" => display_hz_color(stats.display_hz_1s, &t),
+                    "display cadence" => perf_budget_color(
+                        stats
+                            .display_interval_p95_ms
+                            .max(stats.display_interval_last_ms),
+                        &t,
+                    ),
+                    "ui cost" => {
+                        perf_budget_color(stats.frame_time_p95_ms.max(stats.frame_time_last_ms), &t)
                     }
+                    "snapshot" => perf_status_color(terminal.is_some(), &t),
                     "dirty" => perf_status_color(self.perf_overlay.active_session_dirty(), &t),
-                    "palette" => perf_status_color(self.palette_open, &t),
                     _ => t.text_secondary,
                 };
                 panel = panel.child(perf_row(label, value, color, &t));

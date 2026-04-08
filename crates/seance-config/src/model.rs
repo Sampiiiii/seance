@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::defaults::{
+    default_logging_max_bytes_per_session, default_logging_retention_days,
     default_terminal_font_family, default_terminal_font_size_px, default_terminal_line_height_px,
     default_theme, default_true,
 };
@@ -124,6 +125,26 @@ impl Default for UpdateConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub session_transcript_enabled: bool,
+    #[serde(default = "default_logging_retention_days")]
+    pub session_transcript_retention_days: u16,
+    #[serde(default = "default_logging_max_bytes_per_session")]
+    pub session_transcript_max_bytes_per_session: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            session_transcript_enabled: false,
+            session_transcript_retention_days: default_logging_retention_days(),
+            session_transcript_max_bytes_per_session: default_logging_max_bytes_per_session(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct DebugConfig {
     #[serde(default)]
@@ -152,6 +173,8 @@ pub struct AppConfig {
     pub window: WindowConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
     #[serde(default)]
     pub updates: UpdateConfig,
     #[serde(default)]

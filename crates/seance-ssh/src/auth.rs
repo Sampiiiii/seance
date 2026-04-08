@@ -1,14 +1,31 @@
 use std::sync::Arc;
 
 use russh::keys::{Algorithm as SshAlgorithm, PrivateKey as SshPrivateKey, PublicKey};
-use russh::{client, keys::PrivateKeyWithHashAlg};
+use russh::{Channel, client, keys::PrivateKeyWithHashAlg};
+use tokio::sync::mpsc;
 
 use crate::model::{ResolvedAuthMethod, SshError};
 
-#[derive(Default)]
-pub(crate) struct AcceptAnyHostKeyHandler;
+pub(crate) struct ForwardedTcpIpChannel {
+    pub(crate) channel: Channel<russh::client::Msg>,
+}
 
-impl client::Handler for AcceptAnyHostKeyHandler {
+#[derive(Default)]
+pub(crate) struct SshClientHandler {
+    forwarded_tcpip_tx: Option<mpsc::UnboundedSender<ForwardedTcpIpChannel>>,
+}
+
+impl SshClientHandler {
+    pub(crate) fn with_forwarded_tcpip(
+        forwarded_tcpip_tx: mpsc::UnboundedSender<ForwardedTcpIpChannel>,
+    ) -> Self {
+        Self {
+            forwarded_tcpip_tx: Some(forwarded_tcpip_tx),
+        }
+    }
+}
+
+impl client::Handler for SshClientHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
@@ -17,10 +34,25 @@ impl client::Handler for AcceptAnyHostKeyHandler {
     ) -> std::result::Result<bool, Self::Error> {
         Ok(true)
     }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<russh::client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        if let Some(tx) = self.forwarded_tcpip_tx.as_ref() {
+            let _ = tx.send(ForwardedTcpIpChannel { channel });
+        }
+        Ok(())
+    }
 }
 
 pub(crate) async fn authenticate(
-    session: &mut client::Handle<AcceptAnyHostKeyHandler>,
+    session: &mut client::Handle<SshClientHandler>,
     username: &str,
     auth_order: &[ResolvedAuthMethod],
 ) -> std::result::Result<(), SshError> {

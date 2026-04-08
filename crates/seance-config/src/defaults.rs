@@ -48,3 +48,11 @@ pub(crate) fn default_terminal_font_size_px() -> f32 {
 pub(crate) fn default_terminal_line_height_px() -> f32 {
     19.0
 }
+
+pub(crate) fn default_logging_retention_days() -> u16 {
+    7
+}
+
+pub(crate) fn default_logging_max_bytes_per_session() -> u64 {
+    64 * 1024 * 1024
+}

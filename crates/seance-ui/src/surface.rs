@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use gpui::{Pixels, ShapedLine};
 use seance_terminal::{TerminalCellStyle, TerminalGeometry};
@@ -36,10 +36,11 @@ pub(crate) struct TerminalPaintRow {
 #[derive(Clone, Debug)]
 pub(crate) struct TerminalSurfaceState {
     pub(crate) active_session_id: u64,
-    pub(crate) snapshot_seq: u64,
+    pub(crate) viewport_revision: u64,
+    pub(crate) row_revisions: Vec<u64>,
     pub(crate) geometry: Option<TerminalGeometry>,
     pub(crate) theme_id: ThemeId,
-    pub(crate) rows: Vec<TerminalPaintRow>,
+    pub(crate) rows: Arc<[TerminalPaintRow]>,
     pub(crate) metrics: TerminalRendererMetrics,
     pub(crate) shape_cache: ShapeCache,
 }
@@ -48,10 +49,11 @@ impl Default for TerminalSurfaceState {
     fn default() -> Self {
         Self {
             active_session_id: 0,
-            snapshot_seq: 0,
+            viewport_revision: 0,
+            row_revisions: Vec::new(),
             geometry: None,
             theme_id: ThemeId::ObsidianSmoke,
-            rows: Vec::new(),
+            rows: Arc::from(Vec::<TerminalPaintRow>::new()),
             metrics: TerminalRendererMetrics::default(),
             shape_cache: ShapeCache::default(),
         }
@@ -99,6 +101,6 @@ pub(crate) struct TerminalFragmentPlan {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedTerminalSurface {
-    pub(crate) rows: Vec<TerminalPaintRow>,
+    pub(crate) rows: Arc<[TerminalPaintRow]>,
     pub(crate) line_height_px: f32,
 }

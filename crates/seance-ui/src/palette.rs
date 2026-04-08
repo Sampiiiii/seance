@@ -1,7 +1,11 @@
 use crate::{connect::PendingConnectSummary, theme::ThemeId};
 use std::{collections::HashMap, sync::Arc};
 
-use seance_core::{VaultScopedCredentialSummary, VaultScopedHostSummary, VaultScopedKeySummary};
+use seance_core::{
+    VaultScopedCredentialSummary, VaultScopedHostSummary, VaultScopedKeySummary,
+    VaultScopedPortForwardSummary,
+};
+use seance_ssh::PortForwardRuntimeSnapshot;
 use seance_terminal::TerminalSession;
 use seance_vault::PrivateKeyAlgorithm;
 
@@ -9,6 +13,7 @@ use seance_vault::PrivateKeyAlgorithm;
 pub enum PaletteGroup {
     Sessions,
     Hosts,
+    Tunnels,
     Vault,
     Appearance,
     System,
@@ -19,6 +24,7 @@ impl PaletteGroup {
         match self {
             PaletteGroup::Sessions => "SESSIONS",
             PaletteGroup::Hosts => "HOSTS",
+            PaletteGroup::Tunnels => "TUNNELS",
             PaletteGroup::Vault => "VAULT",
             PaletteGroup::Appearance => "APPEARANCE",
             PaletteGroup::System => "SYSTEM",
@@ -71,6 +77,18 @@ pub enum PaletteAction {
         host_id: String,
     },
     OpenSftpBrowser(u64),
+    OpenTunnelManager,
+    OpenHostTunnelSettings {
+        vault_id: String,
+        host_id: String,
+    },
+    StartTunnel {
+        vault_id: String,
+        port_forward_id: String,
+    },
+    StopTunnel {
+        tunnel_scope_key: String,
+    },
     OpenPreferences,
 }
 
@@ -178,6 +196,8 @@ pub fn build_items(
     pending_connects: &[PendingConnectSummary],
     credentials: &[VaultScopedCredentialSummary],
     keys: &[VaultScopedKeySummary],
+    port_forwards: &[VaultScopedPortForwardSummary],
+    active_port_forwards: &[PortForwardRuntimeSnapshot],
     active_id: u64,
     active_theme: ThemeId,
     query: &str,
@@ -189,6 +209,10 @@ pub fn build_items(
     let pending_by_scope = pending_connects
         .iter()
         .map(|pending| (pending.host_scope_key.as_str(), pending))
+        .collect::<HashMap<_, _>>();
+    let active_tunnels = active_port_forwards
+        .iter()
+        .map(|snapshot| (snapshot.id.as_str(), snapshot))
         .collect::<HashMap<_, _>>();
 
     // --- Sessions group ---
@@ -323,6 +347,96 @@ pub fn build_items(
                 shortcut: None,
                 match_indices: Vec::new(),
             });
+        }
+    }
+
+    // --- Tunnels group ---
+
+    if vault_unlocked {
+        items.push(PaletteItem {
+            glyph: "⇄",
+            label: "Open Tunnel Manager".into(),
+            hint: "Manage saved port forwarding rules".into(),
+            action: PaletteAction::OpenTunnelManager,
+            group: PaletteGroup::Tunnels,
+            shortcut: None,
+            match_indices: Vec::new(),
+        });
+
+        let mut host_tunnel_targets = HashMap::<(&str, &str), usize>::new();
+        for port_forward in port_forwards {
+            host_tunnel_targets
+                .entry((&port_forward.vault_id, &port_forward.host_id))
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+
+            let scope_key = crate::workspace::item_scope_key(
+                &port_forward.vault_id,
+                &port_forward.port_forward.id,
+            );
+            let target = format!(
+                "{}:{} -> {}:{}",
+                port_forward.port_forward.listen_address,
+                port_forward.port_forward.listen_port,
+                port_forward.port_forward.target_address,
+                port_forward.port_forward.target_port
+            );
+            if active_tunnels.contains_key(scope_key.as_str()) {
+                items.push(PaletteItem {
+                    glyph: "×",
+                    label: format!(
+                        "Stop Tunnel: {} [{} / {}]",
+                        port_forward.port_forward.label,
+                        port_forward.host_label,
+                        port_forward.vault_name
+                    ),
+                    hint: target.clone(),
+                    action: PaletteAction::StopTunnel {
+                        tunnel_scope_key: scope_key,
+                    },
+                    group: PaletteGroup::Tunnels,
+                    shortcut: None,
+                    match_indices: Vec::new(),
+                });
+            } else {
+                items.push(PaletteItem {
+                    glyph: "→",
+                    label: format!(
+                        "Start Tunnel: {} [{} / {}]",
+                        port_forward.port_forward.label,
+                        port_forward.host_label,
+                        port_forward.vault_name
+                    ),
+                    hint: target.clone(),
+                    action: PaletteAction::StartTunnel {
+                        vault_id: port_forward.vault_id.clone(),
+                        port_forward_id: port_forward.port_forward.id.clone(),
+                    },
+                    group: PaletteGroup::Tunnels,
+                    shortcut: None,
+                    match_indices: Vec::new(),
+                });
+            }
+        }
+
+        for host in saved_hosts {
+            if host_tunnel_targets.contains_key(&(host.vault_id.as_str(), host.host.id.as_str())) {
+                items.push(PaletteItem {
+                    glyph: "⚙",
+                    label: format!(
+                        "Host Tunnel Settings: {} [{}]",
+                        host.host.label, host.vault_name
+                    ),
+                    hint: "Jump to linked port forwarding rules".into(),
+                    action: PaletteAction::OpenHostTunnelSettings {
+                        vault_id: host.vault_id.clone(),
+                        host_id: host.host.id.clone(),
+                    },
+                    group: PaletteGroup::Tunnels,
+                    shortcut: None,
+                    match_indices: Vec::new(),
+                });
+            }
         }
     }
 
@@ -613,7 +727,8 @@ mod tests {
 
     use anyhow::Result;
     use seance_terminal::{
-        SessionPerfSnapshot, SessionSnapshot, TerminalGeometry, TerminalSession,
+        SessionPerfSnapshot, SessionSummary, TerminalGeometry, TerminalScrollCommand,
+        TerminalSession, TerminalViewportSnapshot,
     };
 
     struct StubSession {
@@ -630,8 +745,12 @@ mod tests {
             &self.title
         }
 
-        fn snapshot(&self) -> SessionSnapshot {
-            SessionSnapshot::default()
+        fn summary(&self) -> SessionSummary {
+            SessionSummary::default()
+        }
+
+        fn viewport_snapshot(&self) -> TerminalViewportSnapshot {
+            TerminalViewportSnapshot::default()
         }
 
         fn send_input(&self, _bytes: Vec<u8>) -> Result<()> {
@@ -639,6 +758,14 @@ mod tests {
         }
 
         fn resize(&self, _geometry: TerminalGeometry) -> Result<()> {
+            Ok(())
+        }
+
+        fn scroll_viewport(&self, _command: TerminalScrollCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn scroll_to_bottom(&self) -> Result<()> {
             Ok(())
         }
 
@@ -682,6 +809,8 @@ mod tests {
         let items = build_items(
             &sessions,
             &session_labels,
+            &[],
+            &[],
             &[],
             &[],
             &[],

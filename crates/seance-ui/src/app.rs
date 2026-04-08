@@ -20,7 +20,7 @@ use crate::{
     backend::UiBackend,
     connect::ConnectAttemptTracker,
     forms::{SecureWorkspaceState, SettingsPanelState, VaultModalState, WorkspaceSurface},
-    perf::{PerfOverlayState, RedrawReason, perf_mode_from_config, perf_mode_override_from_env},
+    perf::{PerfOverlayState, perf_mode_from_config, perf_mode_override_from_env},
     surface::TerminalSurfaceState,
     ui_components::theme_id_from_config,
 };
@@ -352,9 +352,9 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
     });
 
     cx.on_action(move |_: &CloseActiveSession, cx| {
-        let handled = with_registered_workspace(cx, |this, _window, cx| {
+        let handled = with_registered_workspace(cx, |this, window, cx| {
             if this.active_session_id != 0 {
-                this.close_session(this.active_session_id, cx);
+                this.close_session(this.active_session_id, window, cx);
             }
         });
         if handled {
@@ -433,9 +433,9 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
     let backend_for_select_session = backend.clone();
     cx.on_action(move |action: &SelectSession, cx| {
         let session_id = action.session_id;
-        if !with_registered_workspace(cx, |this, _window, cx| {
+        if !with_registered_workspace(cx, |this, window, cx| {
             if this.backend.session(session_id).is_some() {
-                this.select_session(session_id, cx);
+                this.select_session(session_id, window, cx);
             }
         }) {
             let _ = open_workspace_window(
@@ -532,6 +532,8 @@ fn open_workspace_window(
                     sftp_browser: None,
                     cached_credentials: bootstrap.cached_credentials.clone(),
                     cached_keys: bootstrap.cached_keys.clone(),
+                    cached_port_forwards: bootstrap.cached_port_forwards.clone(),
+                    active_port_forwards: bootstrap.active_port_forwards.clone(),
                     update_state: bootstrap.update_state.clone(),
                     active_theme: theme_id_from_config(&bootstrap.config),
                     palette_open: false,
@@ -540,6 +542,7 @@ fn open_workspace_window(
                     palette_scroll_handle: gpui::ScrollHandle::new(),
                     terminal_metrics: None,
                     last_applied_geometry: None,
+                    terminal_resize_epoch: 0,
                     active_terminal_rows: TerminalGeometry::default().size.rows as usize,
                     terminal_surface: TerminalSurfaceState {
                         theme_id: theme_id_from_config(&bootstrap.config),
@@ -552,38 +555,16 @@ fn open_workspace_window(
                     toast: None,
                 };
                 cx.observe_window_bounds(window, |this: &mut SeanceWorkspace, window, cx| {
-                    this.apply_active_terminal_geometry(window);
-                    this.invalidate_terminal_surface();
-                    this.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
-                    cx.notify();
+                    this.schedule_active_terminal_geometry_refresh(window, cx);
                 })
                 .detach();
                 ws.apply_active_terminal_geometry(window);
-                if let Some(notify_rx) = ws
-                    .active_session()
-                    .and_then(|session| session.take_notify_rx())
-                {
-                    SeanceWorkspace::schedule_session_watcher(
-                        window,
-                        cx,
-                        entity.clone(),
-                        notify_rx,
-                    );
-                }
-                SeanceWorkspace::schedule_config_watcher(
-                    window,
-                    cx,
-                    entity.clone(),
-                    backend.subscribe_config_changes(),
-                );
-                SeanceWorkspace::schedule_update_watcher(
-                    window,
-                    cx,
-                    entity.clone(),
-                    backend.subscribe_update_changes(),
-                );
+                install_workspace_watchers(window, cx, &entity, &mut ws, &backend);
                 if let Some(initial_action) = initial_action.as_ref() {
                     ws.apply_initial_action(initial_action.clone(), window, cx);
+                }
+                if ws.perf_overlay.mode.is_enabled() {
+                    ws.ensure_display_probe(window, cx);
                 }
                 ws
             })
@@ -592,9 +573,431 @@ fn open_workspace_window(
     Ok(())
 }
 
+#[cfg(not(test))]
+fn install_workspace_watchers(
+    window: &mut Window,
+    cx: &mut Context<SeanceWorkspace>,
+    entity: &gpui::Entity<SeanceWorkspace>,
+    ws: &mut SeanceWorkspace,
+    backend: &UiBackend,
+) {
+    if let Some(notify_rx) = ws
+        .active_session()
+        .and_then(|session| session.take_notify_rx())
+    {
+        SeanceWorkspace::schedule_session_watcher(window, cx, entity.clone(), notify_rx);
+    }
+    SeanceWorkspace::schedule_config_watcher(
+        window,
+        cx,
+        entity.clone(),
+        backend.subscribe_config_changes(),
+    );
+    SeanceWorkspace::schedule_vault_watcher(
+        window,
+        cx,
+        entity.clone(),
+        backend.subscribe_vault_changes(),
+    );
+    SeanceWorkspace::schedule_update_watcher(
+        window,
+        cx,
+        entity.clone(),
+        backend.subscribe_update_changes(),
+    );
+    SeanceWorkspace::schedule_tunnel_state_watcher(
+        window,
+        cx,
+        entity.clone(),
+        backend.subscribe_tunnel_state_changes(),
+    );
+    SeanceWorkspace::schedule_tunnel_animation(window, cx, entity.clone());
+}
+
+#[cfg(test)]
+fn install_workspace_watchers(
+    _window: &mut Window,
+    _cx: &mut Context<SeanceWorkspace>,
+    _entity: &gpui::Entity<SeanceWorkspace>,
+    _ws: &mut SeanceWorkspace,
+    _backend: &UiBackend,
+) {
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Arc, Mutex, mpsc},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use anyhow::Result;
+    use gpui::{
+        App, AppContext as GpuiAppContext, Entity, TestAppContext, VisualTestContext, Window, px,
+        size,
+    };
+    use seance_config::PerfHudDefault;
+    use seance_core::{AppContext, AppPaths, SessionOrigin};
+    use seance_ssh::{PortForwardRuntimeSnapshot, PortForwardStatus, SshPortForwardMode};
+    use seance_terminal::{
+        SessionPerfSnapshot, SessionSummary, TerminalScrollCommand, TerminalSession,
+        TerminalViewportSnapshot,
+    };
+    use seance_vault::{
+        HostAuthRef, PortForwardMode, SecretString, VaultHostProfile, VaultPasswordCredential,
+        VaultPortForwardProfile,
+    };
+
     use super::*;
+
+    #[derive(Debug)]
+    struct RecordingSession {
+        id: u64,
+        title: String,
+        resize_calls: Mutex<Vec<TerminalGeometry>>,
+        perf_snapshot: Mutex<SessionPerfSnapshot>,
+    }
+
+    impl RecordingSession {
+        fn new(id: u64, title: impl Into<String>) -> Self {
+            Self {
+                id,
+                title: title.into(),
+                resize_calls: Mutex::new(Vec::new()),
+                perf_snapshot: Mutex::new(SessionPerfSnapshot::default()),
+            }
+        }
+
+        fn resize_calls(&self) -> Vec<TerminalGeometry> {
+            self.resize_calls
+                .lock()
+                .expect("resize calls poisoned")
+                .clone()
+        }
+
+        fn set_dirty(&self, dirty: bool) {
+            self.perf_snapshot
+                .lock()
+                .expect("perf snapshot poisoned")
+                .dirty_since_last_ui_frame = dirty;
+        }
+    }
+
+    impl TerminalSession for RecordingSession {
+        fn id(&self) -> u64 {
+            self.id
+        }
+
+        fn title(&self) -> &str {
+            &self.title
+        }
+
+        fn summary(&self) -> SessionSummary {
+            SessionSummary::default()
+        }
+
+        fn viewport_snapshot(&self) -> TerminalViewportSnapshot {
+            TerminalViewportSnapshot::default()
+        }
+
+        fn send_input(&self, _bytes: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+
+        fn resize(&self, geometry: TerminalGeometry) -> Result<()> {
+            self.resize_calls
+                .lock()
+                .expect("resize calls poisoned")
+                .push(geometry);
+            Ok(())
+        }
+
+        fn scroll_viewport(&self, _command: TerminalScrollCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn scroll_to_bottom(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn perf_snapshot(&self) -> SessionPerfSnapshot {
+            let mut snapshot = self.perf_snapshot.lock().expect("perf snapshot poisoned");
+            let current = snapshot.clone();
+            snapshot.dirty_since_last_ui_frame = false;
+            current
+        }
+
+        fn take_notify_rx(&self) -> Option<mpsc::Receiver<()>> {
+            None
+        }
+    }
+
+    fn test_root_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "seance-ui-window-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("vaults")).expect("create test vault dir");
+        root
+    }
+
+    fn make_test_controller() -> AppControllerHandle {
+        let root = test_root_dir();
+        let context = AppContext::open(AppPaths {
+            app_root: root.clone(),
+            config_path: root.join("config.toml"),
+            diagnostics_dir: root.join("logs"),
+            session_logs_dir: root.join("session-logs"),
+            vault_db_path: root.join("vault.sqlite"),
+            vaults_dir: root.join("vaults"),
+            ipc_socket_path: root.join("resident.sock"),
+            instance_lock_path: root.join("resident.lock"),
+        })
+        .expect("open test app context");
+        AppControllerHandle::new(context)
+    }
+
+    fn seed_saved_host(
+        controller: &AppControllerHandle,
+    ) -> (
+        seance_core::ManagedVaultSummary,
+        seance_core::VaultScopedCredentialSummary,
+        seance_core::VaultScopedHostSummary,
+    ) {
+        let vault = controller
+            .create_named_vault(
+                "Personal".into(),
+                &SecretString::from("passphrase".to_string()),
+                "device",
+            )
+            .expect("create vault");
+        let credential = controller
+            .save_password_credential(
+                &vault.vault_id,
+                VaultPasswordCredential {
+                    id: String::new(),
+                    label: "prod password".into(),
+                    username_hint: Some("root".into()),
+                    secret: "hunter2".into(),
+                },
+            )
+            .expect("save credential");
+        let host = controller
+            .save_host(
+                &vault.vault_id,
+                VaultHostProfile {
+                    id: String::new(),
+                    label: "Production".into(),
+                    hostname: "prod.example.com".into(),
+                    port: 22,
+                    username: "root".into(),
+                    notes: None,
+                    auth_order: vec![HostAuthRef::Password {
+                        credential_id: credential.credential.id.clone(),
+                    }],
+                },
+            )
+            .expect("save host");
+        (vault, credential, host)
+    }
+
+    fn seed_saved_tunnel(
+        controller: &AppControllerHandle,
+        vault_id: &str,
+        host_id: &str,
+    ) -> seance_core::VaultScopedPortForwardSummary {
+        controller
+            .save_port_forward(
+                vault_id,
+                VaultPortForwardProfile {
+                    id: String::new(),
+                    host_id: host_id.to_string(),
+                    label: "db tunnel".into(),
+                    mode: PortForwardMode::Local,
+                    listen_address: "127.0.0.1".into(),
+                    listen_port: 15432,
+                    target_address: "127.0.0.1".into(),
+                    target_port: 5432,
+                    notes: None,
+                },
+            )
+            .expect("save tunnel")
+    }
+
+    fn make_test_controller_with_perf_hud(perf_hud_default: PerfHudDefault) -> AppControllerHandle {
+        let controller = make_test_controller();
+        controller
+            .update_config(|config| {
+                config.debug.perf_hud_default = perf_hud_default;
+            })
+            .expect("update test config");
+        controller
+    }
+
+    fn close_window(visual: &mut VisualTestContext) {
+        visual.executor().allow_parking();
+        visual.update(|window: &mut Window, _| window.remove_window());
+        visual.run_until_parked();
+        visual.executor().forbid_parking();
+    }
+
+    fn workspace_root(
+        cx: &mut TestAppContext,
+        window_handle: AnyWindowHandle,
+    ) -> Entity<SeanceWorkspace> {
+        cx.update_window(window_handle, |_, window: &mut Window, _| {
+            window
+                .root::<SeanceWorkspace>()
+                .flatten()
+                .expect("workspace root")
+        })
+        .expect("read workspace root")
+    }
+
+    fn open_recording_workspace(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<RecordingSession>,
+        Entity<SeanceWorkspace>,
+        VisualTestContext,
+    ) {
+        let controller = make_test_controller();
+        let backend = UiBackend::new(controller.clone()).expect("backend");
+        let session = Arc::new(RecordingSession::new(41, "recording"));
+
+        cx.update(|cx: &mut App| {
+            cx.set_global(WorkspaceWindowRegistry::default());
+            controller.register_remote_session(session.clone());
+            open_workspace_window(
+                cx,
+                backend,
+                WindowTarget::Session {
+                    session_id: session.id(),
+                },
+                None,
+            )
+            .expect("open workspace window");
+        });
+
+        let window_handle = cx.windows().into_iter().next().expect("workspace window");
+        let workspace = workspace_root(cx, window_handle);
+        (
+            session,
+            workspace,
+            VisualTestContext::from_window(window_handle, cx),
+        )
+    }
+
+    fn open_workspace_with_controller(
+        cx: &mut TestAppContext,
+        controller: AppControllerHandle,
+    ) -> (Entity<SeanceWorkspace>, VisualTestContext) {
+        let backend = UiBackend::new(controller).expect("backend");
+
+        cx.update(|cx: &mut App| {
+            cx.set_global(WorkspaceWindowRegistry::default());
+            open_workspace_window(cx, backend, WindowTarget::MostRecentOrNew, None)
+                .expect("open workspace window");
+        });
+
+        let window_handle = cx.windows().into_iter().next().expect("workspace window");
+        let workspace = workspace_root(cx, window_handle);
+        (workspace, VisualTestContext::from_window(window_handle, cx))
+    }
+
+    fn expected_geometry(
+        workspace: &Entity<SeanceWorkspace>,
+        visual: &mut VisualTestContext,
+    ) -> TerminalGeometry {
+        workspace.update_in(
+            visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, _| {
+                this.expected_active_terminal_geometry(window)
+                    .expect("terminal geometry")
+            },
+        )
+    }
+
+    fn distinct_geometry(current: TerminalGeometry) -> TerminalGeometry {
+        let cols = if current.size.cols > 1 {
+            current.size.cols - 1
+        } else {
+            current.size.cols.saturating_add(1)
+        };
+        let width_px = if cols < current.size.cols {
+            current
+                .pixel_size
+                .width_px
+                .saturating_sub(current.cell_width_px)
+        } else {
+            current
+                .pixel_size
+                .width_px
+                .saturating_add(current.cell_width_px)
+        };
+
+        TerminalGeometry::new(
+            cols,
+            current.size.rows,
+            width_px,
+            current.pixel_size.height_px,
+            current.cell_width_px,
+            current.cell_height_px,
+        )
+        .expect("distinct geometry")
+    }
+
+    fn render_workspace_window(visual: &mut VisualTestContext) {
+        visual.update(|window: &mut Window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+    }
+
+    fn schedule_resize_refresh(
+        workspace: &Entity<SeanceWorkspace>,
+        visual: &mut VisualTestContext,
+    ) -> u64 {
+        workspace.update_in(
+            visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.schedule_active_terminal_geometry_refresh(window, cx);
+                this.terminal_resize_epoch
+            },
+        )
+    }
+
+    fn run_scheduled_resize_refresh(
+        workspace: &Entity<SeanceWorkspace>,
+        visual: &mut VisualTestContext,
+        epoch: u64,
+    ) {
+        workspace.update_in(
+            visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.apply_scheduled_terminal_geometry_refresh(epoch, window, cx);
+            },
+        );
+    }
+
+    fn reserve_resize_epoch(
+        workspace: &Entity<SeanceWorkspace>,
+        visual: &mut VisualTestContext,
+    ) -> u64 {
+        workspace.update_in(
+            visual,
+            |this: &mut SeanceWorkspace, _window: &mut Window, _| {
+                this.terminal_resize_epoch = this.terminal_resize_epoch.wrapping_add(1);
+                this.terminal_resize_epoch
+            },
+        )
+    }
 
     #[test]
     fn promote_unique_moves_item_to_front_without_duplicates() {
@@ -626,5 +1029,394 @@ mod tests {
         remove_item(&mut ordered, 9);
 
         assert_eq!(ordered, vec![1, 2, 3]);
+    }
+
+    #[gpui::test]
+    fn discrete_window_resize_reaches_terminal_without_manual_callback(cx: &mut TestAppContext) {
+        let (session, workspace, mut visual) = open_recording_workspace(cx);
+        let baseline = session.resize_calls().len();
+
+        visual.simulate_resize(size(px(1440.0), px(900.0)));
+        render_workspace_window(&mut visual);
+
+        let resize_calls = session.resize_calls();
+        assert_eq!(resize_calls.len(), baseline + 1);
+        assert_eq!(
+            resize_calls.last().copied(),
+            Some(expected_geometry(&workspace, &mut visual))
+        );
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn window_resize_applies_geometry_on_first_resize(cx: &mut TestAppContext) {
+        let (session, workspace, mut visual) = open_recording_workspace(cx);
+        let baseline = session.resize_calls().len();
+
+        visual.simulate_resize(size(px(1440.0), px(900.0)));
+        let epoch = schedule_resize_refresh(&workspace, &mut visual);
+        run_scheduled_resize_refresh(&workspace, &mut visual, epoch);
+
+        let resize_calls = session.resize_calls();
+        assert!(resize_calls.len() > baseline);
+        assert_eq!(
+            resize_calls.last().copied(),
+            Some(expected_geometry(&workspace, &mut visual))
+        );
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn rapid_resizes_coalesce_to_latest_geometry(cx: &mut TestAppContext) {
+        let (session, workspace, mut visual) = open_recording_workspace(cx);
+        let baseline = session.resize_calls().len();
+
+        let first_epoch = reserve_resize_epoch(&workspace, &mut visual);
+        visual.simulate_resize(size(px(1600.0), px(980.0)));
+        let second_epoch = reserve_resize_epoch(&workspace, &mut visual);
+        run_scheduled_resize_refresh(&workspace, &mut visual, first_epoch);
+        run_scheduled_resize_refresh(&workspace, &mut visual, second_epoch);
+
+        let resize_calls = session.resize_calls();
+        assert_eq!(resize_calls.len(), baseline + 1);
+        assert_eq!(
+            resize_calls.last().copied(),
+            Some(expected_geometry(&workspace, &mut visual))
+        );
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn unchanged_geometry_does_not_emit_duplicate_resize(cx: &mut TestAppContext) {
+        let (session, workspace, mut visual) = open_recording_workspace(cx);
+        let baseline = session.resize_calls().len();
+
+        let first_epoch = schedule_resize_refresh(&workspace, &mut visual);
+        let second_epoch = schedule_resize_refresh(&workspace, &mut visual);
+        run_scheduled_resize_refresh(&workspace, &mut visual, first_epoch);
+        run_scheduled_resize_refresh(&workspace, &mut visual, second_epoch);
+
+        assert_eq!(session.resize_calls().len(), baseline);
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn stale_geometry_is_recovered_during_terminal_surface_sync(cx: &mut TestAppContext) {
+        let (session, workspace, mut visual) = open_recording_workspace(cx);
+        let baseline = session.resize_calls().len();
+        let expected = expected_geometry(&workspace, &mut visual);
+        let stale = distinct_geometry(expected);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, _window: &mut Window, _| {
+                this.last_applied_geometry = Some(stale);
+                this.active_terminal_rows = stale.size.rows as usize;
+            },
+        );
+
+        render_workspace_window(&mut visual);
+
+        let resize_calls = session.resize_calls();
+        assert_eq!(resize_calls.len(), baseline + 1);
+        assert_eq!(resize_calls.last().copied(), Some(expected));
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn deferred_resize_callback_does_not_duplicate_surface_sync_recovery(cx: &mut TestAppContext) {
+        let (session, workspace, mut visual) = open_recording_workspace(cx);
+        let baseline = session.resize_calls().len();
+
+        visual.simulate_resize(size(px(1440.0), px(900.0)));
+        let epoch = workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, _window: &mut Window, _| this.terminal_resize_epoch,
+        );
+
+        render_workspace_window(&mut visual);
+        run_scheduled_resize_refresh(&workspace, &mut visual, epoch);
+
+        let resize_calls = session.resize_calls();
+        assert_eq!(resize_calls.len(), baseline + 1);
+        assert_eq!(
+            resize_calls.last().copied(),
+            Some(expected_geometry(&workspace, &mut visual))
+        );
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn selecting_session_consumes_pending_terminal_dirty_state(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let backend = UiBackend::new(controller.clone()).expect("backend");
+        let first = Arc::new(RecordingSession::new(41, "first"));
+        let second = Arc::new(RecordingSession::new(42, "second"));
+        second.set_dirty(true);
+
+        cx.update(|cx: &mut App| {
+            cx.set_global(WorkspaceWindowRegistry::default());
+            controller.register_remote_session(first.clone());
+            controller.register_remote_session(second.clone());
+            open_workspace_window(
+                cx,
+                backend,
+                WindowTarget::Session {
+                    session_id: first.id(),
+                },
+                None,
+            )
+            .expect("open workspace window");
+        });
+
+        let window_handle = cx.windows().into_iter().next().expect("workspace window");
+        let workspace = workspace_root(cx, window_handle);
+        let mut visual = VisualTestContext::from_window(window_handle, cx);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.select_session(second.id(), window, cx);
+            },
+        );
+
+        assert!(!second.perf_snapshot().dirty_since_last_ui_frame);
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn startup_with_perf_hud_enabled_does_not_panic(cx: &mut TestAppContext) {
+        let controller = make_test_controller_with_perf_hud(PerfHudDefault::Expanded);
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, _| {
+            assert!(this.perf_overlay.mode.is_enabled());
+        });
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn toggling_perf_hud_on_open_workspace_does_not_panic(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                assert!(!this.perf_overlay.mode.is_enabled());
+                this.toggle_perf_mode(window, cx);
+                assert!(this.perf_overlay.mode.is_enabled());
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn refresh_vault_ui_clears_deleted_host_selection(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (vault, _credential, host) = seed_saved_host(&controller);
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller.clone());
+        let host_scope = crate::workspace::host_scope_key(&vault.vault_id, &host.host.id);
+
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, _| {
+            this.selected_host_id = Some(host_scope.clone());
+            this.secure.selected_host_id = Some(host_scope.clone());
+        });
+
+        assert!(
+            controller
+                .delete_host(&vault.vault_id, &host.host.id)
+                .expect("delete host")
+        );
+
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, cx| {
+            this.refresh_vault_ui(cx);
+            assert!(this.selected_host_id.is_none());
+            assert!(this.secure.selected_host_id.is_none());
+            assert!(this.saved_hosts.is_empty());
+        });
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn refresh_vault_ui_turns_deleted_drafts_into_unsaved_clones(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (vault, _credential, host) = seed_saved_host(&controller);
+        let tunnel = seed_saved_tunnel(&controller, &vault.vault_id, &host.host.id);
+        let standalone_credential = controller
+            .save_password_credential(
+                &vault.vault_id,
+                VaultPasswordCredential {
+                    id: String::new(),
+                    label: "standalone".into(),
+                    username_hint: Some("deploy".into()),
+                    secret: "secret".into(),
+                },
+            )
+            .expect("save standalone credential");
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller.clone());
+
+        let host_scope = crate::workspace::host_scope_key(&vault.vault_id, &host.host.id);
+        let tunnel_scope =
+            crate::workspace::item_scope_key(&vault.vault_id, &tunnel.port_forward.id);
+        let credential_scope =
+            crate::workspace::item_scope_key(&vault.vault_id, &standalone_credential.credential.id);
+
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, cx| {
+            this.activate_tunnel_draft(Some(&tunnel_scope), None, cx);
+        });
+        assert!(
+            controller
+                .delete_port_forward(&vault.vault_id, &tunnel.port_forward.id)
+                .expect("delete tunnel")
+        );
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, cx| {
+            this.refresh_vault_ui(cx);
+            let draft = this.secure.tunnel_draft.as_ref().expect("tunnel draft");
+            assert!(draft.port_forward_id.is_none());
+            assert!(draft.dirty);
+        });
+
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, cx| {
+            this.activate_credential_draft(
+                Some(&credential_scope),
+                crate::forms::CredentialDraftOrigin::Standalone,
+                cx,
+            );
+        });
+        assert!(
+            controller
+                .delete_password_credential(&vault.vault_id, &standalone_credential.credential.id)
+                .expect("delete credential")
+        );
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, cx| {
+            this.refresh_vault_ui(cx);
+            let draft = this
+                .secure
+                .credential_draft
+                .as_ref()
+                .expect("credential draft");
+            assert!(draft.credential_id.is_none());
+            assert!(draft.dirty);
+        });
+
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, cx| {
+            this.activate_host_draft(Some(&host_scope), cx);
+        });
+        assert!(
+            controller
+                .delete_host(&vault.vault_id, &host.host.id)
+                .expect("delete host")
+        );
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, cx| {
+            this.refresh_vault_ui(cx);
+            let draft = this.secure.host_draft.as_ref().expect("host draft");
+            assert!(draft.host_id.is_none());
+            assert!(draft.dirty);
+        });
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn live_tunnel_is_marked_deleted_when_saved_rule_disappears(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (vault, _credential, host) = seed_saved_host(&controller);
+        let tunnel = seed_saved_tunnel(&controller, &vault.vault_id, &host.host.id);
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller.clone());
+        let tunnel_scope =
+            crate::workspace::item_scope_key(&vault.vault_id, &tunnel.port_forward.id);
+
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, cx| {
+            this.apply_tunnel_state_snapshot(
+                vec![PortForwardRuntimeSnapshot {
+                    id: tunnel_scope.clone(),
+                    vault_id: vault.vault_id.clone(),
+                    forward_id: tunnel.port_forward.id.clone(),
+                    host_id: host.host.id.clone(),
+                    label: tunnel.port_forward.label.clone(),
+                    host_label: host.host.label.clone(),
+                    mode: SshPortForwardMode::Local,
+                    status: PortForwardStatus::Running,
+                    listen_address: "127.0.0.1".into(),
+                    listen_port: 15432,
+                    target_address: "127.0.0.1".into(),
+                    target_port: 5432,
+                    opened_at: None,
+                    active_connections: 0,
+                    bytes_in: 0,
+                    bytes_out: 0,
+                    last_error: None,
+                }],
+                cx,
+            );
+            assert!(this.live_tunnel_is_saved(&tunnel_scope));
+        });
+
+        assert!(
+            controller
+                .delete_port_forward(&vault.vault_id, &tunnel.port_forward.id)
+                .expect("delete tunnel")
+        );
+
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, cx| {
+            this.refresh_vault_ui(cx);
+            assert!(!this.live_tunnel_is_saved(&tunnel_scope));
+            assert_eq!(this.active_port_forwards.len(), 1);
+        });
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn deleted_remote_session_origin_is_detected_after_host_removal(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (vault, _credential, host) = seed_saved_host(&controller);
+        let backend = UiBackend::new(controller.clone()).expect("backend");
+        let session = Arc::new(RecordingSession::new(77, "prod"));
+
+        cx.update(|cx: &mut App| {
+            cx.set_global(WorkspaceWindowRegistry::default());
+            controller.register_remote_session_with_origin(
+                session.clone(),
+                SessionOrigin {
+                    vault_id: vault.vault_id.clone(),
+                    host_id: host.host.id.clone(),
+                    host_label_at_connect: host.host.label.clone(),
+                },
+            );
+            open_workspace_window(
+                cx,
+                backend,
+                WindowTarget::Session {
+                    session_id: session.id(),
+                },
+                None,
+            )
+            .expect("open workspace window");
+        });
+
+        let window_handle = cx.windows().into_iter().next().expect("workspace window");
+        let workspace = workspace_root(cx, window_handle);
+        let mut visual = VisualTestContext::from_window(window_handle, cx);
+
+        assert!(
+            controller
+                .delete_host(&vault.vault_id, &host.host.id)
+                .expect("delete host")
+        );
+
+        workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, cx| {
+            this.refresh_vault_ui(cx);
+            let origin = this
+                .deleted_remote_session_origin(session.id())
+                .expect("deleted origin");
+            assert_eq!(origin.host_label_at_connect, "Production");
+        });
+
+        close_window(&mut visual);
     }
 }

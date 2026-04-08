@@ -23,6 +23,7 @@ impl SeanceWorkspace {
         self.refresh_managed_vaults();
         self.cached_credentials = self.backend.list_password_credentials().unwrap_or_default();
         self.cached_keys = self.backend.list_private_keys().unwrap_or_default();
+        self.cached_port_forwards = self.backend.list_port_forwards().unwrap_or_default();
     }
 
     pub(crate) fn default_target_vault_id(&self) -> Option<String> {
@@ -50,10 +51,7 @@ impl SeanceWorkspace {
     }
 
     fn refresh_after_vault_change(&mut self, cx: &mut Context<Self>) {
-        self.refresh_saved_hosts();
-        self.refresh_vault_cache();
-        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
-        cx.notify();
+        self.refresh_vault_ui(cx);
     }
 
     fn set_default_vault(&mut self, vault_id: &str, cx: &mut Context<Self>) {

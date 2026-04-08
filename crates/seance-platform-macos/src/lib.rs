@@ -11,6 +11,7 @@ use seance_ui::{
     OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance, SelectSession, ShowAllApps,
     SwitchTheme, ThemeId, TogglePerfHud, UiCommand, UiIntegration,
 };
+use tracing::info;
 
 #[cfg(target_os = "macos")]
 use cocoa::appkit::NSApp;
@@ -97,6 +98,7 @@ impl MacosPlatformAppBridge {
 
 impl PlatformApp for MacosPlatformAppBridge {
     fn on_launch(&mut self) -> Result<()> {
+        info!("issuing first window open request");
         self.request_open_window()
     }
 
@@ -386,6 +388,8 @@ mod tests {
         let paths = AppPaths {
             app_root: app_root.clone(),
             config_path: app_root.join("config.toml"),
+            diagnostics_dir: app_root.join("logs"),
+            session_logs_dir: app_root.join("session-logs"),
             vault_db_path: app_root.join("vault.sqlite"),
             vaults_dir: app_root.join("vaults"),
             ipc_socket_path: app_root.join("resident.sock"),

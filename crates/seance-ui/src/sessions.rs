@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use gpui::{Context, Div, FontWeight, MouseButton, Window, div, prelude::*, px};
-use seance_core::SessionKind;
+use seance_core::{SessionKind, SessionOrigin};
 use seance_ssh::{SshConnectResult, SshError};
 use seance_terminal::{TerminalGeometry, TerminalSession};
 use tracing::trace;
@@ -15,11 +15,17 @@ use crate::{
     local_session_display_number_for_ids,
     perf::RedrawReason,
     refresh_app_menus, session_kind_map_from_sessions,
-    ui_components::session_preview_text,
     workspace::host_scope_key,
 };
 
 impl SeanceWorkspace {
+    fn refresh_active_terminal_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.take_terminal_refresh_request();
+        self.invalidate_terminal_surface();
+        cx.notify();
+        window.refresh();
+    }
+
     fn session_kind(&self, id: u64) -> Option<SessionKind> {
         self.backend.session_kind(id)
     }
@@ -147,7 +153,7 @@ impl SeanceWorkspace {
         };
 
         let host_label = request.connection.label.clone();
-        let connect_task = match self.backend.ssh_manager().start_connect(request) {
+        let connect_task = match self.backend.start_connect(request) {
             Ok(connect_task) => connect_task,
             Err(err) => {
                 self.show_toast(err.to_string());
@@ -261,7 +267,14 @@ impl SeanceWorkspace {
                 if let Some(geometry) = self.last_applied_geometry {
                     let _ = session.resize(geometry);
                 }
-                self.backend.register_remote_session(Arc::clone(&session));
+                self.backend.register_remote_session_with_origin(
+                    Arc::clone(&session),
+                    SessionOrigin {
+                        vault_id: removed.pending.vault_id.clone(),
+                        host_id: removed.pending.host_id.clone(),
+                        host_label_at_connect: removed.pending.host_label.clone(),
+                    },
+                );
                 if let Some(notify_rx) = session.take_notify_rx() {
                     Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
                 }
@@ -280,7 +293,7 @@ impl SeanceWorkspace {
                     self.active_session_id = session.id();
                     self.surface = WorkspaceSurface::Terminal;
                     self.show_toast(format!("Connected: {}", removed.pending.host_label));
-                    self.invalidate_terminal_surface();
+                    self.refresh_active_terminal_view(window, cx);
                 } else {
                     self.show_toast(format!("Connected: {}", removed.pending.host_label));
                 }
@@ -317,6 +330,15 @@ impl SeanceWorkspace {
         self.backend.session(self.active_session_id)
     }
 
+    pub(crate) fn deleted_remote_session_origin(&self, session_id: u64) -> Option<SessionOrigin> {
+        let metadata = self.backend.session_metadata(session_id)?;
+        if metadata.kind != SessionKind::Remote {
+            return None;
+        }
+        let origin = metadata.origin?;
+        (!self.saved_host_exists(&origin.vault_id, &origin.host_id)).then_some(origin)
+    }
+
     pub(crate) fn spawn_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Ok(session) = self.backend.spawn_local_session() {
             if let Some(geometry) = self.last_applied_geometry {
@@ -327,14 +349,13 @@ impl SeanceWorkspace {
                 Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
             }
             self.backend.touch_session(session.id());
-            self.invalidate_terminal_surface();
             self.perf_overlay.mark_input(RedrawReason::Input);
             refresh_app_menus(cx);
-            cx.notify();
+            self.refresh_active_terminal_view(window, cx);
         }
     }
 
-    pub(crate) fn select_session(&mut self, id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn select_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.active_session_id = id;
         self.backend.touch_session(id);
         if let Some(geometry) = self.last_applied_geometry
@@ -343,12 +364,11 @@ impl SeanceWorkspace {
             let _ = session.resize(geometry);
             self.active_terminal_rows = geometry.size.rows as usize;
         }
-        self.invalidate_terminal_surface();
         self.perf_overlay.mark_input(RedrawReason::Input);
-        cx.notify();
+        self.refresh_active_terminal_view(window, cx);
     }
 
-    pub(crate) fn close_session(&mut self, id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn close_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.backend.close_session(id);
         if self
             .sftp_browser
@@ -364,10 +384,9 @@ impl SeanceWorkspace {
             self.last_applied_geometry = None;
             self.active_terminal_rows = TerminalGeometry::default().size.rows as usize;
         }
-        self.invalidate_terminal_surface();
         self.perf_overlay.mark_input(RedrawReason::Input);
         refresh_app_menus(cx);
-        cx.notify();
+        self.refresh_active_terminal_view(window, cx);
     }
 
     fn render_session_row(
@@ -379,20 +398,19 @@ impl SeanceWorkspace {
         let active = session.id() == self.active_session_id;
         let session_id = session.id();
         let title = self.session_display_title(session);
-        let snapshot = session.snapshot();
-        let has_output = snapshot
-            .rows
-            .iter()
-            .any(|row| !row.plain_text().trim().is_empty());
-        let preview = session_preview_text(&snapshot.rows).unwrap_or_else(|| {
-            if has_output {
-                "interactive session".into()
-            } else {
-                "waiting for output…".into()
-            }
-        });
+        let summary = session.summary();
+        let deleted_origin = self.deleted_remote_session_origin(session_id);
+        let preview = if summary.preview_line.trim().is_empty() {
+            "waiting for output…".into()
+        } else {
+            summary.preview_line
+        };
         let close_session_id = session_id;
-        let badge = self.session_display_badge(session, active);
+        let badge = if deleted_origin.is_some() {
+            "deleted".into()
+        } else {
+            self.session_display_badge(session, active)
+        };
 
         self.sidebar_row_shell(active)
             .child(
@@ -438,11 +456,19 @@ impl SeanceWorkspace {
                                     .px(px(7.0))
                                     .py(px(1.0))
                                     .rounded(px(4.0))
-                                    .when(active, |el| {
-                                        el.bg(theme.accent_glow).text_color(theme.accent)
+                                    .bg(if deleted_origin.is_some() {
+                                        theme.glass_hover
+                                    } else if active {
+                                        theme.accent_glow
+                                    } else {
+                                        theme.glass_hover
                                     })
-                                    .when(!active, |el| {
-                                        el.bg(theme.glass_hover).text_color(theme.sidebar_meta)
+                                    .text_color(if deleted_origin.is_some() {
+                                        theme.warning
+                                    } else if active {
+                                        theme.accent
+                                    } else {
+                                        theme.sidebar_meta
                                     })
                                     .child(badge),
                             ),
@@ -451,9 +477,20 @@ impl SeanceWorkspace {
                         div()
                             .font_family(SIDEBAR_FONT_MONO)
                             .text_size(px(SIDEBAR_MONO_SIZE_PX))
-                            .text_color(theme.sidebar_meta)
+                            .text_color(if deleted_origin.is_some() {
+                                theme.warning
+                            } else {
+                                theme.sidebar_meta
+                            })
                             .line_clamp(1)
-                            .child(format!("$ {}", preview)),
+                            .child(if let Some(origin) = deleted_origin.as_ref() {
+                                format!(
+                                    "host deleted from vault  $ {}  [{}]",
+                                    preview, origin.host_label_at_connect
+                                )
+                            } else {
+                                format!("$ {}", preview)
+                            }),
                     ),
             )
             .child({
@@ -487,8 +524,8 @@ impl SeanceWorkspace {
                         .child("x")
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.close_session(close_session_id, cx);
+                            cx.listener(move |this, _, window, cx| {
+                                this.close_session(close_session_id, window, cx);
                             }),
                         ),
                 );
@@ -496,8 +533,8 @@ impl SeanceWorkspace {
             })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.select_session(session_id, cx);
+                cx.listener(move |this, _, window, cx| {
+                    this.select_session(session_id, window, cx);
                 }),
             )
     }

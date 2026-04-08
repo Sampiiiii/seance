@@ -6,6 +6,8 @@ use crate::{AppConfig, SUPPORTED_KEYBINDING_ACTIONS, SUPPORTED_THEME_KEYS};
 
 const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 8.0..=32.0;
 const LINE_HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 10.0..=40.0;
+const TRANSCRIPT_RETENTION_DAYS_RANGE: std::ops::RangeInclusive<u16> = 1..=365;
+const TRANSCRIPT_MAX_BYTES_RANGE: std::ops::RangeInclusive<u64> = 1024..=(1024 * 1024 * 1024);
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -39,6 +41,13 @@ pub enum ConfigError {
         value: f32,
         min: f32,
         max: f32,
+    },
+    #[error("{field} must be between {min} and {max}, got {value}")]
+    OutOfRangeInt {
+        field: &'static str,
+        value: u64,
+        min: u64,
+        max: u64,
     },
     #[error("unsupported keybinding action '{action}'")]
     UnsupportedKeybindingAction { action: String },
@@ -94,6 +103,28 @@ impl AppConfig {
         {
             return Err(ConfigError::EmptyField {
                 field: "terminal.local_shell",
+            });
+        }
+
+        if !TRANSCRIPT_RETENTION_DAYS_RANGE
+            .contains(&self.logging.session_transcript_retention_days)
+        {
+            return Err(ConfigError::OutOfRangeInt {
+                field: "logging.session_transcript_retention_days",
+                value: u64::from(self.logging.session_transcript_retention_days),
+                min: u64::from(*TRANSCRIPT_RETENTION_DAYS_RANGE.start()),
+                max: u64::from(*TRANSCRIPT_RETENTION_DAYS_RANGE.end()),
+            });
+        }
+
+        if !TRANSCRIPT_MAX_BYTES_RANGE
+            .contains(&self.logging.session_transcript_max_bytes_per_session)
+        {
+            return Err(ConfigError::OutOfRangeInt {
+                field: "logging.session_transcript_max_bytes_per_session",
+                value: self.logging.session_transcript_max_bytes_per_session,
+                min: *TRANSCRIPT_MAX_BYTES_RANGE.start(),
+                max: *TRANSCRIPT_MAX_BYTES_RANGE.end(),
             });
         }
 
@@ -233,6 +264,31 @@ mod tests {
             line_height_err,
             ConfigError::OutOfRange {
                 field: "terminal.line_height_px",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn transcript_logging_bounds_are_enforced() {
+        let mut config = AppConfig::default();
+        config.logging.session_transcript_retention_days = 0;
+        let retention_err = config.validate().unwrap_err();
+        assert!(matches!(
+            retention_err,
+            ConfigError::OutOfRangeInt {
+                field: "logging.session_transcript_retention_days",
+                ..
+            }
+        ));
+
+        config.logging.session_transcript_retention_days = 7;
+        config.logging.session_transcript_max_bytes_per_session = 0;
+        let size_err = config.validate().unwrap_err();
+        assert!(matches!(
+            size_err,
+            ConfigError::OutOfRangeInt {
+                field: "logging.session_transcript_max_bytes_per_session",
                 ..
             }
         ));

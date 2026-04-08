@@ -11,6 +11,7 @@ gpui = "0.2.2"
 seance-core = { path = "../seance-core" }
 seance-platform = { path = "../seance-platform" }
 seance-ui = { path = "../seance-ui" }
+tracing = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.26"

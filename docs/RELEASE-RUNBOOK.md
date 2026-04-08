@@ -82,9 +82,12 @@ These are required by the workflow jobs and wrapper scripts.
 
 1. `cargo`
 2. `gh`
-3. `cargo-packager` on the macOS job
-4. `codesign`, `notarytool`, and `stapler` on the macOS job
-5. `linuxdeploy` and `appimagetool` on Linux packaging jobs
+3. `zig 0.15.2` on build jobs that compile the vendored Ghostty terminal stack
+4. `cargo-packager` on the macOS job
+5. `codesign`, `notarytool`, and `stapler` on the macOS job
+6. `linuxdeploy` and `appimagetool` on Linux packaging jobs
+
+The release workflow installs Zig at runtime on GitHub-hosted runners and expects the self-hosted `Linux ARM64` runner to allow the same tool download during the job.
 
 ## Preflight Checks
 
@@ -106,13 +109,13 @@ make release-validate RELEASE_DIR=dist/release
 make release-checksums RELEASE_DIR=dist/release
 ```
 
-For Touch ID validation on macOS, do not use `cargo run` or `make run`. Create a local signing file and build or launch a signed app bundle instead:
+For Touch ID validation on macOS, do not use `cargo run` or `make app-run`. Create a local signing file and build or launch a signed app bundle instead:
 
 ```bash
 cp .env.macos-signing.example .env.macos-signing
 # edit .env.macos-signing with your Apple team id, Apple Development identity,
 # and a macOS development provisioning profile for com.seance.app.dev
-make run-macos-signed
+make signed-run
 codesign -d --entitlements :- dist/dev-macos/Seance.app
 security cms -D -i dist/dev-macos/Seance.app/Contents/embedded.provisionprofile
 ```

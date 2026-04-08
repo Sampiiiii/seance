@@ -8,18 +8,24 @@ use std::{
     },
 };
 
+mod session_logs;
+mod tunnels;
+
 use anyhow::{Context, Result, anyhow};
 use seance_config::{AppConfig, ConfigStore, VaultRegistryEntry};
 use seance_ssh::{
-    ResolvedAuthMethod, SftpEntry, SshConnectRequest, SshConnectionConfig, SshSessionManager,
+    PortForwardRuntimeSnapshot, SftpEntry, SshConnectRequest, SshConnectTask,
+    SshPortForwardRequest, SshSessionManager,
 };
 use seance_terminal::{LocalSessionFactory, TerminalSession};
 use seance_updater::UpdateManager;
 pub use seance_updater::{InstallMode, ReleaseChannel, UpdateInfo, UpdateSettings, UpdateState};
 use seance_vault::{
-    CredentialSummary, GenerateKeyRequest, HostAuthRef, HostSummary, KeySummary, SecretString,
-    VaultHostProfile, VaultPasswordCredential, VaultStatus, VaultStore,
+    CredentialSummary, GenerateKeyRequest, HostSummary, KeySummary, SecretString, VaultHostProfile,
+    VaultPasswordCredential, VaultPortForwardProfile, VaultStatus, VaultStore,
 };
+use session_logs::SessionLogManager;
+pub use tunnels::VaultScopedPortForwardSummary;
 use uuid::Uuid;
 
 pub type SessionId = u64;
@@ -29,6 +35,8 @@ const LEGACY_VAULT_DB_FILE: &str = "vault.sqlite";
 pub struct AppPaths {
     pub app_root: PathBuf,
     pub config_path: PathBuf,
+    pub diagnostics_dir: PathBuf,
+    pub session_logs_dir: PathBuf,
     pub vault_db_path: PathBuf,
     pub vaults_dir: PathBuf,
     pub ipc_socket_path: PathBuf,
@@ -42,8 +50,14 @@ impl AppPaths {
         fs::create_dir_all(&app_root).context("failed to create app data directory")?;
         let vaults_dir = app_root.join("vaults");
         fs::create_dir_all(&vaults_dir).context("failed to create vault storage directory")?;
+        let diagnostics_dir = app_root.join("logs");
+        fs::create_dir_all(&diagnostics_dir).context("failed to create diagnostics directory")?;
+        let session_logs_dir = app_root.join("session-logs");
+        fs::create_dir_all(&session_logs_dir).context("failed to create session log directory")?;
         Ok(Self {
             config_path: app_root.join("config.toml"),
+            diagnostics_dir,
+            session_logs_dir,
             vault_db_path: app_root.join("vault.sqlite"),
             vaults_dir,
             ipc_socket_path: app_root.join("resident.sock"),
@@ -59,6 +73,7 @@ pub struct AppContext {
     vaults: HashMap<String, ManagedVaultState>,
     pub ssh: Arc<SshSessionManager>,
     pub local: LocalSessionFactory,
+    pub session_logs: Arc<SessionLogManager>,
     pub updater: Arc<UpdateManager>,
 }
 
@@ -78,6 +93,7 @@ impl AppContext {
         migrate_legacy_vault_registry(&paths, &mut config)?;
         let vaults = load_managed_vaults(&paths, &config.snapshot())?;
         let ssh = Arc::new(SshSessionManager::new()?);
+        let session_logs = Arc::new(SessionLogManager::new(paths.session_logs_dir.clone())?);
         let updater = Arc::new(UpdateManager::new(update_settings_from_config(
             &config.snapshot(),
         )));
@@ -87,6 +103,7 @@ impl AppContext {
             vaults,
             ssh,
             local: LocalSessionFactory,
+            session_logs,
             updater,
         })
     }
@@ -141,9 +158,20 @@ pub struct WindowBootstrap {
     pub saved_hosts: Vec<VaultScopedHostSummary>,
     pub cached_credentials: Vec<VaultScopedCredentialSummary>,
     pub cached_keys: Vec<VaultScopedKeySummary>,
+    pub cached_port_forwards: Vec<VaultScopedPortForwardSummary>,
+    pub active_port_forwards: Vec<PortForwardRuntimeSnapshot>,
     pub device_unlock_attempted: bool,
     pub config: AppConfig,
     pub update_state: UpdateState,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VaultUiSnapshot {
+    pub managed_vaults: Vec<ManagedVaultSummary>,
+    pub saved_hosts: Vec<VaultScopedHostSummary>,
+    pub cached_credentials: Vec<VaultScopedCredentialSummary>,
+    pub cached_keys: Vec<VaultScopedKeySummary>,
+    pub cached_port_forwards: Vec<VaultScopedPortForwardSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,14 +223,34 @@ pub struct SessionRegistry {
     metadata: HashMap<SessionId, SessionMetadata>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionOrigin {
+    pub vault_id: String,
+    pub host_id: String,
+    pub host_label_at_connect: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionMetadataSummary {
+    pub kind: SessionKind,
+    pub origin: Option<SessionOrigin>,
+}
+
+#[derive(Clone, Debug)]
 struct SessionMetadata {
     kind: SessionKind,
     last_access_seq: u64,
+    origin: Option<SessionOrigin>,
 }
 
 impl SessionRegistry {
-    fn insert(&mut self, session: Arc<dyn TerminalSession>, kind: SessionKind, seq: u64) {
+    fn insert(
+        &mut self,
+        session: Arc<dyn TerminalSession>,
+        kind: SessionKind,
+        origin: Option<SessionOrigin>,
+        seq: u64,
+    ) {
         let id = session.id();
         self.sessions.insert(id, session);
         self.metadata.insert(
@@ -210,6 +258,7 @@ impl SessionRegistry {
             SessionMetadata {
                 kind,
                 last_access_seq: seq,
+                origin,
             },
         );
     }
@@ -226,6 +275,13 @@ impl SessionRegistry {
 
     fn kind(&self, id: SessionId) -> Option<SessionKind> {
         self.metadata.get(&id).map(|meta| meta.kind)
+    }
+
+    fn metadata(&self, id: SessionId) -> Option<SessionMetadataSummary> {
+        self.metadata.get(&id).map(|meta| SessionMetadataSummary {
+            kind: meta.kind,
+            origin: meta.origin.clone(),
+        })
     }
 
     fn touch(&mut self, id: SessionId, seq: u64) {
@@ -277,6 +333,7 @@ pub struct AppController {
     windows: WindowRegistry,
     lifecycle_policy: LifecyclePolicy,
     config_subscribers: Vec<Sender<AppConfig>>,
+    vault_subscribers: Vec<Sender<VaultUiSnapshot>>,
     access_seq: u64,
     device_unlock_attempted: bool,
 }
@@ -293,6 +350,7 @@ impl AppControllerHandle {
             windows: WindowRegistry::default(),
             lifecycle_policy,
             config_subscribers: Vec::new(),
+            vault_subscribers: Vec::new(),
             access_seq: 0,
             device_unlock_attempted: false,
         })))
@@ -321,6 +379,10 @@ impl AppControllerHandle {
 
     pub fn subscribe_config_changes(&self) -> Receiver<AppConfig> {
         self.with_lock(|controller| controller.subscribe_config_changes())
+    }
+
+    pub fn subscribe_vault_changes(&self) -> Receiver<VaultUiSnapshot> {
+        self.with_lock(|controller| controller.subscribe_vault_changes())
     }
 
     pub fn update_state_snapshot(&self) -> UpdateState {
@@ -383,6 +445,10 @@ impl AppControllerHandle {
         self.with_lock(|controller| controller.sessions.kind(id))
     }
 
+    pub fn session_metadata(&self, id: SessionId) -> Option<SessionMetadataSummary> {
+        self.with_lock(|controller| controller.sessions.metadata(id))
+    }
+
     pub fn get_session(&self, id: SessionId) -> Option<Arc<dyn TerminalSession>> {
         self.with_lock(|controller| controller.sessions.get(id))
     }
@@ -403,8 +469,27 @@ impl AppControllerHandle {
         self.with_lock(|controller| controller.spawn_local_session())
     }
 
+    pub fn start_connect(
+        &self,
+        request: SshConnectRequest,
+    ) -> std::result::Result<SshConnectTask, seance_ssh::SshError> {
+        self.with_lock(|controller| controller.start_connect(request))
+    }
+
     pub fn register_remote_session(&self, session: Arc<dyn TerminalSession>) {
-        self.with_lock(|controller| controller.register_session(session, SessionKind::Remote));
+        self.with_lock(|controller| {
+            controller.register_session(session, SessionKind::Remote, None)
+        });
+    }
+
+    pub fn register_remote_session_with_origin(
+        &self,
+        session: Arc<dyn TerminalSession>,
+        origin: SessionOrigin,
+    ) {
+        self.with_lock(|controller| {
+            controller.register_session(session, SessionKind::Remote, Some(origin));
+        });
     }
 
     pub fn close_session(&self, id: SessionId) -> bool {
@@ -424,13 +509,18 @@ impl AppControllerHandle {
             let vault_id = controller
                 .default_target_vault_id_for_actions()
                 .ok_or_else(|| anyhow!("no vault available to unlock"))?;
-            controller.try_unlock_vault_with_device(&vault_id)
+            let result = controller.try_unlock_vault_with_device(&vault_id);
+            if matches!(result, Ok(true)) {
+                controller.publish_vault_update();
+            }
+            result
         })
     }
 
     pub fn create_vault(&self, passphrase: &SecretString, device_name: &str) -> Result<()> {
         self.with_lock(|controller| {
             controller.create_named_vault("Personal".into(), passphrase, device_name)?;
+            controller.publish_vault_update();
             Ok(())
         })
     }
@@ -440,14 +530,20 @@ impl AppControllerHandle {
             let vault_id = controller
                 .default_target_vault_id_for_actions()
                 .ok_or_else(|| anyhow!("no vault available to unlock"))?;
-            controller.unlock_vault(&vault_id, passphrase, device_name)
+            let result = controller.unlock_vault(&vault_id, passphrase, device_name);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
         })
     }
 
     pub fn lock_vault(&self) {
         self.with_lock(|controller| {
             if let Some(vault_id) = controller.default_target_vault_id_for_actions() {
-                let _ = controller.lock_vault(&vault_id);
+                if controller.lock_vault(&vault_id).is_ok() {
+                    controller.publish_vault_update();
+                }
             }
         });
     }
@@ -462,19 +558,43 @@ impl AppControllerHandle {
         passphrase: &SecretString,
         device_name: &str,
     ) -> Result<ManagedVaultSummary> {
-        self.with_lock(|controller| controller.create_named_vault(name, passphrase, device_name))
+        self.with_lock(|controller| {
+            let result = controller.create_named_vault(name, passphrase, device_name);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn rename_vault(&self, vault_id: &str, name: String) -> Result<ManagedVaultSummary> {
-        self.with_lock(|controller| controller.rename_vault(vault_id, name))
+        self.with_lock(|controller| {
+            let result = controller.rename_vault(vault_id, name);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn open_vault(&self, vault_id: &str) -> Result<()> {
-        self.with_lock(|controller| controller.open_vault(vault_id))
+        self.with_lock(|controller| {
+            let result = controller.open_vault(vault_id);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn close_vault(&self, vault_id: &str) -> Result<()> {
-        self.with_lock(|controller| controller.close_vault(vault_id))
+        self.with_lock(|controller| {
+            let result = controller.close_vault(vault_id);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn unlock_named_vault(
@@ -483,23 +603,53 @@ impl AppControllerHandle {
         passphrase: &SecretString,
         device_name: &str,
     ) -> Result<()> {
-        self.with_lock(|controller| controller.unlock_vault(vault_id, passphrase, device_name))
+        self.with_lock(|controller| {
+            let result = controller.unlock_vault(vault_id, passphrase, device_name);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn try_unlock_vault_with_device(&self, vault_id: &str) -> Result<bool> {
-        self.with_lock(|controller| controller.try_unlock_vault_with_device(vault_id))
+        self.with_lock(|controller| {
+            let result = controller.try_unlock_vault_with_device(vault_id);
+            if matches!(result, Ok(true)) {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn lock_named_vault(&self, vault_id: &str) -> Result<()> {
-        self.with_lock(|controller| controller.lock_vault(vault_id))
+        self.with_lock(|controller| {
+            let result = controller.lock_vault(vault_id);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn delete_vault_permanently(&self, vault_id: &str) -> Result<()> {
-        self.with_lock(|controller| controller.delete_vault_permanently(vault_id))
+        self.with_lock(|controller| {
+            let result = controller.delete_vault_permanently(vault_id);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn set_default_target_vault(&self, vault_id: &str) -> Result<()> {
-        self.with_lock(|controller| controller.set_default_target_vault(vault_id))
+        self.with_lock(|controller| {
+            let result = controller.set_default_target_vault(vault_id);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn list_hosts(&self) -> Result<Vec<VaultScopedHostSummary>> {
@@ -515,11 +665,59 @@ impl AppControllerHandle {
         vault_id: &str,
         host: VaultHostProfile,
     ) -> Result<VaultScopedHostSummary> {
-        self.with_lock(|controller| controller.save_host(vault_id, host))
+        self.with_lock(|controller| {
+            let result = controller.save_host(vault_id, host);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn delete_host(&self, vault_id: &str, id: &str) -> Result<bool> {
-        self.with_lock(|controller| controller.delete_host(vault_id, id))
+        self.with_lock(|controller| {
+            let result = controller.delete_host(vault_id, id);
+            if matches!(result, Ok(true)) {
+                controller.publish_vault_update();
+            }
+            result
+        })
+    }
+
+    pub fn list_port_forwards(&self) -> Result<Vec<VaultScopedPortForwardSummary>> {
+        self.with_lock(|controller| controller.list_port_forwards())
+    }
+
+    pub fn load_port_forward(
+        &self,
+        vault_id: &str,
+        id: &str,
+    ) -> Result<Option<VaultPortForwardProfile>> {
+        self.with_lock(|controller| controller.load_port_forward(vault_id, id))
+    }
+
+    pub fn save_port_forward(
+        &self,
+        vault_id: &str,
+        port_forward: VaultPortForwardProfile,
+    ) -> Result<VaultScopedPortForwardSummary> {
+        self.with_lock(|controller| {
+            let result = controller.save_port_forward(vault_id, port_forward);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
+    }
+
+    pub fn delete_port_forward(&self, vault_id: &str, id: &str) -> Result<bool> {
+        self.with_lock(|controller| {
+            let result = controller.delete_port_forward(vault_id, id);
+            if matches!(result, Ok(true)) {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn list_password_credentials(&self) -> Result<Vec<VaultScopedCredentialSummary>> {
@@ -539,11 +737,23 @@ impl AppControllerHandle {
         vault_id: &str,
         credential: VaultPasswordCredential,
     ) -> Result<VaultScopedCredentialSummary> {
-        self.with_lock(|controller| controller.save_password_credential(vault_id, credential))
+        self.with_lock(|controller| {
+            let result = controller.save_password_credential(vault_id, credential);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn delete_password_credential(&self, vault_id: &str, id: &str) -> Result<bool> {
-        self.with_lock(|controller| controller.delete_password_credential(vault_id, id))
+        self.with_lock(|controller| {
+            let result = controller.delete_password_credential(vault_id, id);
+            if matches!(result, Ok(true)) {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn list_private_keys(&self) -> Result<Vec<VaultScopedKeySummary>> {
@@ -555,11 +765,23 @@ impl AppControllerHandle {
         vault_id: &str,
         request: GenerateKeyRequest,
     ) -> Result<VaultScopedKeySummary> {
-        self.with_lock(|controller| controller.generate_private_key(vault_id, request))
+        self.with_lock(|controller| {
+            let result = controller.generate_private_key(vault_id, request);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn delete_private_key(&self, vault_id: &str, id: &str) -> Result<bool> {
-        self.with_lock(|controller| controller.delete_private_key(vault_id, id))
+        self.with_lock(|controller| {
+            let result = controller.delete_private_key(vault_id, id);
+            if matches!(result, Ok(true)) {
+                controller.publish_vault_update();
+            }
+            result
+        })
     }
 
     pub fn build_connect_request(
@@ -572,49 +794,37 @@ impl AppControllerHandle {
             let host = vault
                 .load_host_profile(host_id)?
                 .ok_or_else(|| anyhow!("saved host not found"))?;
-
-            let mut auth_order = Vec::with_capacity(host.auth_order.len());
-            for auth in &host.auth_order {
-                match auth {
-                    HostAuthRef::Password { credential_id } => {
-                        let credential = vault
-                            .load_password_credential(credential_id)?
-                            .ok_or_else(|| anyhow!("missing password credential"))?;
-                        auth_order.push(ResolvedAuthMethod::Password {
-                            password: credential.secret,
-                        });
-                    }
-                    HostAuthRef::PrivateKey {
-                        key_id,
-                        passphrase_credential_id,
-                    } => {
-                        let key = vault
-                            .load_private_key(key_id)?
-                            .ok_or_else(|| anyhow!("missing private key"))?;
-                        let passphrase = passphrase_credential_id
-                            .as_ref()
-                            .map(|id| vault.load_password_credential(id))
-                            .transpose()?
-                            .flatten()
-                            .map(|credential| credential.secret);
-                        auth_order.push(ResolvedAuthMethod::PrivateKey {
-                            private_key_pem: key.private_key_pem,
-                            passphrase,
-                        });
-                    }
-                }
-            }
-
-            Ok(SshConnectRequest {
-                connection: SshConnectionConfig {
-                    label: host.label,
-                    hostname: host.hostname,
-                    port: host.port,
-                    username: host.username,
-                },
-                auth_order,
-            })
+            tunnels::build_connect_request(vault, &host)
         })
+    }
+
+    pub fn build_port_forward_request(
+        &self,
+        vault_id: &str,
+        port_forward_id: &str,
+    ) -> Result<SshPortForwardRequest> {
+        self.with_lock(|controller| {
+            controller.build_port_forward_request(vault_id, port_forward_id)
+        })
+    }
+
+    pub fn start_port_forward(
+        &self,
+        request: SshPortForwardRequest,
+    ) -> Result<PortForwardRuntimeSnapshot> {
+        self.with_lock(|controller| Ok(controller.context.ssh.start_port_forward(request)?))
+    }
+
+    pub fn stop_port_forward(&self, id: &str) -> bool {
+        self.with_lock(|controller| controller.context.ssh.stop_port_forward(id))
+    }
+
+    pub fn list_active_port_forwards(&self) -> Vec<PortForwardRuntimeSnapshot> {
+        self.with_lock(|controller| controller.context.ssh.list_port_forwards())
+    }
+
+    pub fn subscribe_tunnel_state_changes(&self) -> Receiver<Vec<PortForwardRuntimeSnapshot>> {
+        self.with_lock(|controller| controller.context.ssh.subscribe_tunnel_state_changes())
     }
 
     pub fn sftp_canonicalize(&self, session_id: SessionId, path: &str) -> Result<String> {
@@ -679,13 +889,17 @@ impl AppController {
             if let Some(store) = state.store.as_mut()
                 && store.status().initialized
             {
+                tracing::debug!(vault_id = %state.entry.id, "attempting device unlock during bootstrap");
                 let _ = store.try_unlock_with_device();
+                tracing::debug!(vault_id = %state.entry.id, "device unlock attempt completed");
                 self.device_unlock_attempted = true;
             }
         }
         if self.sessions.is_empty() {
+            tracing::info!("spawning initial local session during bootstrap");
             let _ = self.spawn_local_session()?;
         }
+        tracing::debug!("starting updater startup check");
         self.context.updater.startup_check();
         Ok(())
     }
@@ -707,12 +921,15 @@ impl AppController {
         self.bump_access_seq();
         let seq = self.access_seq;
         self.sessions.touch(attached_session_id, seq);
+        let vault_ui = self.vault_ui_snapshot();
         Ok(WindowBootstrap {
             attached_session_id,
-            managed_vaults: self.list_vaults(),
-            saved_hosts: self.list_hosts().unwrap_or_default(),
-            cached_credentials: self.list_password_credentials().unwrap_or_default(),
-            cached_keys: self.list_private_keys().unwrap_or_default(),
+            managed_vaults: vault_ui.managed_vaults.clone(),
+            saved_hosts: vault_ui.saved_hosts.clone(),
+            cached_credentials: vault_ui.cached_credentials.clone(),
+            cached_keys: vault_ui.cached_keys.clone(),
+            cached_port_forwards: vault_ui.cached_port_forwards.clone(),
+            active_port_forwards: self.context.ssh.list_port_forwards(),
             device_unlock_attempted: self.device_unlock_attempted,
             config: self.context.config.snapshot(),
             update_state: self.context.updater.state_snapshot(),
@@ -720,11 +937,33 @@ impl AppController {
     }
 
     fn spawn_local_session(&mut self) -> Result<Arc<dyn TerminalSession>> {
-        let shell_override = self.context.config.snapshot().terminal.local_shell;
-        let session: Arc<dyn TerminalSession> =
-            Arc::new(self.context.local.spawn(shell_override.as_deref())?);
-        self.register_session(Arc::clone(&session), SessionKind::Local);
+        let config = self.context.config.snapshot();
+        let shell_override = config.terminal.local_shell.clone();
+        let transcript_sink =
+            self.context
+                .session_logs
+                .sink_for_session(&config, SessionKind::Local, "local", None);
+        let session: Arc<dyn TerminalSession> = Arc::new(
+            self.context
+                .local
+                .spawn(shell_override.as_deref(), transcript_sink)?,
+        );
+        self.register_session(Arc::clone(&session), SessionKind::Local, None);
         Ok(session)
+    }
+
+    fn start_connect(
+        &mut self,
+        request: SshConnectRequest,
+    ) -> std::result::Result<SshConnectTask, seance_ssh::SshError> {
+        let config = self.context.config.snapshot();
+        let transcript_sink = self.context.session_logs.sink_for_session(
+            &config,
+            SessionKind::Remote,
+            &request.connection.label,
+            Some(&request.connection.label),
+        );
+        self.context.ssh.start_connect(request, transcript_sink)
     }
 
     fn update_config(&mut self, f: impl FnOnce(&mut AppConfig)) -> Result<AppConfig> {
@@ -762,15 +1001,34 @@ impl AppController {
         rx
     }
 
+    fn subscribe_vault_changes(&mut self) -> Receiver<VaultUiSnapshot> {
+        let (tx, rx) = mpsc::channel();
+        let snapshot = self.vault_ui_snapshot();
+        self.vault_subscribers.push(tx.clone());
+        let _ = tx.send(snapshot);
+        rx
+    }
+
     fn publish_config_update(&mut self, snapshot: AppConfig) {
         self.config_subscribers
             .retain(|subscriber| subscriber.send(snapshot.clone()).is_ok());
     }
 
-    fn register_session(&mut self, session: Arc<dyn TerminalSession>, kind: SessionKind) {
+    fn publish_vault_update(&mut self) {
+        let snapshot = self.vault_ui_snapshot();
+        self.vault_subscribers
+            .retain(|subscriber| subscriber.send(snapshot.clone()).is_ok());
+    }
+
+    fn register_session(
+        &mut self,
+        session: Arc<dyn TerminalSession>,
+        kind: SessionKind,
+        origin: Option<SessionOrigin>,
+    ) {
         self.bump_access_seq();
         let seq = self.access_seq;
-        self.sessions.insert(session, kind, seq);
+        self.sessions.insert(session, kind, origin, seq);
     }
 
     fn bump_access_seq(&mut self) {
@@ -797,6 +1055,16 @@ impl AppController {
             vault_path: self.context.paths.vault_db_path.display().to_string(),
             device_unlock_available: false,
             device_unlock_message: None,
+        }
+    }
+
+    fn vault_ui_snapshot(&self) -> VaultUiSnapshot {
+        VaultUiSnapshot {
+            managed_vaults: self.list_vaults(),
+            saved_hosts: self.list_hosts().unwrap_or_default(),
+            cached_credentials: self.list_password_credentials().unwrap_or_default(),
+            cached_keys: self.list_private_keys().unwrap_or_default(),
+            cached_port_forwards: self.list_port_forwards().unwrap_or_default(),
         }
     }
 
@@ -1071,6 +1339,82 @@ impl AppController {
         Ok(self.store_mut(vault_id)?.delete_host_profile(id)?)
     }
 
+    fn list_port_forwards(&self) -> Result<Vec<VaultScopedPortForwardSummary>> {
+        let mut port_forwards = Vec::new();
+        for (vault_id, state) in &self.context.vaults {
+            let Some(store) = state.store.as_ref() else {
+                continue;
+            };
+            if !store.status().unlocked {
+                continue;
+            }
+            port_forwards.extend(store.list_port_forwards()?.into_iter().filter_map(
+                |port_forward| {
+                    let host = store
+                        .load_host_profile(&port_forward.host_id)
+                        .ok()
+                        .flatten()?;
+                    Some(VaultScopedPortForwardSummary {
+                        vault_id: vault_id.clone(),
+                        vault_name: state.entry.name.clone(),
+                        host_id: host.id.clone(),
+                        host_label: host.label,
+                        port_forward,
+                    })
+                },
+            ));
+        }
+        port_forwards.sort_by(|left, right| {
+            left.port_forward
+                .label
+                .to_lowercase()
+                .cmp(&right.port_forward.label.to_lowercase())
+                .then_with(|| {
+                    left.host_label
+                        .to_lowercase()
+                        .cmp(&right.host_label.to_lowercase())
+                })
+                .then_with(|| {
+                    left.vault_name
+                        .to_lowercase()
+                        .cmp(&right.vault_name.to_lowercase())
+                })
+        });
+        Ok(port_forwards)
+    }
+
+    fn load_port_forward(
+        &self,
+        vault_id: &str,
+        id: &str,
+    ) -> Result<Option<VaultPortForwardProfile>> {
+        Ok(self.store(vault_id)?.load_port_forward(id)?)
+    }
+
+    fn save_port_forward(
+        &mut self,
+        vault_id: &str,
+        port_forward: VaultPortForwardProfile,
+    ) -> Result<VaultScopedPortForwardSummary> {
+        let summary = self.store_mut(vault_id)?.store_port_forward(port_forward)?;
+        let vault_name = self.vault_entry(vault_id)?.name.clone();
+        let host = self
+            .store(vault_id)?
+            .load_host_profile(&summary.host_id)?
+            .ok_or_else(|| anyhow!("saved host not found"))?;
+        Ok(VaultScopedPortForwardSummary {
+            vault_id: vault_id.to_string(),
+            vault_name,
+            host_id: host.id.clone(),
+            host_label: host.label,
+            port_forward: summary,
+        })
+    }
+
+    fn delete_port_forward(&mut self, vault_id: &str, id: &str) -> Result<bool> {
+        Ok(self.store_mut(vault_id)?.delete_port_forward(id)?)
+    }
+
     fn list_password_credentials(&self) -> Result<Vec<VaultScopedCredentialSummary>> {
         let mut credentials = Vec::new();
         for (vault_id, state) in &self.context.vaults {
@@ -1183,6 +1527,18 @@ impl AppController {
 
     fn delete_private_key(&mut self, vault_id: &str, id: &str) -> Result<bool> {
         Ok(self.store_mut(vault_id)?.delete_private_key(id)?)
+    }
+
+    fn build_port_forward_request(
+        &self,
+        vault_id: &str,
+        port_forward_id: &str,
+    ) -> Result<SshPortForwardRequest> {
+        let vault = self.store(vault_id)?;
+        let port_forward = vault
+            .load_port_forward(port_forward_id)?
+            .ok_or_else(|| anyhow!("saved port forward not found"))?;
+        tunnels::build_port_forward_request(vault, vault_id, port_forward)
     }
 
     fn default_target_vault_id_for_actions(&self) -> Option<String> {
@@ -1355,18 +1711,24 @@ fn update_settings_from_config(config: &AppConfig) -> UpdateSettings {
 mod tests {
     use std::{
         sync::{Arc, mpsc},
-        time::Duration,
+        thread,
+        time::{Duration, Instant},
     };
 
     use anyhow::Result;
     use seance_terminal::{
-        SessionPerfSnapshot, SessionSnapshot, TerminalGeometry, TerminalSession,
+        SessionPerfSnapshot, SessionSummary, TerminalGeometry, TerminalScrollCommand,
+        TerminalSession, TerminalViewportSnapshot,
+    };
+    use seance_vault::{
+        GenerateKeyAlgorithm, GenerateKeyRequest, HostAuthRef, PortForwardMode, SecretString,
+        VaultHostProfile, VaultPasswordCredential, VaultPortForwardProfile,
     };
     use tempfile::tempdir;
 
     use super::{
         AppContext, AppControllerHandle, AppPaths, LifecyclePolicy, PlatformCloseAction,
-        SessionKind, SessionRegistry,
+        SessionKind, SessionOrigin, SessionRegistry,
     };
 
     struct FakeSession(u64);
@@ -1378,13 +1740,22 @@ mod tests {
         fn title(&self) -> &str {
             "fake"
         }
-        fn snapshot(&self) -> SessionSnapshot {
-            SessionSnapshot::default()
+        fn summary(&self) -> SessionSummary {
+            SessionSummary::default()
+        }
+        fn viewport_snapshot(&self) -> TerminalViewportSnapshot {
+            TerminalViewportSnapshot::default()
         }
         fn send_input(&self, _bytes: Vec<u8>) -> Result<()> {
             Ok(())
         }
         fn resize(&self, _geometry: TerminalGeometry) -> Result<()> {
+            Ok(())
+        }
+        fn scroll_viewport(&self, _command: TerminalScrollCommand) -> Result<()> {
+            Ok(())
+        }
+        fn scroll_to_bottom(&self) -> Result<()> {
             Ok(())
         }
         fn perf_snapshot(&self) -> SessionPerfSnapshot {
@@ -1398,11 +1769,30 @@ mod tests {
     #[test]
     fn session_registry_tracks_recent_session() {
         let mut registry = SessionRegistry::default();
-        registry.insert(Arc::new(FakeSession(1)), SessionKind::Local, 1);
-        registry.insert(Arc::new(FakeSession(2)), SessionKind::Remote, 2);
+        registry.insert(Arc::new(FakeSession(1)), SessionKind::Local, None, 1);
+        registry.insert(Arc::new(FakeSession(2)), SessionKind::Remote, None, 2);
         assert_eq!(registry.most_recent_session_id(), Some(2));
         registry.touch(1, 3);
         assert_eq!(registry.most_recent_session_id(), Some(1));
+    }
+
+    #[test]
+    fn session_registry_exposes_origin_metadata() {
+        let mut registry = SessionRegistry::default();
+        registry.insert(
+            Arc::new(FakeSession(7)),
+            SessionKind::Remote,
+            Some(SessionOrigin {
+                vault_id: "vault-a".into(),
+                host_id: "host-a".into(),
+                host_label_at_connect: "Production".into(),
+            }),
+            1,
+        );
+
+        let metadata = registry.metadata(7).expect("session metadata");
+        assert_eq!(metadata.kind, SessionKind::Remote);
+        assert_eq!(metadata.origin.expect("origin").host_id, "host-a");
     }
 
     #[test]
@@ -1514,12 +1904,365 @@ mod tests {
         assert_eq!(broadcast.appearance.theme, "nord");
     }
 
+    #[test]
+    fn vault_snapshot_broadcasts_after_host_save_and_delete() {
+        let controller = make_test_controller();
+        let vault = controller
+            .create_named_vault(
+                "Personal".into(),
+                &SecretString::from("passphrase".to_string()),
+                "device",
+            )
+            .unwrap();
+        let rx = controller.subscribe_vault_changes();
+        let _ = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let credential = controller
+            .save_password_credential(
+                &vault.vault_id,
+                VaultPasswordCredential {
+                    id: String::new(),
+                    label: "prod password".into(),
+                    username_hint: Some("root".into()),
+                    secret: "hunter2".into(),
+                },
+            )
+            .unwrap();
+        let _ = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let host = controller
+            .save_host(
+                &vault.vault_id,
+                VaultHostProfile {
+                    id: String::new(),
+                    label: "Production".into(),
+                    hostname: "prod.example.com".into(),
+                    port: 22,
+                    username: "root".into(),
+                    notes: None,
+                    auth_order: vec![HostAuthRef::Password {
+                        credential_id: credential.credential.id.clone(),
+                    }],
+                },
+            )
+            .unwrap();
+
+        let saved_snapshot = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            saved_snapshot
+                .saved_hosts
+                .iter()
+                .any(|item| item.host.id == host.host.id && item.vault_id == vault.vault_id)
+        );
+
+        assert!(
+            controller
+                .delete_host(&vault.vault_id, &host.host.id)
+                .expect("delete host")
+        );
+
+        let deleted_snapshot = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            deleted_snapshot
+                .saved_hosts
+                .iter()
+                .all(|item| item.host.id != host.host.id || item.vault_id != vault.vault_id)
+        );
+    }
+
+    #[test]
+    fn vault_snapshot_broadcasts_after_tunnel_save_and_delete() {
+        let controller = make_test_controller();
+        let vault = controller
+            .create_named_vault(
+                "Personal".into(),
+                &SecretString::from("passphrase".to_string()),
+                "device",
+            )
+            .unwrap();
+        let rx = controller.subscribe_vault_changes();
+        let _ = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let credential = controller
+            .save_password_credential(
+                &vault.vault_id,
+                VaultPasswordCredential {
+                    id: String::new(),
+                    label: "prod password".into(),
+                    username_hint: Some("root".into()),
+                    secret: "hunter2".into(),
+                },
+            )
+            .unwrap();
+        let _ = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let host = controller
+            .save_host(
+                &vault.vault_id,
+                VaultHostProfile {
+                    id: String::new(),
+                    label: "Production".into(),
+                    hostname: "prod.example.com".into(),
+                    port: 22,
+                    username: "root".into(),
+                    notes: None,
+                    auth_order: vec![HostAuthRef::Password {
+                        credential_id: credential.credential.id.clone(),
+                    }],
+                },
+            )
+            .unwrap();
+        let _ = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let tunnel = controller
+            .save_port_forward(
+                &vault.vault_id,
+                VaultPortForwardProfile {
+                    id: String::new(),
+                    host_id: host.host.id.clone(),
+                    label: "db tunnel".into(),
+                    mode: PortForwardMode::Local,
+                    listen_address: "127.0.0.1".into(),
+                    listen_port: 15432,
+                    target_address: "127.0.0.1".into(),
+                    target_port: 5432,
+                    notes: None,
+                },
+            )
+            .unwrap();
+
+        let saved_snapshot = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(saved_snapshot.cached_port_forwards.iter().any(|item| {
+            item.vault_id == vault.vault_id && item.port_forward.id == tunnel.port_forward.id
+        }));
+
+        assert!(
+            controller
+                .delete_port_forward(&vault.vault_id, &tunnel.port_forward.id)
+                .expect("delete tunnel")
+        );
+
+        let deleted_snapshot = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(deleted_snapshot.cached_port_forwards.iter().all(|item| {
+            item.vault_id != vault.vault_id || item.port_forward.id != tunnel.port_forward.id
+        }));
+    }
+
+    #[test]
+    fn vault_snapshot_broadcasts_after_lock_unlock_and_delete() {
+        let controller = make_test_controller();
+        let vault = controller
+            .create_named_vault(
+                "Personal".into(),
+                &SecretString::from("passphrase".to_string()),
+                "device",
+            )
+            .unwrap();
+        let rx = controller.subscribe_vault_changes();
+        let initial = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            initial
+                .managed_vaults
+                .iter()
+                .any(|item| item.vault_id == vault.vault_id && item.unlocked)
+        );
+
+        controller.lock_named_vault(&vault.vault_id).unwrap();
+        let locked = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            locked
+                .managed_vaults
+                .iter()
+                .any(|item| item.vault_id == vault.vault_id && !item.unlocked)
+        );
+
+        controller
+            .unlock_named_vault(
+                &vault.vault_id,
+                &SecretString::from("passphrase".to_string()),
+                "device",
+            )
+            .unwrap();
+        let unlocked = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            unlocked
+                .managed_vaults
+                .iter()
+                .any(|item| item.vault_id == vault.vault_id && item.unlocked)
+        );
+
+        controller.lock_named_vault(&vault.vault_id).unwrap();
+        let _ = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        controller
+            .delete_vault_permanently(&vault.vault_id)
+            .unwrap();
+        let deleted = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            deleted
+                .managed_vaults
+                .iter()
+                .all(|item| item.vault_id != vault.vault_id)
+        );
+    }
+
+    #[test]
+    fn controller_exposes_remote_session_origin_metadata() {
+        let controller = make_test_controller();
+        let session = Arc::new(FakeSession(99));
+        controller.register_remote_session_with_origin(
+            session,
+            SessionOrigin {
+                vault_id: "vault-z".into(),
+                host_id: "host-z".into(),
+                host_label_at_connect: "Bastion".into(),
+            },
+        );
+
+        let metadata = controller.session_metadata(99).expect("metadata");
+        assert_eq!(metadata.kind, SessionKind::Remote);
+        assert_eq!(
+            metadata.origin.expect("origin").host_label_at_connect,
+            "Bastion"
+        );
+    }
+
+    #[test]
+    fn build_port_forward_request_resolves_linked_host_and_auth() {
+        let controller = make_test_controller();
+        let vault = controller
+            .create_named_vault(
+                "Personal".into(),
+                &SecretString::from("passphrase".to_string()),
+                "device",
+            )
+            .unwrap();
+        let credential = controller
+            .save_password_credential(
+                &vault.vault_id,
+                VaultPasswordCredential {
+                    id: String::new(),
+                    label: "prod password".into(),
+                    username_hint: Some("root".into()),
+                    secret: "hunter2".into(),
+                },
+            )
+            .unwrap();
+        let key = controller
+            .generate_private_key(
+                &vault.vault_id,
+                GenerateKeyRequest {
+                    label: "deploy".into(),
+                    algorithm: GenerateKeyAlgorithm::Ed25519,
+                },
+            )
+            .unwrap();
+        let host = controller
+            .save_host(
+                &vault.vault_id,
+                VaultHostProfile {
+                    id: String::new(),
+                    label: "Production".into(),
+                    hostname: "prod.example.com".into(),
+                    port: 22,
+                    username: "root".into(),
+                    notes: None,
+                    auth_order: vec![
+                        HostAuthRef::Password {
+                            credential_id: credential.credential.id.clone(),
+                        },
+                        HostAuthRef::PrivateKey {
+                            key_id: key.key.id.clone(),
+                            passphrase_credential_id: Some(credential.credential.id.clone()),
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let port_forward = controller
+            .save_port_forward(
+                &vault.vault_id,
+                VaultPortForwardProfile {
+                    id: String::new(),
+                    host_id: host.host.id.clone(),
+                    label: "db tunnel".into(),
+                    mode: PortForwardMode::Local,
+                    listen_address: "127.0.0.1".into(),
+                    listen_port: 15432,
+                    target_address: "127.0.0.1".into(),
+                    target_port: 5432,
+                    notes: None,
+                },
+            )
+            .unwrap();
+
+        let request = controller
+            .build_port_forward_request(&vault.vault_id, &port_forward.port_forward.id)
+            .unwrap();
+
+        assert_eq!(
+            request.id,
+            format!("{}::{}", vault.vault_id, port_forward.port_forward.id)
+        );
+        assert_eq!(request.label, "db tunnel");
+        assert_eq!(request.host_label, "Production");
+        assert_eq!(request.connection.hostname, "prod.example.com");
+        assert_eq!(request.auth_order.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_local_session_smoke_test_avoids_startup_error() {
+        let controller = make_test_controller();
+        let session = controller
+            .spawn_local_session()
+            .expect("spawn local session");
+        let notify_rx = session.take_notify_rx();
+
+        assert!(wait_for_session_condition(
+            &*session,
+            &notify_rx,
+            Duration::from_secs(2),
+            |session| session.summary().exit_status.as_deref() != Some("startup error"),
+        ));
+        assert_ne!(
+            session.summary().exit_status.as_deref(),
+            Some("startup error")
+        );
+
+        let _ = session.send_input(b"exit\n".to_vec());
+    }
+
+    fn wait_for_session_condition(
+        session: &dyn TerminalSession,
+        notify_rx: &Option<mpsc::Receiver<()>>,
+        timeout: Duration,
+        predicate: impl Fn(&dyn TerminalSession) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if predicate(session) {
+                return true;
+            }
+
+            if let Some(rx) = notify_rx {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let _ = rx.recv_timeout(remaining.min(Duration::from_millis(50)));
+            } else {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        predicate(session)
+    }
+
     fn make_test_controller() -> AppControllerHandle {
         let dir = tempdir().unwrap();
         let root = dir.keep();
         let context = AppContext::open(AppPaths {
             app_root: root.clone(),
             config_path: root.join("config.toml"),
+            diagnostics_dir: root.join("logs"),
+            session_logs_dir: root.join("session-logs"),
             vault_db_path: root.join("vault.sqlite"),
             vaults_dir: root.join("vaults"),
             ipc_socket_path: root.join("resident.sock"),

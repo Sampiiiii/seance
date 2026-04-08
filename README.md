@@ -45,6 +45,7 @@ Resident lifecycle behavior now works like this:
 ## Prerequisites
 
 - **Rust 1.93+** (pinned in `rust-toolchain.toml`, installed automatically by `rustup`)
+- **Zig 0.15.2** for local build, clippy, and test paths that compile `seance-terminal`
 - **macOS** or **Linux**
 
 ## Getting started
@@ -52,23 +53,43 @@ Resident lifecycle behavior now works like this:
 ```bash
 git clone https://github.com/sampiiiii/seance.git
 cd seance
-make run
+make app-run
 ```
 
-`make run` uses `cargo run` and is fine for normal local development, but it is not a valid Touch ID test path on macOS. Touch ID-backed vault unlock requires a signed `Seance.app` bundle with keychain entitlements.
+`make app-run` uses `cargo run` and is fine for normal local development, but it is not a valid Touch ID test path on macOS. Touch ID-backed vault unlock requires a signed `Seance.app` bundle with keychain entitlements.
+
+GitHub Actions installs Zig automatically for CI and release jobs that compile the vendored `libghostty-vt` stack. Local development still needs a matching Zig toolchain available on `PATH`.
 
 Other useful targets:
 
 ```bash
-make run-perf           # Compact performance HUD
-make run-perf-expanded  # Expanded performance HUD
-make run-trace          # Tracing enabled
-make build-macos-signed-app  # Build a signed macOS app bundle for Touch ID testing
-make run-macos-signed        # Build and launch the signed macOS app bundle
-make check              # cargo check
-make clippy             # Clippy with -D warnings
-make test               # Run tests
-make fmt                # Format code
+make app-run
+make app-run-perf
+make app-run-perf-expanded
+make debug-run
+make debug-run-perf-expanded
+make debug-lldb
+make signed-build
+make signed-run
+make signed-debug
+make logs-dir
+make logs-latest
+make logs-tail
+make crash-latest
+make check
+make clippy
+make test
+make fmt
+```
+
+For launch-crash debugging on macOS:
+
+```bash
+make debug-run      # baseline repro with tracing + full Rust backtraces
+make signed-debug   # signed-app repro for Touch ID / entitlement paths
+make logs-latest    # newest launch log path
+make logs-tail      # tail the newest launch log
+make crash-latest   # newest macOS crash report for Seance
 ```
 
 For local Touch ID verification on macOS, create a local signing file once and use the signed app path instead of `cargo run`:
@@ -77,7 +98,7 @@ For local Touch ID verification on macOS, create a local signing file once and u
 cp .env.macos-signing.example .env.macos-signing
 # edit .env.macos-signing with your Apple team id, Apple Development identity,
 # and a macOS development provisioning profile for com.seance.app.dev
-make run-macos-signed
+make signed-run
 ```
 
 You can verify the resulting app entitlements with:
@@ -95,7 +116,7 @@ Local macOS Touch ID setup requires:
 - a macOS development provisioning profile for that App ID
 - `APPLE_DEV_PROVISIONING_PROFILE` set in `.env.macos-signing`
 
-`make run-macos-signed` and `make build-macos-signed-app` will automatically load `.env.macos-signing` if it exists. If it does not, they still accept explicit `APPLE_TEAM_ID`, `APPLE_DEVELOPMENT_SIGNING_IDENTITY`, and `APPLE_DEV_PROVISIONING_PROFILE` environment variables.
+`make signed-run` and `make signed-build` will automatically load `.env.macos-signing` if it exists. If it does not, they still accept explicit `APPLE_TEAM_ID`, `APPLE_DEVELOPMENT_SIGNING_IDENTITY`, and `APPLE_DEV_PROVISIONING_PROFILE` environment variables.
 
 Release metadata and artifact naming now go through the Rust build helper:
 
@@ -116,10 +137,21 @@ GitHub Actions now drives CI and release packaging:
 - Linux release artifacts are AppImages for `x86_64` and `aarch64`
 - macOS release artifacts are a signed/notarized `dmg` plus a Sparkle update zip for Apple Silicon
 
+The build jobs provision Zig 0.15.2 before compiling Rust because the vendored `libghostty-vt-sys` build invokes Ghostty's `zig build` path during compilation.
+
 The canonical interface for release metadata is `cargo run -p seance-build -- <subcommand>`. The remaining scripts under `scripts/` are platform packaging wrappers for tools such as `cargo-packager`, `codesign`, `notarytool`, `linuxdeploy`, and `appimagetool`.
 
 See [docs/RELEASE.md](docs/RELEASE.md) for the release architecture, manifest model, and diagrams.
 See [docs/RELEASE-RUNBOOK.md](docs/RELEASE-RUNBOOK.md) for the operator runbook, preflight checklist, and recovery steps.
+
+Hosted vault sync and multiplayer backend design docs live under `docs/` as well:
+
+- [docs/VAULT-SYNC-ARCHITECTURE.md](docs/VAULT-SYNC-ARCHITECTURE.md)
+- [docs/VAULT-SYNC-PROTOCOL.md](docs/VAULT-SYNC-PROTOCOL.md)
+- [docs/VAULT-SYNC-DATA-MODEL.md](docs/VAULT-SYNC-DATA-MODEL.md)
+- [docs/VAULT-SYNC-THREAT-MODEL.md](docs/VAULT-SYNC-THREAT-MODEL.md)
+- [docs/VAULT-SYNC-RUNBOOK.md](docs/VAULT-SYNC-RUNBOOK.md)
+- [docs/VAULT-MULTIPLAYER-ARCHITECTURE.md](docs/VAULT-MULTIPLAYER-ARCHITECTURE.md)
 
 ## Roadmap
 

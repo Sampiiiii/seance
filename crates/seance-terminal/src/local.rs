@@ -3,19 +3,17 @@ use std::{
     io::{Read, Write},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use tracing::trace;
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use tracing::{debug, trace};
 
 use crate::{
-    model::TerminalGeometry,
-    render::TerminalEmulator,
-    state::{
-        SessionPerfSnapshot, SessionSnapshot, SharedSessionState, TerminalSession, next_session_id,
-    },
+    SessionPerfSnapshot, SessionSummary, SharedSessionState, TerminalEmulator, TerminalGeometry,
+    TerminalScrollCommand, TerminalSession, TerminalTranscriptSink, TerminalViewportSnapshot,
+    TranscriptEvent, TranscriptStream, next_session_id,
 };
 
 pub struct LocalSessionHandle {
@@ -53,8 +51,12 @@ impl TerminalSession for LocalSessionHandle {
         &self.title
     }
 
-    fn snapshot(&self) -> SessionSnapshot {
-        self.state.snapshot()
+    fn summary(&self) -> SessionSummary {
+        self.state.summary()
+    }
+
+    fn viewport_snapshot(&self) -> TerminalViewportSnapshot {
+        self.state.viewport_snapshot()
     }
 
     fn send_input(&self, bytes: Vec<u8>) -> Result<()> {
@@ -70,6 +72,18 @@ impl TerminalSession for LocalSessionHandle {
             .context("failed to forward resize to local shell")
     }
 
+    fn scroll_viewport(&self, command: TerminalScrollCommand) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::ScrollViewport(command))
+            .context("failed to forward viewport scroll to local shell")
+    }
+
+    fn scroll_to_bottom(&self) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::ScrollToBottom)
+            .context("failed to forward viewport bottom command to local shell")
+    }
+
     fn perf_snapshot(&self) -> SessionPerfSnapshot {
         self.state.perf_snapshot()
     }
@@ -83,24 +97,37 @@ impl TerminalSession for LocalSessionHandle {
 pub struct LocalSessionFactory;
 
 impl LocalSessionFactory {
-    pub fn spawn(&self, shell_override: Option<&str>) -> Result<LocalSessionHandle> {
+    pub fn spawn(
+        &self,
+        shell_override: Option<&str>,
+        transcript_sink: Arc<dyn TerminalTranscriptSink>,
+    ) -> Result<LocalSessionHandle> {
         let id = next_session_id();
         let title: Arc<str> = format!("local-{id}").into();
-        spawn_local_session(id, title, shell_override.map(ToOwned::to_owned))
+        spawn_local_session(
+            id,
+            title,
+            shell_override.map(ToOwned::to_owned),
+            transcript_sink,
+        )
     }
 }
 
 pub(crate) enum SessionCommand {
     Input(Vec<u8>),
     Resize(TerminalGeometry),
+    ScrollViewport(TerminalScrollCommand),
+    ScrollToBottom,
 }
 
 fn spawn_local_session(
     id: u64,
     title: Arc<str>,
     shell_override: Option<String>,
+    transcript_sink: Arc<dyn TerminalTranscriptSink>,
 ) -> Result<LocalSessionHandle> {
-    let (state, notify_rx) = SharedSessionState::new("Launching local shell...");
+    let geometry = TerminalGeometry::default();
+    let (state, notify_rx) = SharedSessionState::new("Launching local shell...", geometry);
     let (command_tx, command_rx) = mpsc::channel();
 
     let thread_state = state.clone();
@@ -108,9 +135,13 @@ fn spawn_local_session(
     thread::Builder::new()
         .name(format!("seance-local-session-{id}"))
         .spawn(move || {
-            if let Err(error) = run_local_session(thread_state.clone(), command_rx, shell_override)
-            {
-                thread_state.set_error(&error);
+            if let Err(error) = run_local_session(
+                thread_state.clone(),
+                command_rx,
+                shell_override,
+                transcript_sink,
+            ) {
+                thread_state.set_error(&error, geometry);
             }
         })
         .context("failed to spawn local terminal worker")?;
@@ -128,21 +159,17 @@ fn run_local_session(
     state: SharedSessionState,
     command_rx: mpsc::Receiver<SessionCommand>,
     shell_override: Option<String>,
+    transcript_sink: Arc<dyn TerminalTranscriptSink>,
 ) -> Result<()> {
     let mut current_geometry = TerminalGeometry::default();
-    let pty_system = native_pty_system();
-    let pty_pair = pty_system
-        .openpty(PtySize {
-            rows: current_geometry.size.rows,
-            cols: current_geometry.size.cols,
-            pixel_width: current_geometry.pixel_size.width_px,
-            pixel_height: current_geometry.pixel_size.height_px,
-        })
-        .context("failed to open PTY")?;
+    debug!(?current_geometry, "opening PTY for local shell startup");
+    let pty_pair = open_pty(current_geometry).context("failed to open PTY")?;
+    debug!("opened PTY for local shell startup");
 
     let shell = shell_override
         .or_else(|| env::var("SHELL").ok())
         .unwrap_or_else(|| "/bin/bash".to_string());
+    debug!(shell = %shell, "spawning local shell");
     let mut command = CommandBuilder::new(shell);
     command.env("TERM", "xterm-256color");
 
@@ -150,6 +177,7 @@ fn run_local_session(
         .slave
         .spawn_command(command)
         .context("failed to spawn local shell")?;
+    debug!("spawned local shell process");
 
     let mut writer = pty_pair
         .master
@@ -179,19 +207,29 @@ fn run_local_session(
         })
         .context("failed to spawn PTY reader")?;
 
-    let mut terminal = TerminalEmulator::new(current_geometry)?;
-    terminal.publish(&state, None);
+    let mut terminal = TerminalEmulator::new(current_geometry, "Launching local shell...")?;
+    terminal.refresh(&state, None, true, transcript_sink.dropped_events());
 
     loop {
         let mut changed = false;
 
         while let Ok(bytes) = output_rx.try_recv() {
+            transcript_sink.record(TranscriptEvent {
+                timestamp: SystemTime::now(),
+                stream: TranscriptStream::Output,
+                bytes: Arc::from(bytes.as_slice()),
+            });
             terminal.write(&bytes);
             changed = true;
         }
 
         match command_rx.recv_timeout(Duration::from_millis(16)) {
             Ok(SessionCommand::Input(bytes)) => {
+                transcript_sink.record(TranscriptEvent {
+                    timestamp: SystemTime::now(),
+                    stream: TranscriptStream::Input,
+                    bytes: Arc::from(bytes.as_slice()),
+                });
                 writer
                     .write_all(&bytes)
                     .context("failed to write input to PTY")?;
@@ -203,37 +241,47 @@ fn run_local_session(
                     continue;
                 }
 
-                pty_pair
-                    .master
-                    .resize(PtySize {
-                        rows: new_geometry.size.rows,
-                        cols: new_geometry.size.cols,
-                        pixel_width: new_geometry.pixel_size.width_px,
-                        pixel_height: new_geometry.pixel_size.height_px,
-                    })
-                    .context("failed to resize PTY")?;
+                resize_pty(&*pty_pair.master, new_geometry).context("failed to resize PTY")?;
                 trace!(?new_geometry, "applied PTY resize");
 
                 terminal.resize(new_geometry)?;
                 trace!(?new_geometry, "applied Ghostty resize");
 
                 current_geometry = new_geometry;
-                terminal.publish(&state, None);
+                terminal.refresh(&state, None, true, transcript_sink.dropped_events());
+            }
+            Ok(SessionCommand::ScrollViewport(command)) => {
+                terminal.scroll_viewport(command);
+                terminal.refresh(&state, None, true, transcript_sink.dropped_events());
+            }
+            Ok(SessionCommand::ScrollToBottom) => {
+                terminal.scroll_viewport(TerminalScrollCommand::Bottom);
+                terminal.refresh(&state, None, true, transcript_sink.dropped_events());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
         if changed {
-            terminal.publish(&state, None);
+            terminal.refresh(&state, None, false, transcript_sink.dropped_events());
         }
 
         if let Some(status) = child.try_wait().context("failed to poll shell process")? {
             while let Ok(bytes) = output_rx.try_recv() {
+                transcript_sink.record(TranscriptEvent {
+                    timestamp: SystemTime::now(),
+                    stream: TranscriptStream::Output,
+                    bytes: Arc::from(bytes.as_slice()),
+                });
                 terminal.write(&bytes);
             }
 
-            terminal.publish(&state, Some(status.to_string()));
+            terminal.refresh(
+                &state,
+                Some(status.to_string()),
+                true,
+                transcript_sink.dropped_events(),
+            );
             break;
         }
     }
@@ -241,15 +289,86 @@ fn run_local_session(
     Ok(())
 }
 
+fn pty_size_from_geometry(geometry: TerminalGeometry) -> PtySize {
+    PtySize {
+        rows: geometry.size.rows,
+        cols: geometry.size.cols,
+        pixel_width: geometry.cell_width_px,
+        pixel_height: geometry.cell_height_px,
+    }
+}
+
+fn pty_size_without_pixels(geometry: TerminalGeometry) -> PtySize {
+    PtySize {
+        pixel_width: 0,
+        pixel_height: 0,
+        ..pty_size_from_geometry(geometry)
+    }
+}
+
+fn should_retry_without_pixels(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            == Some(22)
+            || cause
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("invalid value")
+    })
+}
+
+fn open_pty(geometry: TerminalGeometry) -> Result<portable_pty::PtyPair> {
+    let pty_system = native_pty_system();
+    let size = pty_size_from_geometry(geometry);
+
+    match pty_system.openpty(size) {
+        Ok(pair) => Ok(pair),
+        Err(error) if should_retry_without_pixels(&error) => {
+            trace!(
+                ?geometry,
+                "retrying PTY open without pixel metrics after invalid value"
+            );
+            pty_system.openpty(pty_size_without_pixels(geometry))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn resize_pty(master: &dyn MasterPty, geometry: TerminalGeometry) -> Result<()> {
+    let size = pty_size_from_geometry(geometry);
+
+    match master.resize(size) {
+        Ok(()) => Ok(()),
+        Err(error) if should_retry_without_pixels(&error) => {
+            trace!(
+                ?geometry,
+                "retrying PTY resize without pixel metrics after invalid value"
+            );
+            master.resize(pty_size_without_pixels(geometry))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, mpsc};
+    use std::{
+        env,
+        path::Path,
+        sync::{Arc, Mutex, mpsc},
+        thread,
+        time::{Duration, Instant},
+    };
 
     use super::*;
+    use crate::NoopTranscriptSink;
 
     #[test]
     fn local_sessions_fit_terminal_session_trait_objects() {
-        let (state, notify_rx) = SharedSessionState::new("hello");
+        let geometry = TerminalGeometry::default();
+        let (state, notify_rx) = SharedSessionState::new("hello", geometry);
         let handle = Arc::new(LocalSessionHandle::new(
             7,
             Arc::<str>::from("local-7"),
@@ -260,6 +379,171 @@ mod tests {
 
         assert_eq!(handle.id(), 7);
         assert_eq!(handle.title(), "local-7");
-        assert_eq!(handle.snapshot().rows[0].plain_text(), "hello");
+        assert_eq!(handle.summary().preview_line, "hello");
+    }
+
+    #[test]
+    fn pty_size_uses_cell_metrics_instead_of_total_viewport_pixels() {
+        let geometry = TerminalGeometry::new(132, 48, 1400, 900, 9, 21).expect("geometry");
+
+        let size = pty_size_from_geometry(geometry);
+
+        assert_eq!(size.rows, 48);
+        assert_eq!(size.cols, 132);
+        assert_eq!(size.pixel_width, 9);
+        assert_eq!(size.pixel_height, 21);
+    }
+
+    #[test]
+    fn pty_size_without_pixels_preserves_rows_and_cols() {
+        let geometry = TerminalGeometry::new(90, 30, 1024, 768, 8, 19).expect("geometry");
+
+        let size = pty_size_without_pixels(geometry);
+
+        assert_eq!(size.rows, 30);
+        assert_eq!(size.cols, 90);
+        assert_eq!(size.pixel_width, 0);
+        assert_eq!(size.pixel_height, 0);
+    }
+
+    #[test]
+    fn invalid_value_errors_trigger_pixel_retry() {
+        let error = anyhow::anyhow!(std::io::Error::from_raw_os_error(22));
+
+        assert!(should_retry_without_pixels(&error));
+    }
+
+    #[cfg(unix)]
+    fn test_shell() -> String {
+        if Path::new("/bin/sh").exists() {
+            "/bin/sh".to_string()
+        } else {
+            env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+        }
+    }
+
+    #[cfg(unix)]
+    fn test_echo_program() -> String {
+        if Path::new("/bin/cat").exists() {
+            "/bin/cat".to_string()
+        } else {
+            test_shell()
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_condition(
+        session: &dyn TerminalSession,
+        notify_rx: &Option<mpsc::Receiver<()>>,
+        timeout: Duration,
+        predicate: impl Fn(&dyn TerminalSession) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if predicate(session) {
+                return true;
+            }
+
+            if let Some(rx) = notify_rx {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let _ = rx.recv_timeout(remaining.min(Duration::from_millis(50)));
+            } else {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        predicate(session)
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        output: Mutex<Vec<u8>>,
+    }
+
+    impl RecordingSink {
+        fn output_contains(&self, needle: &str) -> bool {
+            let bytes = self.output.lock().expect("output poisoned");
+            String::from_utf8_lossy(&bytes).contains(needle)
+        }
+    }
+
+    impl TerminalTranscriptSink for RecordingSink {
+        fn record(&self, event: TranscriptEvent) {
+            if matches!(event.stream, TranscriptStream::Output) {
+                self.output
+                    .lock()
+                    .expect("output poisoned")
+                    .extend_from_slice(&event.bytes);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_local_session_does_not_enter_startup_error() {
+        let session = LocalSessionFactory
+            .spawn(Some(&test_shell()), Arc::new(NoopTranscriptSink))
+            .expect("spawn local session");
+        let notify_rx = session.take_notify_rx();
+
+        assert!(wait_for_condition(
+            &session,
+            &notify_rx,
+            Duration::from_secs(2),
+            |session| session.summary().exit_status.as_deref() != Some("startup error"),
+        ));
+        assert_ne!(
+            session.summary().exit_status.as_deref(),
+            Some("startup error")
+        );
+
+        let _ = session.send_input(b"exit\n".to_vec());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_session_accepts_immediate_resize_with_ui_geometry() {
+        let session = LocalSessionFactory
+            .spawn(Some(&test_shell()), Arc::new(NoopTranscriptSink))
+            .expect("spawn local session");
+        let notify_rx = session.take_notify_rx();
+        let ui_geometry = TerminalGeometry::new(123, 41, 988, 788, 8, 19).expect("ui geometry");
+
+        session.resize(ui_geometry).expect("queue resize");
+
+        assert!(wait_for_condition(
+            &session,
+            &notify_rx,
+            Duration::from_secs(2),
+            |session| session.summary().exit_status.as_deref() != Some("startup error"),
+        ));
+        assert_ne!(
+            session.summary().exit_status.as_deref(),
+            Some("startup error")
+        );
+
+        let _ = session.send_input(b"exit\n".to_vec());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_session_echo_round_trip_works() {
+        let sink = Arc::new(RecordingSink::default());
+        let session = LocalSessionFactory
+            .spawn(Some(&test_echo_program()), sink.clone())
+            .expect("spawn local session");
+        let notify_rx = session.take_notify_rx();
+        let marker = "__SEANCE_LOCAL_ECHO__";
+
+        session
+            .send_input(format!("{marker}\n").into_bytes())
+            .expect("send input");
+
+        assert!(wait_for_condition(
+            &session,
+            &notify_rx,
+            Duration::from_secs(3),
+            |_| sink.output_contains(marker),
+        ));
     }
 }

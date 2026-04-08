@@ -1,0 +1,13 @@
+[package]
+name = "seance-sync-protocol"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+seance-vault = { path = "../seance-vault" }
+
+[dev-dependencies]
+serde_json = "1.0"

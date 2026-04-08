@@ -52,6 +52,90 @@ pub struct SshConnectResult {
     pub sftp: SftpBootstrapHandle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshPortForwardMode {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortForwardStatus {
+    Starting,
+    Running,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct SshPortForwardRequest {
+    pub id: String,
+    pub vault_id: String,
+    pub forward_id: String,
+    pub host_id: String,
+    pub label: String,
+    pub host_label: String,
+    pub mode: SshPortForwardMode,
+    pub listen_address: String,
+    pub listen_port: u16,
+    pub target_address: String,
+    pub target_port: u16,
+    pub connection: SshConnectionConfig,
+    pub auth_order: Vec<ResolvedAuthMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForwardRuntimeSnapshot {
+    pub id: String,
+    pub vault_id: String,
+    pub forward_id: String,
+    pub host_id: String,
+    pub label: String,
+    pub host_label: String,
+    pub mode: SshPortForwardMode,
+    pub status: PortForwardStatus,
+    pub listen_address: String,
+    pub listen_port: u16,
+    pub target_address: String,
+    pub target_port: u16,
+    pub opened_at: Option<i64>,
+    pub active_connections: usize,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct SshPortForwardHandle {
+    cancel_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl std::fmt::Debug for SshPortForwardHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshPortForwardHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SshPortForwardHandle {
+    pub(crate) fn new(cancel_tx: oneshot::Sender<()>) -> Self {
+        Self {
+            cancel_tx: Arc::new(Mutex::new(Some(cancel_tx))),
+        }
+    }
+
+    pub fn abort(&self) -> bool {
+        let Some(cancel_tx) = self
+            .cancel_tx
+            .lock()
+            .expect("SSH port forward handle poisoned")
+            .take()
+        else {
+            return false;
+        };
+
+        cancel_tx.send(()).is_ok()
+    }
+}
+
 pub struct SshConnectTask {
     pub session_id: u64,
     pub result_rx: Receiver<std::result::Result<SshConnectResult, SshError>>,
@@ -111,4 +195,12 @@ pub enum SshError {
     SftpNotConnected,
     #[error("SFTP operation failed: {0}")]
     SftpOperation(String),
+    #[error("port forward {0} is already running")]
+    PortForwardAlreadyRunning(String),
+    #[error("port forward listener failed: {0}")]
+    PortForwardBind(String),
+    #[error("port forward target connect failed: {0}")]
+    PortForwardTargetConnect(String),
+    #[error("port forward channel open failed: {0}")]
+    PortForwardChannel(String),
 }

@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex, mpsc::Receiver};
 
 use anyhow::{Result, anyhow};
 use seance_terminal::{
-    SessionPerfSnapshot, SessionSnapshot, SharedSessionState, TerminalGeometry, TerminalSession,
+    SessionPerfSnapshot, SessionSummary, SharedSessionState, TerminalGeometry,
+    TerminalScrollCommand, TerminalSession, TerminalViewportSnapshot,
 };
 use tokio::sync::mpsc;
 
@@ -10,6 +11,8 @@ use tokio::sync::mpsc;
 pub(crate) enum SessionCommand {
     Input(Vec<u8>),
     Resize(TerminalGeometry),
+    ScrollViewport(TerminalScrollCommand),
+    ScrollToBottom,
 }
 
 pub struct SshSessionHandle {
@@ -56,8 +59,12 @@ impl TerminalSession for SshSessionHandle {
         &self.title
     }
 
-    fn snapshot(&self) -> SessionSnapshot {
-        self.state.snapshot()
+    fn summary(&self) -> SessionSummary {
+        self.state.summary()
+    }
+
+    fn viewport_snapshot(&self) -> TerminalViewportSnapshot {
+        self.state.viewport_snapshot()
     }
 
     fn send_input(&self, bytes: Vec<u8>) -> Result<()> {
@@ -70,6 +77,18 @@ impl TerminalSession for SshSessionHandle {
         self.command_tx
             .send(SessionCommand::Resize(geometry))
             .map_err(|_| anyhow!("failed to forward resize to SSH session"))
+    }
+
+    fn scroll_viewport(&self, command: TerminalScrollCommand) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::ScrollViewport(command))
+            .map_err(|_| anyhow!("failed to forward viewport scroll to SSH session"))
+    }
+
+    fn scroll_to_bottom(&self) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::ScrollToBottom)
+            .map_err(|_| anyhow!("failed to forward viewport bottom command to SSH session"))
     }
 
     fn perf_snapshot(&self) -> SessionPerfSnapshot {

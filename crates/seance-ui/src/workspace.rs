@@ -1,30 +1,31 @@
 // Owns non-render workspace coordination, input handling, config/update snapshots, and terminal state.
 
-use std::{sync::Arc, time::Instant};
+use std::{sync::Arc, time::Duration};
 
-use gpui::{App, Context, FocusHandle, Focusable, KeyDownEvent, Window, font, point, px};
+use gpui::{
+    App, Context, FocusHandle, Focusable, KeyDownEvent, ScrollDelta, ScrollWheelEvent, Window,
+    point, px,
+};
 use seance_config::AppConfig;
-use seance_core::UpdateState;
-use seance_terminal::TerminalGeometry;
+use seance_core::{UpdateState, VaultUiSnapshot};
+use seance_terminal::{TerminalScreenKind, TerminalScrollCommand};
 use seance_vault::{SecretString, UnlockMethod};
-use tracing::trace;
 
 use crate::{
     app::{InitialWorkspaceAction, refresh_app_menus},
     forms::{
         CredentialDraftField, HostDraftField, SecureInputTarget, SecureSection, SettingsSection,
-        UnlockMode, VaultModalOrigin, WorkspaceSurface,
+        TunnelDraftField, UnlockMode, VaultModalOrigin, WorkspaceSurface,
     },
-    model::{SeanceWorkspace, TerminalMetrics, TerminalRendererMetrics},
+    model::SeanceWorkspace,
     palette::{
         PageDirection, PaletteAction, PaletteViewModel, build_items, flatten_items,
         page_target_index,
     },
-    perf::{RedrawReason, UiPerfMode},
+    perf::RedrawReason,
     surface::ShapeCache,
-    terminal_paint::build_terminal_surface_rows,
     theme::Theme,
-    ui_components::{compute_terminal_geometry, theme_id_from_config, update_status_label},
+    ui_components::{theme_id_from_config, update_status_label},
 };
 
 const SCOPE_KEY_SEPARATOR: &str = "::";
@@ -42,6 +43,313 @@ pub(crate) fn split_scope_key(scope_key: &str) -> Option<(&str, &str)> {
 }
 
 impl SeanceWorkspace {
+    fn current_vault_ui_snapshot(&self) -> VaultUiSnapshot {
+        VaultUiSnapshot {
+            managed_vaults: self.backend.list_vaults(),
+            saved_hosts: self.backend.list_hosts().unwrap_or_default(),
+            cached_credentials: self.backend.list_password_credentials().unwrap_or_default(),
+            cached_keys: self.backend.list_private_keys().unwrap_or_default(),
+            cached_port_forwards: self.backend.list_port_forwards().unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn refresh_vault_ui(&mut self, cx: &mut Context<Self>) {
+        self.apply_vault_snapshot(self.current_vault_ui_snapshot(), cx);
+    }
+
+    fn has_unlocked_vault(&self, vault_id: &str) -> bool {
+        self.managed_vaults
+            .iter()
+            .any(|vault| vault.vault_id == vault_id && vault.unlocked)
+    }
+
+    pub(crate) fn saved_host_exists(&self, vault_id: &str, host_id: &str) -> bool {
+        self.saved_hosts
+            .iter()
+            .any(|host| host.vault_id == vault_id && host.host.id == host_id)
+    }
+
+    pub(crate) fn saved_tunnel_exists(&self, vault_id: &str, tunnel_id: &str) -> bool {
+        self.cached_port_forwards
+            .iter()
+            .any(|tunnel| tunnel.vault_id == vault_id && tunnel.port_forward.id == tunnel_id)
+    }
+
+    fn saved_credential_exists(&self, vault_id: &str, credential_id: &str) -> bool {
+        self.cached_credentials.iter().any(|credential| {
+            credential.vault_id == vault_id && credential.credential.id == credential_id
+        })
+    }
+
+    fn saved_key_exists(&self, vault_id: &str, key_id: &str) -> bool {
+        self.cached_keys
+            .iter()
+            .any(|key| key.vault_id == vault_id && key.key.id == key_id)
+    }
+
+    fn reconcile_saved_selection_state(&mut self) {
+        if self.selected_host_id.as_deref().is_some_and(|scope_key| {
+            split_scope_key(scope_key)
+                .map(|(vault_id, host_id)| !self.saved_host_exists(vault_id, host_id))
+                .unwrap_or(true)
+        }) {
+            self.selected_host_id = self
+                .saved_hosts
+                .first()
+                .map(|host| host_scope_key(&host.vault_id, &host.host.id));
+        }
+
+        if self
+            .secure
+            .selected_host_id
+            .as_deref()
+            .is_some_and(|scope_key| {
+                split_scope_key(scope_key)
+                    .map(|(vault_id, host_id)| !self.saved_host_exists(vault_id, host_id))
+                    .unwrap_or(true)
+            })
+        {
+            self.secure.selected_host_id = None;
+        }
+
+        if self
+            .secure
+            .selected_tunnel_id
+            .as_deref()
+            .is_some_and(|scope_key| {
+                split_scope_key(scope_key)
+                    .map(|(vault_id, tunnel_id)| !self.saved_tunnel_exists(vault_id, tunnel_id))
+                    .unwrap_or(true)
+            })
+        {
+            self.secure.selected_tunnel_id = None;
+        }
+
+        if self
+            .secure
+            .selected_credential_id
+            .as_deref()
+            .is_some_and(|scope_key| {
+                split_scope_key(scope_key)
+                    .map(|(vault_id, credential_id)| {
+                        !self.saved_credential_exists(vault_id, credential_id)
+                    })
+                    .unwrap_or(true)
+            })
+        {
+            self.secure.selected_credential_id = None;
+        }
+
+        if self
+            .secure
+            .selected_key_id
+            .as_deref()
+            .is_some_and(|scope_key| {
+                split_scope_key(scope_key)
+                    .map(|(vault_id, key_id)| !self.saved_key_exists(vault_id, key_id))
+                    .unwrap_or(true)
+            })
+        {
+            self.secure.selected_key_id = None;
+        }
+    }
+
+    fn reconcile_host_draft_after_vault_snapshot(&mut self) {
+        let Some((vault_id, host_id)) = self
+            .secure
+            .host_draft
+            .as_ref()
+            .map(|draft| (draft.vault_id.clone(), draft.host_id.clone()))
+        else {
+            return;
+        };
+        let Some(vault_id) = vault_id else {
+            return;
+        };
+
+        if !self.has_unlocked_vault(&vault_id) {
+            self.secure.host_draft = None;
+            self.secure.selected_host_id = None;
+            self.show_toast("Host editor closed because its vault is no longer available.");
+            return;
+        }
+
+        let Some(host_id) = host_id else {
+            return;
+        };
+
+        if self.saved_host_exists(&vault_id, &host_id) {
+            return;
+        }
+
+        let Some(draft) = self.secure.host_draft.as_mut() else {
+            return;
+        };
+        draft.host_id = None;
+        draft.dirty = true;
+        draft.error = Some(
+            "This saved item was deleted from the vault. Saving will create a new record.".into(),
+        );
+        self.secure.selected_host_id = None;
+        self.show_toast("Saved host was deleted from the vault. Editing a new copy.");
+    }
+
+    fn reconcile_tunnel_draft_after_vault_snapshot(&mut self) {
+        let Some((vault_id, tunnel_id)) = self
+            .secure
+            .tunnel_draft
+            .as_ref()
+            .map(|draft| (draft.vault_id.clone(), draft.port_forward_id.clone()))
+        else {
+            return;
+        };
+        let Some(vault_id) = vault_id else {
+            return;
+        };
+
+        if !self.has_unlocked_vault(&vault_id) {
+            self.secure.tunnel_draft = None;
+            self.secure.selected_tunnel_id = None;
+            self.show_toast("Tunnel editor closed because its vault is no longer available.");
+            return;
+        }
+
+        let Some(tunnel_id) = tunnel_id else {
+            return;
+        };
+
+        if self.saved_tunnel_exists(&vault_id, &tunnel_id) {
+            return;
+        }
+
+        let Some(draft) = self.secure.tunnel_draft.as_mut() else {
+            return;
+        };
+        draft.port_forward_id = None;
+        draft.dirty = true;
+        draft.error = Some(
+            "This saved item was deleted from the vault. Saving will create a new record.".into(),
+        );
+        self.secure.selected_tunnel_id = None;
+        self.show_toast("Saved tunnel was deleted from the vault. Editing a new copy.");
+    }
+
+    fn reconcile_credential_draft_after_vault_snapshot(&mut self) {
+        let Some((vault_id, credential_id)) = self
+            .secure
+            .credential_draft
+            .as_ref()
+            .map(|draft| (draft.vault_id.clone(), draft.credential_id.clone()))
+        else {
+            return;
+        };
+        let Some(vault_id) = vault_id else {
+            return;
+        };
+
+        if !self.has_unlocked_vault(&vault_id) {
+            self.secure.credential_draft = None;
+            self.secure.selected_credential_id = None;
+            self.show_toast("Credential editor closed because its vault is no longer available.");
+            return;
+        }
+
+        let Some(credential_id) = credential_id else {
+            return;
+        };
+
+        if self.saved_credential_exists(&vault_id, &credential_id) {
+            return;
+        }
+
+        let Some(draft) = self.secure.credential_draft.as_mut() else {
+            return;
+        };
+        draft.credential_id = None;
+        draft.dirty = true;
+        draft.error = Some(
+            "This saved item was deleted from the vault. Saving will create a new record.".into(),
+        );
+        self.secure.selected_credential_id = None;
+        self.show_toast("Saved credential was deleted from the vault. Editing a new copy.");
+    }
+
+    pub(crate) fn handle_terminal_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.active_session() else {
+            return;
+        };
+        let summary = session.summary();
+        if matches!(summary.active_screen, TerminalScreenKind::Alternate) || summary.mouse_tracking
+        {
+            return;
+        }
+
+        let line_height = self
+            .terminal_metrics
+            .map(|metrics| metrics.line_height_px)
+            .unwrap_or_else(|| self.terminal_line_height_px());
+        let delta_y = match event.delta {
+            ScrollDelta::Pixels(delta) => f32::from(delta.y),
+            ScrollDelta::Lines(delta) => delta.y * line_height,
+        };
+        let delta_rows = if delta_y.abs() < f32::EPSILON {
+            0
+        } else {
+            (-(delta_y / line_height).round()) as isize
+        };
+        if delta_rows == 0 {
+            return;
+        }
+
+        let _ = session.scroll_viewport(TerminalScrollCommand::DeltaRows(delta_rows));
+        self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
+        cx.notify();
+    }
+
+    fn handle_terminal_scrollback_key(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session) = self.active_session() else {
+            return false;
+        };
+        let summary = session.summary();
+        if matches!(summary.active_screen, TerminalScreenKind::Alternate) {
+            return false;
+        }
+
+        let modifiers = event.keystroke.modifiers;
+        if !modifiers.shift {
+            return false;
+        }
+
+        let command = match event.keystroke.key.as_str() {
+            "pageup" => Some(TerminalScrollCommand::PageUp),
+            "pagedown" => Some(TerminalScrollCommand::PageDown),
+            "home" => Some(TerminalScrollCommand::Top),
+            "end" => Some(TerminalScrollCommand::Bottom),
+            _ => None,
+        };
+        let Some(command) = command else {
+            return false;
+        };
+
+        let result = match command {
+            TerminalScrollCommand::Bottom => session.scroll_to_bottom(),
+            _ => session.scroll_viewport(command),
+        };
+        if result.is_ok() {
+            self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
+            cx.notify();
+        }
+        true
+    }
+
     pub(crate) fn apply_initial_action(
         &mut self,
         action: InitialWorkspaceAction,
@@ -74,6 +382,7 @@ impl SeanceWorkspace {
         self.config.terminal.line_height_px
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn apply_config_snapshot(
         &mut self,
         config: AppConfig,
@@ -104,12 +413,13 @@ impl SeanceWorkspace {
         }
 
         if self.perf_mode_env_override.is_none() {
-            self.perf_overlay.mode = self.config.debug.perf_hud_default.into();
+            self.apply_perf_mode(self.config.debug.perf_hud_default.into(), window, cx);
         }
 
         cx.notify();
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn apply_update_state_snapshot(
         &mut self,
         next_state: UpdateState,
@@ -136,72 +446,40 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
-    pub(crate) fn terminal_metrics(&mut self, window: &Window) -> TerminalMetrics {
-        if let Some(metrics) = self.terminal_metrics {
-            return metrics;
-        }
-
-        let font_family = self.config.terminal.font_family.clone();
-        let font_size_px = self.terminal_font_size_px();
-        let line_height_px = self.terminal_line_height_px();
-        let font_size = px(font_size_px);
-        let font_id = window.text_system().resolve_font(&font(font_family));
-        let cell_width_px = window
-            .text_system()
-            .ch_advance(font_id, font_size)
-            .map(f32::from)
-            .unwrap_or(8.0)
-            .ceil()
-            .max(1.0);
-        let line_height_px = line_height_px.ceil().max(1.0);
-        let metrics = TerminalMetrics {
-            cell_width_px,
-            cell_height_px: line_height_px,
-            line_height_px,
-            font_size_px,
-        };
-        trace!(?metrics, "measured terminal metrics");
-        self.terminal_metrics = Some(metrics);
-        metrics
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn apply_tunnel_state_snapshot(
+        &mut self,
+        snapshots: Vec<seance_ssh::PortForwardRuntimeSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_port_forwards = snapshots;
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
     }
 
-    pub(crate) fn apply_active_terminal_geometry(&mut self, window: &Window) {
-        let Some(session) = self.active_session() else {
-            self.last_applied_geometry = None;
-            self.active_terminal_rows = TerminalGeometry::default().size.rows as usize;
-            return;
-        };
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn apply_vault_snapshot(
+        &mut self,
+        snapshot: VaultUiSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        self.managed_vaults = snapshot.managed_vaults;
+        self.saved_hosts = snapshot.saved_hosts;
+        self.cached_credentials = snapshot.cached_credentials;
+        self.cached_keys = snapshot.cached_keys;
+        self.cached_port_forwards = snapshot.cached_port_forwards;
 
-        let metrics = self.terminal_metrics(window);
-        let geometry =
-            compute_terminal_geometry(window.viewport_size(), metrics, self.sidebar_width)
-                .unwrap_or_else(TerminalGeometry::default);
-        self.active_terminal_rows = geometry.size.rows as usize;
+        self.reconcile_saved_selection_state();
+        self.reconcile_host_draft_after_vault_snapshot();
+        self.reconcile_tunnel_draft_after_vault_snapshot();
+        self.reconcile_credential_draft_after_vault_snapshot();
 
-        if self.last_applied_geometry == Some(geometry) {
-            trace!(?geometry, "skipping unchanged UI terminal geometry");
-            return;
-        }
-
-        trace!(
-            ?geometry,
-            session_id = session.id(),
-            "computed UI terminal geometry"
-        );
-        if let Err(error) = session.resize(geometry) {
-            trace!(
-                ?geometry,
-                session_id = session.id(),
-                error = %error,
-                "failed to apply terminal geometry"
-            );
-            return;
-        }
-
-        self.last_applied_geometry = Some(geometry);
-        self.invalidate_terminal_surface();
+        refresh_app_menus(cx);
+        self.perf_overlay.mark_input(RedrawReason::UiRefresh);
+        cx.notify();
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn schedule_config_watcher(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -235,6 +513,41 @@ impl SeanceWorkspace {
             .detach();
     }
 
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn schedule_vault_watcher(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        entity: gpui::Entity<Self>,
+        vault_rx: std::sync::mpsc::Receiver<VaultUiSnapshot>,
+    ) {
+        let vault_rx = Arc::new(std::sync::Mutex::new(vault_rx));
+        window
+            .spawn(cx, async move |cx| {
+                loop {
+                    let rx = Arc::clone(&vault_rx);
+                    let next_snapshot = cx
+                        .background_executor()
+                        .spawn(async move { rx.lock().unwrap().recv().ok() })
+                        .await;
+                    let Some(mut next_snapshot) = next_snapshot else {
+                        break;
+                    };
+                    while let Ok(snapshot) = vault_rx.lock().unwrap().try_recv() {
+                        next_snapshot = snapshot;
+                    }
+                    let entity = entity.clone();
+                    let _ = cx.update(move |window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.apply_vault_snapshot(next_snapshot, cx);
+                        });
+                        window.refresh();
+                    });
+                }
+            })
+            .detach();
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn schedule_update_watcher(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -268,90 +581,68 @@ impl SeanceWorkspace {
             .detach();
     }
 
-    pub(crate) fn take_terminal_refresh_request(&mut self) -> bool {
-        let Some(session) = self.active_session() else {
-            return false;
-        };
-
-        let session_perf = session.perf_snapshot();
-        self.perf_overlay.active_session_perf_snapshot = Some(session_perf.clone());
-        if !session_perf.dirty_since_last_ui_frame {
-            return false;
-        }
-
-        self.perf_overlay.mark_terminal_refresh_request(
-            Instant::now(),
-            RedrawReason::TerminalUpdate,
-            Some(session_perf),
-        );
-        true
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn schedule_tunnel_state_watcher(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        entity: gpui::Entity<Self>,
+        tunnel_rx: std::sync::mpsc::Receiver<Vec<seance_ssh::PortForwardRuntimeSnapshot>>,
+    ) {
+        let tunnel_rx = Arc::new(std::sync::Mutex::new(tunnel_rx));
+        window
+            .spawn(cx, async move |cx| {
+                loop {
+                    let rx = Arc::clone(&tunnel_rx);
+                    let next_state = cx
+                        .background_executor()
+                        .spawn(async move { rx.lock().unwrap().recv().ok() })
+                        .await;
+                    let Some(mut next_state) = next_state else {
+                        break;
+                    };
+                    while let Ok(state) = tunnel_rx.lock().unwrap().try_recv() {
+                        next_state = state;
+                    }
+                    let entity = entity.clone();
+                    let _ = cx.update(move |_window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.apply_tunnel_state_snapshot(next_state, cx);
+                        });
+                    });
+                }
+            })
+            .detach();
     }
 
-    pub(crate) fn invalidate_terminal_surface(&mut self) {
-        self.terminal_surface.snapshot_seq = 0;
-        self.terminal_surface.geometry = None;
-    }
-
-    pub(crate) fn sync_terminal_surface(&mut self, window: &mut Window) {
-        let Some(session) = self.active_session() else {
-            self.terminal_surface.rows.clear();
-            self.terminal_surface.metrics = TerminalRendererMetrics::default();
-            self.terminal_surface.active_session_id = 0;
-            self.terminal_surface.geometry = None;
-            return;
-        };
-
-        let metrics = self.terminal_metrics(window);
-        let geometry = self
-            .last_applied_geometry
-            .unwrap_or_else(TerminalGeometry::default);
-        let snapshot_seq = self
-            .perf_overlay
-            .active_session_perf_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.terminal.snapshot_seq)
-            .unwrap_or(0);
-        let needs_rebuild = self.terminal_surface.active_session_id != session.id()
-            || self.terminal_surface.snapshot_seq != snapshot_seq
-            || self.terminal_surface.geometry != Some(geometry)
-            || self.terminal_surface.theme_id != self.active_theme
-            || self.terminal_surface.rows.is_empty();
-
-        if !needs_rebuild {
-            return;
-        }
-
-        let snapshot = session.snapshot();
-        let font_family = self.config.terminal.font_family.clone();
-        let (rows, metrics_report) = build_terminal_surface_rows(
-            &snapshot.rows,
-            geometry,
-            metrics,
-            self.active_theme,
-            &self.theme(),
-            font_family,
-            &mut self.terminal_surface.shape_cache,
-            window,
-        );
-
-        self.terminal_surface.rows = rows;
-        self.terminal_surface.metrics = metrics_report;
-        self.terminal_surface.active_session_id = session.id();
-        self.terminal_surface.snapshot_seq = snapshot_seq;
-        self.terminal_surface.geometry = Some(geometry);
-        self.terminal_surface.theme_id = self.active_theme;
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn schedule_tunnel_animation(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        entity: gpui::Entity<Self>,
+    ) {
+        window
+            .spawn(cx, async move |cx| {
+                loop {
+                    cx.background_executor()
+                        .spawn(async move {
+                            std::thread::sleep(Duration::from_millis(250));
+                        })
+                        .await;
+                    let _ = cx.update(|_window, cx| {
+                        entity.update(cx, |this, cx| {
+                            if !this.active_port_forwards.is_empty() {
+                                cx.notify();
+                            }
+                        });
+                    });
+                }
+            })
+            .detach();
     }
 
     pub(crate) fn toggle_perf_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let next_mode = self.perf_overlay.mode.next();
-        if matches!(self.perf_overlay.mode, UiPerfMode::Off) && next_mode.is_enabled() {
-            self.perf_overlay.reset_sampling_window();
-        }
-        self.perf_overlay.mode = next_mode;
-        self.perf_overlay
-            .mark_ui_refresh_request(Instant::now(), RedrawReason::UiRefresh);
-        window.refresh();
-        cx.notify();
+        self.apply_perf_mode(next_mode, window, cx);
     }
 
     pub(crate) fn open_vault_modal(
@@ -434,8 +725,7 @@ impl SeanceWorkspace {
                             } else {
                                 "Encrypted vault created."
                             });
-                            self.refresh_saved_hosts();
-                            self.refresh_vault_cache();
+                            self.refresh_vault_ui(cx);
                         }
                         Err(err) => self.vault_modal.error = Some(err.to_string()),
                     }
@@ -449,8 +739,7 @@ impl SeanceWorkspace {
                             Ok(_) => {
                                 self.vault_modal.close();
                                 self.show_toast("Vault renamed.");
-                                self.refresh_saved_hosts();
-                                self.refresh_vault_cache();
+                                self.refresh_vault_ui(cx);
                             }
                             Err(err) => self.vault_modal.error = Some(err.to_string()),
                         }
@@ -469,8 +758,7 @@ impl SeanceWorkspace {
                         Ok(true) => {
                             self.vault_modal.close();
                             self.show_toast("Vault unlocked from device credentials.");
-                            self.refresh_saved_hosts();
-                            self.refresh_vault_cache();
+                            self.refresh_vault_ui(cx);
                         }
                         Ok(false) => {
                             self.vault_modal.unlock_method = UnlockMethod::Passphrase;
@@ -506,8 +794,7 @@ impl SeanceWorkspace {
                                     Ok(()) => {
                                         self.vault_modal.close();
                                         self.show_toast("Vault unlocked.");
-                                        self.refresh_saved_hosts();
-                                        self.refresh_vault_cache();
+                                        self.refresh_vault_ui(cx);
                                     }
                                     Err(err) => self.vault_modal.error = Some(err.to_string()),
                                 }
@@ -538,13 +825,7 @@ impl SeanceWorkspace {
         {
             let _ = self.backend.lock_vault(&vault);
         }
-        self.refresh_managed_vaults();
-        self.saved_hosts.clear();
-        self.cached_credentials.clear();
-        self.cached_keys.clear();
-        self.selected_host_id = None;
-        self.secure.host_draft = None;
-        self.secure.credential_draft = None;
+        self.refresh_vault_ui(cx);
         self.confirm_dialog = None;
         self.surface = WorkspaceSurface::Terminal;
         self.vault_modal.open(
@@ -584,6 +865,8 @@ impl SeanceWorkspace {
             &self.connect_attempts.pending_summaries(),
             &self.cached_credentials,
             &self.cached_keys,
+            &self.cached_port_forwards,
+            &self.active_port_forwards,
             self.active_session_id,
             self.active_theme,
             &self.palette_query,
@@ -663,10 +946,10 @@ impl SeanceWorkspace {
             PaletteAction::InstallAvailableUpdate => {
                 self.install_available_update(cx);
             }
-            PaletteAction::SwitchSession(id) => self.select_session(id, cx),
+            PaletteAction::SwitchSession(id) => self.select_session(id, window, cx),
             PaletteAction::CloseActiveSession => {
                 let id = self.active_session_id;
-                self.close_session(id, cx);
+                self.close_session(id, window, cx);
             }
             PaletteAction::SwitchTheme(tid) => {
                 self.persist_theme(tid, window, cx);
@@ -767,6 +1050,47 @@ impl SeanceWorkspace {
                 self.open_sftp_browser(session_id, cx);
                 return;
             }
+            PaletteAction::OpenTunnelManager => {
+                self.open_secure_workspace(SecureSection::Tunnels, cx);
+                if self.secure.selected_tunnel_id.is_none() {
+                    if let Some(first_tunnel) = self.cached_port_forwards.first() {
+                        self.begin_edit_tunnel(
+                            &item_scope_key(&first_tunnel.vault_id, &first_tunnel.port_forward.id),
+                            cx,
+                        );
+                    } else {
+                        self.begin_add_tunnel(cx);
+                    }
+                }
+                return;
+            }
+            PaletteAction::OpenHostTunnelSettings { vault_id, host_id } => {
+                self.activate_host_draft(Some(&host_scope_key(&vault_id, &host_id)), cx);
+                return;
+            }
+            PaletteAction::StartTunnel {
+                vault_id,
+                port_forward_id,
+            } => {
+                self.start_saved_tunnel(&item_scope_key(&vault_id, &port_forward_id), cx);
+                self.palette_open = false;
+                self.palette_query.clear();
+                self.palette_selected = 0;
+                self.reset_palette_scroll_to_top();
+                self.perf_overlay.mark_input(RedrawReason::Palette);
+                cx.notify();
+                return;
+            }
+            PaletteAction::StopTunnel { tunnel_scope_key } => {
+                self.stop_saved_tunnel(&tunnel_scope_key, cx);
+                self.palette_open = false;
+                self.palette_query.clear();
+                self.palette_selected = 0;
+                self.reset_palette_scroll_to_top();
+                self.perf_overlay.mark_input(RedrawReason::Palette);
+                cx.notify();
+                return;
+            }
             PaletteAction::OpenPreferences => {
                 self.open_settings_panel(SettingsSection::General, cx);
                 return;
@@ -822,9 +1146,17 @@ impl SeanceWorkspace {
             return;
         }
 
+        if self.handle_terminal_scrollback_key(event, cx) {
+            return;
+        }
+
         if let Some(bytes) = encode_keystroke(event)
             && let Some(session) = self.active_session()
         {
+            let summary = session.summary();
+            if matches!(summary.active_screen, TerminalScreenKind::Primary) && !summary.at_bottom {
+                let _ = session.scroll_to_bottom();
+            }
             let _ = session.send_input(bytes);
         }
         self.perf_overlay.mark_input(RedrawReason::Input);
@@ -1004,6 +1336,8 @@ impl SeanceWorkspace {
         if modifiers.platform && key == "s" {
             if self.secure.host_draft.is_some() {
                 self.save_host_draft(cx);
+            } else if self.secure.tunnel_draft.is_some() {
+                self.save_tunnel_draft(cx);
             } else if self.secure.credential_draft.is_some() {
                 self.save_credential_draft(cx);
             }
@@ -1020,6 +1354,8 @@ impl SeanceWorkspace {
             "enter" => {
                 if self.secure.host_draft.is_some() {
                     self.save_host_draft(cx);
+                } else if self.secure.tunnel_draft.is_some() {
+                    self.save_tunnel_draft(cx);
                 } else if self.secure.credential_draft.is_some() {
                     self.save_credential_draft(cx);
                 }
@@ -1075,6 +1411,22 @@ impl SeanceWorkspace {
                 draft.selected_field = CredentialDraftField::ALL[next];
                 SecureInputTarget::CredentialDraft(draft.selected_field)
             }
+            SecureSection::Tunnels => {
+                let Some(draft) = self.secure.tunnel_draft.as_mut() else {
+                    return;
+                };
+                let position = TunnelDraftField::ALL
+                    .iter()
+                    .position(|field| *field == draft.selected_field)
+                    .unwrap_or(0);
+                let next = if backward {
+                    (position + TunnelDraftField::ALL.len() - 1) % TunnelDraftField::ALL.len()
+                } else {
+                    (position + 1) % TunnelDraftField::ALL.len()
+                };
+                draft.selected_field = TunnelDraftField::ALL[next];
+                SecureInputTarget::TunnelDraft(draft.selected_field)
+            }
             SecureSection::Keys => SecureInputTarget::KeySearch,
         };
     }
@@ -1083,6 +1435,9 @@ impl SeanceWorkspace {
         match self.secure.input_target {
             SecureInputTarget::HostSearch => {
                 self.secure.host_search.pop();
+            }
+            SecureInputTarget::TunnelSearch => {
+                self.secure.tunnel_search.pop();
             }
             SecureInputTarget::CredentialSearch => {
                 self.secure.credential_search.pop();
@@ -1112,12 +1467,39 @@ impl SeanceWorkspace {
                     draft.dirty = true;
                 }
             }
+            SecureInputTarget::TunnelDraft(field) => {
+                if let Some(draft) = self.secure.tunnel_draft.as_mut() {
+                    match field {
+                        TunnelDraftField::Label => {
+                            let _ = draft.label.pop();
+                        }
+                        TunnelDraftField::Mode => {}
+                        TunnelDraftField::ListenAddress => {
+                            let _ = draft.listen_address.pop();
+                        }
+                        TunnelDraftField::ListenPort => {
+                            let _ = draft.listen_port.pop();
+                        }
+                        TunnelDraftField::TargetAddress => {
+                            let _ = draft.target_address.pop();
+                        }
+                        TunnelDraftField::TargetPort => {
+                            let _ = draft.target_port.pop();
+                        }
+                        TunnelDraftField::Notes => {
+                            let _ = draft.notes.pop();
+                        }
+                    };
+                    draft.dirty = true;
+                }
+            }
         }
     }
 
     fn push_secure_input(&mut self, text: &str) {
         match self.secure.input_target {
             SecureInputTarget::HostSearch => self.secure.host_search.push_str(text),
+            SecureInputTarget::TunnelSearch => self.secure.tunnel_search.push_str(text),
             SecureInputTarget::CredentialSearch => self.secure.credential_search.push_str(text),
             SecureInputTarget::KeySearch => self.secure.key_search.push_str(text),
             SecureInputTarget::HostDraft(field) => {
@@ -1146,6 +1528,34 @@ impl SeanceWorkspace {
                     draft.dirty = true;
                 }
             }
+            SecureInputTarget::TunnelDraft(field) => {
+                if let Some(draft) = self.secure.tunnel_draft.as_mut() {
+                    match field {
+                        TunnelDraftField::Label => draft.label.push_str(text),
+                        TunnelDraftField::Mode => {
+                            if text.eq_ignore_ascii_case("l") {
+                                draft.mode = seance_vault::PortForwardMode::Local;
+                            } else if text.eq_ignore_ascii_case("r") {
+                                draft.mode = seance_vault::PortForwardMode::Remote;
+                            }
+                        }
+                        TunnelDraftField::ListenAddress => draft.listen_address.push_str(text),
+                        TunnelDraftField::ListenPort => {
+                            if text.chars().all(|value| value.is_ascii_digit()) {
+                                draft.listen_port.push_str(text);
+                            }
+                        }
+                        TunnelDraftField::TargetAddress => draft.target_address.push_str(text),
+                        TunnelDraftField::TargetPort => {
+                            if text.chars().all(|value| value.is_ascii_digit()) {
+                                draft.target_port.push_str(text);
+                            }
+                        }
+                        TunnelDraftField::Notes => draft.notes.push_str(text),
+                    }
+                    draft.dirty = true;
+                }
+            }
         }
     }
 
@@ -1158,13 +1568,7 @@ impl SeanceWorkspace {
         match self.backend.delete_host(vault_id, host_id) {
             Ok(true) => {
                 self.show_toast("Saved host removed.");
-                self.refresh_saved_hosts();
-                if self.secure.host_draft.as_ref().is_some_and(|draft| {
-                    draft.host_id.as_deref() == Some(host_id)
-                        && draft.vault_id.as_deref() == Some(vault_id)
-                }) {
-                    self.secure.host_draft = None;
-                }
+                self.refresh_vault_ui(cx);
             }
             Ok(false) => self.show_toast("Saved host already removed."),
             Err(err) => self.show_toast(err.to_string()),
@@ -1206,6 +1610,10 @@ fn encode_keystroke(event: &KeyDownEvent) -> Option<Vec<u8>> {
         "down" => Some(b"\x1b[B".to_vec()),
         "right" => Some(b"\x1b[C".to_vec()),
         "left" => Some(b"\x1b[D".to_vec()),
+        "home" => Some(b"\x1b[H".to_vec()),
+        "end" => Some(b"\x1b[F".to_vec()),
+        "pageup" => Some(b"\x1b[5~".to_vec()),
+        "pagedown" => Some(b"\x1b[6~".to_vec()),
         _ => key_char.map(|text| text.as_bytes().to_vec()),
     }
 }

@@ -1,0 +1,76 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "seance-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-08",
+  "compatibility_flags": ["nodejs_compat_v2"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "APP_BASE_URL": "http://localhost:8787",
+    "ACCESS_TOKEN_TTL_SECONDS": "900",
+    "MAGIC_LINK_TTL_SECONDS": "900",
+    "REFRESH_TOKEN_TTL_SECONDS": "2592000",
+    "MOQ_ORIGIN": "https://moq.example.invalid",
+    "SYNC_SIGNING_KEY": "change-me-in-production"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "seance-sync",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations/d1"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "SYNC_BLOBS",
+      "bucket_name": "seance-sync-blobs"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "SYNC_EMAIL_OUTBOX",
+        "queue": "seance-sync-email-outbox"
+      },
+      {
+        "binding": "SYNC_JOBS",
+        "queue": "seance-sync-jobs"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "seance-sync-email-outbox",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5
+      },
+      {
+        "queue": "seance-sync-jobs",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5
+      }
+    ]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "VAULT_AUTHORITY",
+        "class_name": "VaultAuthority"
+      },
+      {
+        "name": "ROOM_AUTHORITY",
+        "class_name": "RoomAuthority"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["VaultAuthority", "RoomAuthority"]
+    }
+  ]
+}
+
