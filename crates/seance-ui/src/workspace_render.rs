@@ -1,6 +1,8 @@
 // Owns render-side SeanceWorkspace methods: sidebar, terminal pane, update banner, and overlays.
 
-use gpui::{App, Context, Div, FontWeight, MouseButton, Window, canvas, div, prelude::*, px};
+use gpui::{
+    Context, Div, ElementInputHandler, FontWeight, MouseButton, Window, canvas, div, prelude::*, px,
+};
 use seance_core::UpdateState;
 use std::time::Instant;
 use tracing::trace;
@@ -8,6 +10,7 @@ use tracing::trace;
 use crate::{
     SIDEBAR_FONT_MONO, SIDEBAR_MONO_SIZE_PX, SeanceWorkspace,
     forms::{SettingsSection, UnlockMode},
+    keybindings::command_shortcut,
     model::{TerminalMetrics, ToastState},
     palette::PaletteRow,
     perf::{RedrawReason, UiPerfMode},
@@ -330,8 +333,6 @@ impl SeanceWorkspace {
             .flex_col()
             .justify_between()
             .bg(t.sidebar_bg_elevated)
-            .border_r_1()
-            .border_color(t.sidebar_edge)
             .child(
                 div()
                     .flex_1()
@@ -366,23 +367,73 @@ impl SeanceWorkspace {
     ) -> impl IntoElement {
         let t = self.theme();
 
-        let base = div()
+        let terminal_link_actionable = self
+            .terminal_hovered_link
+            .as_ref()
+            .is_some_and(|link| link.modifier_active);
+
+        let mut base = div()
             .flex_1()
             .h_full()
             .bg(t.bg_void)
             .track_focus(&self.focus_handle)
-            .on_mouse_down(MouseButton::Left, {
-                let fh = self.focus_handle.clone();
-                move |_: &gpui::MouseDownEvent, window: &mut Window, _cx: &mut App| {
-                    window.focus(&fh);
-                }
-            })
+            .key_context("WorkspaceTerminal")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.handle_terminal_mouse_down(event, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.handle_terminal_mouse_down(event, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.handle_terminal_mouse_down(event, window, cx);
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                    this.handle_terminal_mouse_move(event, window, cx);
+                }),
+            )
+            .on_modifiers_changed(cx.listener(
+                |this, event: &gpui::ModifiersChangedEvent, window, cx| {
+                    this.handle_terminal_modifiers_changed(event.modifiers, window, cx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                    this.handle_terminal_mouse_up(event, window, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                    this.handle_terminal_mouse_up(event, window, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                    this.handle_terminal_mouse_up(event, window, cx);
+                }),
+            )
             .on_scroll_wheel(
                 cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
                     this.handle_terminal_scroll_wheel(event, cx);
                 }),
             )
             .on_key_down(cx.listener(Self::handle_key_down));
+
+        if terminal_link_actionable {
+            base = base.cursor_pointer();
+        }
 
         let sessions = self.sessions();
         if sessions.is_empty() || self.active_session().is_none() {
@@ -432,22 +483,62 @@ impl SeanceWorkspace {
         }
 
         self.sync_terminal_surface(window);
+        self.terminal_surface.selection = self.terminal_selection;
         self.perf_overlay.visible_line_count = self.terminal_surface.metrics.visible_rows;
+        let metrics = self.terminal_metrics.unwrap_or(TerminalMetrics {
+            cell_width_px: 8.0,
+            cell_height_px: self.terminal_line_height_px(),
+            line_height_px: self.terminal_line_height_px(),
+            font_size_px: self.terminal_font_size_px(),
+        });
+        let terminal_focused = self.focus_handle.is_focused(window);
+        if !terminal_focused && self.terminal_ime_visible() {
+            self.clear_terminal_ime();
+        }
         let prepared = PreparedTerminalSurface {
             rows: self.terminal_surface.rows.clone(),
-            line_height_px: self
-                .terminal_metrics
-                .unwrap_or(TerminalMetrics {
-                    cell_width_px: 8.0,
-                    cell_height_px: self.terminal_line_height_px(),
-                    line_height_px: self.terminal_line_height_px(),
-                    font_size_px: self.terminal_font_size_px(),
-                })
-                .line_height_px,
+            metrics,
+            cursor: self.terminal_surface.cursor,
+            selection: self.terminal_surface.selection,
+            hovered_link: self.terminal_hovered_link.clone(),
+            terminal_focused,
+            cursor_fallback: t.accent,
+            cursor_dim: t.text_ghost.alpha(0.65),
+            selection_background: t.accent.alpha(0.22),
+            link_hover_background: t.terminal_link_hover_bg,
+            link_hover_underline: t.terminal_link_hover_underline,
+            link_modifier_background: t.terminal_link_modifier_bg,
+            link_modifier_underline: t.terminal_link_modifier_underline,
         };
         let exit_status = self
             .active_session()
             .and_then(|session| session.summary().exit_status);
+        let workspace_entity = cx.entity();
+        let focus_handle = self.focus_handle.clone();
+        let ime_overlay = if terminal_focused && self.terminal_ime_visible() {
+            self.terminal_ime_overlay_position()
+                .map(|(left_px, top_px)| {
+                    div()
+                        .absolute()
+                        .left(px(left_px))
+                        .top(px(top_px))
+                        .max_w_full()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .font_family(self.config.terminal.font_family.clone())
+                                .text_size(px(metrics.font_size_px))
+                                .text_color(t.text_primary)
+                                .border_b_1()
+                                .border_color(t.accent)
+                                .bg(t.glass_strong)
+                                .px(px(1.0))
+                                .child(self.terminal_ime.marked_text.clone()),
+                        )
+                })
+        } else {
+            None
+        };
 
         let mut content = div().flex_1().flex().flex_col().gap(px(12.0));
 
@@ -463,17 +554,84 @@ impl SeanceWorkspace {
             content = content.child(self.render_update_banner(cx));
         }
 
-        content = content.child(
+        let mut terminal_canvas_shell = div().relative().flex_1().child(
             canvas(
                 move |_bounds, _window, _cx| prepared,
                 move |bounds, prepared, window, cx| {
+                    window.handle_input(
+                        &focus_handle,
+                        ElementInputHandler::new(bounds, workspace_entity.clone()),
+                        cx,
+                    );
                     paint_terminal_surface(bounds, prepared, window, cx);
                 },
             )
             .size_full(),
         );
 
-        let mut term = base.p_4().child(content);
+        if let Some(ime_overlay) = ime_overlay {
+            terminal_canvas_shell = terminal_canvas_shell.child(ime_overlay);
+        }
+
+        if let Some(layout) = self.terminal_scrollbar_layout() {
+            let scrollbar_active = terminal_focused
+                || self.terminal_scrollbar_hovered
+                || self.terminal_scrollbar_drag.is_some();
+            let thumb_width_px =
+                if self.terminal_scrollbar_hovered || self.terminal_scrollbar_drag.is_some() {
+                    layout.active_thumb_width_px()
+                } else {
+                    layout.idle_thumb_width_px()
+                };
+            let thumb_color = if self.terminal_scrollbar_drag.is_some() {
+                t.scrollbar_thumb_drag
+            } else if self.terminal_scrollbar_hovered {
+                t.scrollbar_thumb_hover
+            } else {
+                t.scrollbar_thumb_idle
+            };
+            terminal_canvas_shell = terminal_canvas_shell.child(
+                div()
+                    .absolute()
+                    .top(px(layout.gutter_top_px))
+                    .left(px(layout.gutter_left_px))
+                    .w(px(layout.gutter_width_px))
+                    .h(px(layout.gutter_height_px))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(layout.track_top_px - layout.gutter_top_px))
+                            .left(px(layout.track_left_px - layout.gutter_left_px))
+                            .w(px(layout.track_width_px))
+                            .h(px(layout.track_height_px))
+                            .rounded_full()
+                            .bg(if scrollbar_active {
+                                t.scrollbar_track_focus
+                            } else {
+                                t.scrollbar_track
+                            }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(layout.thumb_top_px - layout.gutter_top_px))
+                            .left(px(
+                                layout.thumb_left_px(thumb_width_px) - layout.gutter_left_px
+                            ))
+                            .w(px(thumb_width_px))
+                            .h(px(layout.thumb_height_px))
+                            .rounded_full()
+                            .bg(thumb_color)
+                            .border_1()
+                            .border_color(t.scrollbar_thumb_border)
+                            .shadow_sm(),
+                    ),
+            );
+        }
+
+        content = content.child(terminal_canvas_shell);
+
+        let mut term = base.relative().p_4().child(content);
 
         if let Some(exit_status) = exit_status {
             term = term.child(
@@ -560,7 +718,11 @@ impl SeanceWorkspace {
             .child(actions)
     }
 
-    pub(crate) fn render_palette_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_palette_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let t = self.theme();
         let view_model = self.palette_view_model();
         trace!(
@@ -692,7 +854,9 @@ impl SeanceWorkspace {
 
             let mut right_section = div().flex().items_center().gap_2();
 
-            if let Some(shortcut) = item.shortcut {
+            if let Some(command) = item.shortcut_command
+                && let Some(shortcut) = command_shortcut(window, command)
+            {
                 right_section = right_section.child(
                     div()
                         .px(px(6.0))
@@ -756,25 +920,61 @@ impl SeanceWorkspace {
                             .font_weight(FontWeight::BOLD)
                             .child("/"),
                     )
-                    .child(div().flex_1().flex().items_center().child(
-                        if self.palette_query.is_empty() {
-                            div()
-                                .text_sm()
-                                .text_color(t.text_muted)
-                                .child("Search commands\u{2026}")
-                        } else {
+                    .child(div().flex_1().flex().items_center().child({
+                        let fragments = self
+                            .palette_text_input
+                            .display_fragments(&self.palette_query);
+                        if self.palette_query.is_empty()
+                            && fragments.prefix.is_empty()
+                            && fragments.selected.is_none()
+                            && fragments.suffix.is_empty()
+                        {
                             div()
                                 .flex()
                                 .items_center()
+                                .child(div().w(px(2.0)).h(px(16.0)).mr(px(6.0)).bg(t.accent))
                                 .child(
                                     div()
                                         .text_sm()
-                                        .text_color(t.text_primary)
-                                        .child(self.palette_query.clone()),
+                                        .text_color(t.text_muted)
+                                        .child("Search commands\u{2026}"),
                                 )
-                                .child(div().w(px(2.0)).h(px(16.0)).ml(px(1.0)).bg(t.accent))
-                        },
-                    ))
+                        } else {
+                            let mut row = div().flex().items_center();
+                            if !fragments.prefix.is_empty() {
+                                row = row.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(t.text_primary)
+                                        .child(fragments.prefix),
+                                );
+                            }
+                            if let Some(selected) = fragments.selected {
+                                row = row.child(
+                                    div()
+                                        .px(px(1.0))
+                                        .rounded_sm()
+                                        .bg(t.accent.alpha(0.22))
+                                        .text_sm()
+                                        .text_color(t.text_primary)
+                                        .child(selected),
+                                );
+                            }
+                            if fragments.caret_visible {
+                                row = row
+                                    .child(div().w(px(2.0)).h(px(16.0)).ml(px(1.0)).bg(t.accent));
+                            }
+                            if !fragments.suffix.is_empty() {
+                                row = row.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(t.text_primary)
+                                        .child(fragments.suffix),
+                                );
+                            }
+                            row
+                        }
+                    }))
                     .child(
                         div()
                             .px(px(6.0))
@@ -819,12 +1019,36 @@ impl SeanceWorkspace {
         div()
             .absolute()
             .size_full()
-            .bg(t.scrim)
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(100.0))
-            .child(panel)
+            .track_focus(&self.focus_handle)
+            .key_context("Palette")
+            .on_key_down(cx.listener(Self::handle_key_down))
+            .child(div().absolute().size_full().bg(t.scrim).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.close_palette(cx);
+                }),
+            ))
+            .child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .pt(px(100.0))
+                    .child(
+                        div()
+                            .on_mouse_down(MouseButton::Left, {
+                                let focus_handle = self.focus_handle.clone();
+                                move |_: &gpui::MouseDownEvent,
+                                      window: &mut Window,
+                                      _cx: &mut gpui::App| {
+                                    window.focus(&focus_handle);
+                                }
+                            })
+                            .child(panel),
+                    ),
+            )
     }
 
     pub(crate) fn render_vault_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -876,12 +1100,14 @@ impl SeanceWorkspace {
             "Vault Name",
             self.vault_modal.vault_name.to_string(),
             (create_mode || rename_mode) && self.vault_modal.selected_field == 0,
+            ((create_mode || rename_mode) && self.vault_modal.selected_field == 0)
+                .then_some(&self.vault_modal_text_input),
             &t,
         )
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
-                this.vault_modal.selected_field = 0;
+                this.focus_vault_modal_field(0);
                 cx.notify();
             }),
         );
@@ -894,12 +1120,14 @@ impl SeanceWorkspace {
                 masked_value(&self.vault_modal.passphrase)
             },
             field_count > 0 && self.vault_modal.selected_field == if create_mode { 1 } else { 0 },
+            (field_count > 0 && self.vault_modal.selected_field == if create_mode { 1 } else { 0 })
+                .then_some(&self.vault_modal_text_input),
             &t,
         )
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
-                this.vault_modal.selected_field = if create_mode { 1 } else { 0 };
+                this.focus_vault_modal_field(if create_mode { 1 } else { 0 });
                 cx.notify();
             }),
         );
@@ -966,7 +1194,7 @@ impl SeanceWorkspace {
                                 cx.listener(|this, _, _, cx| {
                                     this.vault_modal.unlock_method =
                                         seance_vault::UnlockMethod::Passphrase;
-                                    this.vault_modal.selected_field = 0;
+                                    this.focus_vault_modal_field(0);
                                     cx.notify();
                                 }),
                             )
@@ -1001,6 +1229,7 @@ impl SeanceWorkspace {
                                     if device_available {
                                         this.vault_modal.unlock_method =
                                             seance_vault::UnlockMethod::Device;
+                                        this.sync_vault_modal_text_input();
                                         cx.notify();
                                     }
                                 }),
@@ -1028,12 +1257,13 @@ impl SeanceWorkspace {
                         masked_value(&self.vault_modal.confirm_passphrase)
                     },
                     self.vault_modal.selected_field == 2,
+                    (self.vault_modal.selected_field == 2).then_some(&self.vault_modal_text_input),
                     &t,
                 )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
-                        this.vault_modal.selected_field = 2;
+                        this.focus_vault_modal_field(2);
                         cx.notify();
                     }),
                 ),
@@ -1144,6 +1374,8 @@ impl SeanceWorkspace {
             .absolute()
             .size_full()
             .bg(t.scrim)
+            .track_focus(&self.focus_handle)
+            .key_context("VaultModal")
             .flex()
             .items_center()
             .justify_center()

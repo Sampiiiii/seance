@@ -28,9 +28,8 @@ impl SeanceWorkspace {
             .ch_advance(font_id, font_size)
             .map(f32::from)
             .unwrap_or(8.0)
-            .ceil()
             .max(1.0);
-        let line_height_px = line_height_px.ceil().max(1.0);
+        let line_height_px = line_height_px.max(1.0);
         let metrics = TerminalMetrics {
             cell_width_px,
             cell_height_px: line_height_px,
@@ -160,9 +159,14 @@ impl SeanceWorkspace {
         let Some(session) = self.active_session() else {
             self.terminal_surface.rows = Arc::from(Vec::<crate::TerminalPaintRow>::new());
             self.terminal_surface.row_revisions.clear();
+            self.terminal_surface.cursor = None;
+            self.terminal_surface.scrollbar = None;
             self.terminal_surface.metrics = TerminalRendererMetrics::default();
             self.terminal_surface.active_session_id = 0;
             self.terminal_surface.geometry = None;
+            self.terminal_hovered_link = None;
+            self.terminal_scrollbar_hovered = false;
+            self.terminal_scrollbar_drag = None;
             return;
         };
 
@@ -183,13 +187,28 @@ impl SeanceWorkspace {
             .last_applied_geometry
             .unwrap_or_else(TerminalGeometry::default);
         let viewport = session.viewport_snapshot();
+        self.reconcile_terminal_hovered_link(
+            &viewport,
+            session.summary().active_screen,
+            session.summary().mouse_tracking,
+            window.modifiers(),
+        );
+        let rows_unchanged = self.terminal_surface.row_revisions == viewport.row_revisions.as_ref();
         let full_rebuild = self.terminal_surface.active_session_id != session.id()
-            || self.terminal_surface.viewport_revision != viewport.revision
             || self.terminal_surface.geometry != Some(geometry)
             || self.terminal_surface.theme_id != self.active_theme
             || self.terminal_surface.rows.is_empty();
-
-        if !full_rebuild && self.terminal_surface.row_revisions == viewport.row_revisions.as_ref() {
+        if !full_rebuild && rows_unchanged {
+            self.terminal_surface.active_session_id = session.id();
+            self.terminal_surface.viewport_revision = viewport.revision;
+            self.terminal_surface.geometry = Some(geometry);
+            self.terminal_surface.theme_id = self.active_theme;
+            self.terminal_surface.cursor = viewport.cursor;
+            self.terminal_surface.scrollbar = viewport.scrollbar;
+            if self.terminal_surface.scrollbar.is_none() {
+                self.terminal_scrollbar_hovered = false;
+                self.terminal_scrollbar_drag = None;
+            }
             return;
         }
 
@@ -229,8 +248,10 @@ impl SeanceWorkspace {
                 metrics_report.rebuilt_rows += 1;
             } else if let Some(existing) = paint_rows.get(row_index) {
                 metrics_report.fragments += existing.fragments.len();
-                metrics_report.background_quads +=
-                    existing.backgrounds.len() + existing.underlines.len();
+                metrics_report.background_quads += existing.backgrounds.len()
+                    + existing.link_highlights.len()
+                    + existing.underlines.len()
+                    + existing.link_underlines.len();
             }
         }
 
@@ -241,5 +262,14 @@ impl SeanceWorkspace {
         self.terminal_surface.row_revisions = viewport.row_revisions.as_ref().to_vec();
         self.terminal_surface.geometry = Some(geometry);
         self.terminal_surface.theme_id = self.active_theme;
+        self.terminal_surface.cursor = viewport.cursor;
+        self.terminal_surface.scrollbar = viewport.scrollbar;
+        if self.terminal_surface.scrollbar.is_none() {
+            self.terminal_scrollbar_hovered = false;
+            self.terminal_scrollbar_drag = None;
+        }
+        if self.terminal_surface.rows.is_empty() {
+            self.terminal_hovered_link = None;
+        }
     }
 }

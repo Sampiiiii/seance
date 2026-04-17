@@ -46,6 +46,7 @@ endef
 	signed-build signed-run signed-debug \
 	logs-dir logs-latest logs-tail crash-latest \
 	check build fmt fmt-check clippy test clean \
+	check-public \
 	release-version release-notes release-artifacts release-validate release-checksums
 
 help: ## Show available commands
@@ -110,6 +111,9 @@ fmt-check: ## Check workspace formatting without writing changes
 
 clippy: ## Run workspace clippy with warnings denied
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
+
+check-public: ## Fail on unreachable public items in private modules
+	RUSTFLAGS="-D unreachable-pub" $(CARGO) check --workspace --all-targets
 
 test: ## Run workspace tests
 	$(CARGO) test --workspace

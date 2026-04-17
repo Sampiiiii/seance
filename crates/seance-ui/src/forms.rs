@@ -659,6 +659,7 @@ impl ConfirmDialogState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingsSection {
     General,
+    Keybindings,
     Updates,
     Appearance,
     Terminal,
@@ -666,8 +667,9 @@ pub(crate) enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::General,
+        Self::Keybindings,
         Self::Updates,
         Self::Appearance,
         Self::Terminal,
@@ -677,6 +679,7 @@ impl SettingsSection {
     pub(crate) fn title(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Keybindings => "Keybindings",
             Self::Updates => "Updates",
             Self::Appearance => "Appearance",
             Self::Terminal => "Terminal",
@@ -687,6 +690,7 @@ impl SettingsSection {
     pub(crate) fn subtitle(self) -> &'static str {
         match self {
             Self::General => "Resident app and window lifecycle",
+            Self::Keybindings => "Effective shortcuts and config-first overrides",
             Self::Updates => "Release channel and in-app updater state",
             Self::Appearance => "Themes and overall look",
             Self::Terminal => "Shell and terminal rendering defaults",
@@ -697,6 +701,7 @@ impl SettingsSection {
     pub(crate) fn glyph(self) -> &'static str {
         match self {
             Self::General => "⚙",
+            Self::Keybindings => "⌘",
             Self::Updates => "↑",
             Self::Appearance => "◑",
             Self::Terminal => "▸",

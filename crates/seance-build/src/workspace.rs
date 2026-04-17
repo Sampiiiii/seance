@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use cargo_metadata::MetadataCommand;
 
-pub fn package_version(package_name: &str) -> Result<String> {
+pub(crate) fn package_version(package_name: &str) -> Result<String> {
     let metadata = MetadataCommand::new()
         .no_deps()
         .exec()
@@ -15,13 +15,16 @@ pub fn package_version(package_name: &str) -> Result<String> {
     Ok(package.version.to_string())
 }
 
-pub fn verified_package_version(package_name: &str, expected_tag: Option<&str>) -> Result<String> {
+pub(crate) fn verified_package_version(
+    package_name: &str,
+    expected_tag: Option<&str>,
+) -> Result<String> {
     let version = package_version(package_name)?;
 
-    if let Some(tag) = expected_tag {
-        if version != tag {
-            bail!("tag version {tag} does not match package {package_name} version {version}");
-        }
+    if let Some(tag) = expected_tag
+        && version != tag
+    {
+        bail!("tag version {tag} does not match package {package_name} version {version}");
     }
 
     Ok(version)

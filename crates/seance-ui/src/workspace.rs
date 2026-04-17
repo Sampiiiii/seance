@@ -3,29 +3,37 @@
 use std::{sync::Arc, time::Duration};
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, KeyDownEvent, ScrollDelta, ScrollWheelEvent, Window,
-    point, px,
+    App, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ScrollDelta, ScrollWheelEvent, Window, point, px,
 };
 use seance_config::AppConfig;
 use seance_core::{UpdateState, VaultUiSnapshot};
-use seance_terminal::{TerminalScreenKind, TerminalScrollCommand};
+use seance_terminal::{
+    TerminalInputModifiers, TerminalMouseButton, TerminalMouseEvent, TerminalMouseEventKind,
+    TerminalScreenKind, TerminalScrollCommand, TerminalViewportSnapshot,
+};
 use seance_vault::{SecretString, UnlockMethod};
 
 use crate::{
+    TERMINAL_SCROLLBAR_GUTTER_WIDTH_PX, TerminalScrollbarDragState, TerminalScrollbarHit,
+    TerminalScrollbarLayout,
     app::{InitialWorkspaceAction, refresh_app_menus},
     forms::{
         CredentialDraftField, HostDraftField, SecureInputTarget, SecureSection, SettingsSection,
         TunnelDraftField, UnlockMode, VaultModalOrigin, WorkspaceSurface,
     },
-    model::SeanceWorkspace,
+    model::{
+        SeanceWorkspace, TerminalHoveredLink, TerminalSelectionPoint, sidebar_occupied_width_px,
+    },
     palette::{
         PageDirection, PaletteAction, PaletteViewModel, build_items, flatten_items,
         page_target_index,
     },
     perf::RedrawReason,
     surface::ShapeCache,
+    terminal_links::{terminal_link_at_column, terminal_links_for_row},
     theme::Theme,
-    ui_components::{theme_id_from_config, update_status_label},
+    ui_components::{TERMINAL_PANE_PADDING_PX, theme_id_from_config, update_status_label},
 };
 
 const SCOPE_KEY_SEPARATOR: &str = "::";
@@ -43,6 +51,76 @@ pub(crate) fn split_scope_key(scope_key: &str) -> Option<(&str, &str)> {
 }
 
 impl SeanceWorkspace {
+    fn set_terminal_hovered_link(&mut self, next: Option<TerminalHoveredLink>) -> bool {
+        if self.terminal_hovered_link == next {
+            return false;
+        }
+
+        self.terminal_hovered_link = next;
+        true
+    }
+
+    fn clear_terminal_hovered_link(&mut self) -> bool {
+        self.set_terminal_hovered_link(None)
+    }
+
+    fn update_terminal_hovered_link(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        modifiers: gpui::Modifiers,
+    ) -> bool {
+        let next = self.active_session().and_then(|session| {
+            let summary = session.summary();
+            let point = self.terminal_selection_point(position)?;
+            let viewport = session.viewport_snapshot();
+            terminal_hovered_link_at_position(
+                &viewport,
+                point,
+                summary.active_screen,
+                summary.mouse_tracking,
+                modifiers,
+            )
+        });
+
+        self.set_terminal_hovered_link(next)
+    }
+
+    pub(crate) fn reconcile_terminal_hovered_link(
+        &mut self,
+        viewport: &TerminalViewportSnapshot,
+        active_screen: TerminalScreenKind,
+        mouse_tracking: bool,
+        modifiers: gpui::Modifiers,
+    ) {
+        let Some(hovered_link) = self.terminal_hovered_link.as_mut() else {
+            return;
+        };
+
+        if !matches!(active_screen, TerminalScreenKind::Primary) || mouse_tracking {
+            self.terminal_hovered_link = None;
+            return;
+        }
+
+        let Some(row) = viewport.rows.get(hovered_link.row) else {
+            self.terminal_hovered_link = None;
+            return;
+        };
+        let Some(row_revision) = viewport.row_revisions.get(hovered_link.row).copied() else {
+            self.terminal_hovered_link = None;
+            return;
+        };
+        let visible_cols = viewport.cols as usize;
+        let link_still_present = terminal_links_for_row(row, visible_cols)
+            .into_iter()
+            .any(|link| link.col_range == hovered_link.col_range && link.url == hovered_link.url);
+        if row_revision != hovered_link.row_revision || !link_still_present {
+            self.terminal_hovered_link = None;
+            return;
+        }
+
+        hovered_link.modifier_active = terminal_link_open_modifier(modifiers);
+    }
+
     fn current_vault_ui_snapshot(&self) -> VaultUiSnapshot {
         VaultUiSnapshot {
             managed_vaults: self.backend.list_vaults(),
@@ -283,30 +361,273 @@ impl SeanceWorkspace {
             return;
         };
         let summary = session.summary();
-        if matches!(summary.active_screen, TerminalScreenKind::Alternate) || summary.mouse_tracking
-        {
-            return;
-        }
-
         let line_height = self
             .terminal_metrics
             .map(|metrics| metrics.line_height_px)
-            .unwrap_or_else(|| self.terminal_line_height_px());
-        let delta_y = match event.delta {
-            ScrollDelta::Pixels(delta) => f32::from(delta.y),
-            ScrollDelta::Lines(delta) => delta.y * line_height,
+            .unwrap_or_else(|| self.terminal_line_height_px())
+            .max(1.0);
+        let delta_rows_f = match event.delta {
+            ScrollDelta::Pixels(delta) => -(f32::from(delta.y) / line_height),
+            ScrollDelta::Lines(delta) => -delta.y,
         };
-        let delta_rows = if delta_y.abs() < f32::EPSILON {
-            0
-        } else {
-            (-(delta_y / line_height).round()) as isize
-        };
+        if delta_rows_f.abs() < f32::EPSILON {
+            return;
+        }
+        if self.terminal_scroll_remainder_rows.signum() != 0.0
+            && delta_rows_f.signum() != 0.0
+            && self.terminal_scroll_remainder_rows.signum() != delta_rows_f.signum()
+        {
+            self.terminal_scroll_remainder_rows = 0.0;
+        }
+        let pending_rows = self.terminal_scroll_remainder_rows + delta_rows_f;
+        let delta_rows = pending_rows.trunc() as isize;
+        self.terminal_scroll_remainder_rows = pending_rows - delta_rows as f32;
+
+        if summary.mouse_tracking {
+            if delta_rows == 0 {
+                return;
+            }
+            let button = if delta_rows > 0 {
+                TerminalMouseButton::WheelUp
+            } else {
+                TerminalMouseButton::WheelDown
+            };
+            if let Some(mouse_event) = self.terminal_mouse_event(
+                event.position,
+                TerminalMouseEventKind::Press,
+                Some(button),
+                event.modifiers,
+            ) {
+                for _ in 0..delta_rows.unsigned_abs() {
+                    let _ = session.send_mouse(mouse_event.clone());
+                }
+                self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
+                cx.notify();
+            }
+            return;
+        }
+
+        if matches!(summary.active_screen, TerminalScreenKind::Alternate) {
+            self.terminal_scroll_remainder_rows = 0.0;
+            return;
+        }
+
         if delta_rows == 0 {
             return;
         }
 
         let _ = session.scroll_viewport(TerminalScrollCommand::DeltaRows(delta_rows));
         self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
+        cx.notify();
+    }
+
+    pub(crate) fn handle_terminal_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle);
+
+        let Some(session) = self.active_session() else {
+            return;
+        };
+        let summary = session.summary();
+        let scrollbar_interactive =
+            terminal_scrollbar_is_interactive(summary.active_screen, summary.mouse_tracking);
+        if event.button == MouseButton::Left
+            && scrollbar_interactive
+            && let Some((layout, local_x, local_y)) =
+                self.terminal_scrollbar_local_position(event.position)
+            && let Some(outcome) = terminal_scrollbar_mouse_down_outcome(layout, local_x, local_y)
+        {
+            self.terminal_scrollbar_hovered = true;
+            self.terminal_scrollbar_drag = Some(outcome.drag_state);
+            if let Some(command) = outcome.command {
+                let _ = session.scroll_viewport(command);
+                self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
+            } else {
+                self.perf_overlay.mark_input(RedrawReason::Input);
+            }
+            cx.notify();
+            return;
+        }
+
+        if summary.mouse_tracking {
+            self.clear_terminal_hovered_link();
+            self.terminal_scrollbar_hovered = false;
+            self.terminal_scrollbar_drag = None;
+            if let Some(mouse_event) = self.terminal_mouse_event(
+                event.position,
+                TerminalMouseEventKind::Press,
+                terminal_mouse_button(event.button),
+                event.modifiers,
+            ) {
+                let _ = session.send_mouse(mouse_event);
+            }
+            self.clear_terminal_selection();
+        } else if self.try_open_terminal_link(event, summary.active_screen) {
+            self.terminal_drag_anchor = None;
+            self.clear_terminal_hovered_link();
+            self.perf_overlay.mark_input(RedrawReason::Input);
+            cx.notify();
+            return;
+        } else if event.button == MouseButton::Left
+            && let Some(point) = self.terminal_selection_point(event.position)
+        {
+            self.clear_terminal_hovered_link();
+            self.terminal_selection = Some(crate::model::TerminalSelection {
+                anchor: point,
+                focus: point,
+            });
+            self.terminal_drag_anchor = Some(point);
+        }
+
+        self.perf_overlay.mark_input(RedrawReason::Input);
+        cx.notify();
+    }
+
+    pub(crate) fn handle_terminal_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.active_session() else {
+            if self.clear_terminal_hovered_link() {
+                self.perf_overlay.mark_input(RedrawReason::Input);
+                cx.notify();
+            }
+            return;
+        };
+        let summary = session.summary();
+        let scrollbar_interactive =
+            terminal_scrollbar_is_interactive(summary.active_screen, summary.mouse_tracking);
+        if let Some(drag_state) = self.terminal_scrollbar_drag {
+            let mut state_changed = self.clear_terminal_hovered_link();
+            if scrollbar_interactive && let Some(local_y) = self.terminal_local_y(event.position) {
+                let _ =
+                    session.scroll_viewport(terminal_scrollbar_drag_command(drag_state, local_y));
+                self.terminal_scrollbar_hovered = true;
+                self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
+                cx.notify();
+            } else {
+                self.terminal_scrollbar_drag = None;
+                if self.terminal_scrollbar_hovered {
+                    self.terminal_scrollbar_hovered = false;
+                    state_changed = true;
+                }
+                if state_changed {
+                    self.perf_overlay.mark_input(RedrawReason::Input);
+                    cx.notify();
+                }
+            }
+            return;
+        }
+
+        if summary.mouse_tracking {
+            let mut state_changed = self.clear_terminal_hovered_link();
+            if self.terminal_scrollbar_hovered {
+                self.terminal_scrollbar_hovered = false;
+                state_changed = true;
+            }
+            if let Some(mouse_event) = self.terminal_mouse_event(
+                event.position,
+                TerminalMouseEventKind::Move,
+                event.pressed_button.and_then(terminal_mouse_button),
+                event.modifiers,
+            ) {
+                let _ = session.send_mouse(mouse_event);
+                self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
+                cx.notify();
+            } else if state_changed {
+                self.perf_overlay.mark_input(RedrawReason::Input);
+                cx.notify();
+            }
+            return;
+        }
+
+        let scrollbar_hovered = scrollbar_interactive
+            && self
+                .terminal_scrollbar_local_position(event.position)
+                .is_some_and(|(layout, local_x, local_y)| {
+                    layout.hit_test(local_x, local_y).is_some()
+                });
+        let mut state_changed = false;
+        if scrollbar_hovered != self.terminal_scrollbar_hovered {
+            self.terminal_scrollbar_hovered = scrollbar_hovered;
+            state_changed = true;
+        }
+
+        if event.dragging() {
+            state_changed |= self.clear_terminal_hovered_link();
+        } else {
+            state_changed |= self.update_terminal_hovered_link(event.position, event.modifiers);
+        }
+
+        if state_changed {
+            self.perf_overlay.mark_input(RedrawReason::Input);
+            cx.notify();
+        }
+
+        if !event.dragging() {
+            return;
+        }
+
+        let Some(anchor) = self.terminal_drag_anchor else {
+            return;
+        };
+        let Some(focus) = self.terminal_selection_point(event.position) else {
+            return;
+        };
+        self.terminal_selection = Some(crate::model::TerminalSelection { anchor, focus });
+        self.perf_overlay.mark_input(RedrawReason::Input);
+        cx.notify();
+    }
+
+    pub(crate) fn handle_terminal_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.active_session() else {
+            self.terminal_drag_anchor = None;
+            self.terminal_hovered_link = None;
+            self.terminal_scrollbar_hovered = false;
+            self.terminal_scrollbar_drag = None;
+            return;
+        };
+
+        let summary = session.summary();
+        let scrollbar_interactive =
+            terminal_scrollbar_is_interactive(summary.active_screen, summary.mouse_tracking);
+        if self.terminal_scrollbar_drag.take().is_some() {
+            self.terminal_drag_anchor = None;
+            self.terminal_scrollbar_hovered = scrollbar_interactive
+                && self
+                    .terminal_scrollbar_local_position(event.position)
+                    .is_some_and(|(layout, local_x, local_y)| {
+                        layout.hit_test(local_x, local_y).is_some()
+                    });
+            self.perf_overlay.mark_input(RedrawReason::Input);
+            cx.notify();
+            return;
+        }
+
+        if summary.mouse_tracking {
+            if let Some(mouse_event) = self.terminal_mouse_event(
+                event.position,
+                TerminalMouseEventKind::Release,
+                terminal_mouse_button(event.button),
+                event.modifiers,
+            ) {
+                let _ = session.send_mouse(mouse_event);
+            }
+        }
+
+        self.terminal_drag_anchor = None;
+        self.perf_overlay.mark_input(RedrawReason::Input);
         cx.notify();
     }
 
@@ -380,6 +701,10 @@ impl SeanceWorkspace {
 
     pub(crate) fn terminal_line_height_px(&self) -> f32 {
         self.config.terminal.line_height_px
+    }
+
+    pub(crate) fn sidebar_occupied_width_px(&self) -> f32 {
+        sidebar_occupied_width_px(self.sidebar_width)
     }
 
     #[cfg_attr(test, allow(dead_code))]
@@ -690,6 +1015,7 @@ impl SeanceWorkspace {
         if matches!(mode, UnlockMode::Unlock) && device_unlock_available {
             self.vault_modal.unlock_method = UnlockMethod::Device;
         }
+        self.sync_vault_modal_text_input();
         self.perf_overlay.mark_input(RedrawReason::Input);
         cx.notify();
     }
@@ -834,7 +1160,7 @@ impl SeanceWorkspace {
             "Vault locked. Decrypted records were cleared from memory.".into(),
         );
         self.show_toast("Vault locked.");
-        self.palette_open = false;
+        self.close_palette(cx);
         self.invalidate_terminal_surface();
         self.perf_overlay.mark_input(RedrawReason::Input);
         refresh_app_menus(cx);
@@ -843,15 +1169,16 @@ impl SeanceWorkspace {
 
     pub(crate) fn toggle_palette(&mut self, cx: &mut Context<Self>) {
         if self.palette_open {
-            self.palette_open = false;
+            self.close_palette(cx);
         } else {
             self.palette_open = true;
             self.palette_query.clear();
+            self.palette_text_input = crate::TextEditState::default();
             self.palette_selected = 0;
             self.reset_palette_scroll_to_top();
+            self.perf_overlay.mark_input(RedrawReason::Palette);
+            cx.notify();
         }
-        self.perf_overlay.mark_input(RedrawReason::Palette);
-        cx.notify();
     }
 
     pub(crate) fn palette_view_model(&self) -> PaletteViewModel {
@@ -901,6 +1228,20 @@ impl SeanceWorkspace {
     fn reset_palette_scroll_to_top(&mut self) {
         self.palette_scroll_handle
             .set_offset(point(px(0.0), px(0.0)));
+    }
+
+    pub(crate) fn close_palette(&mut self, cx: &mut Context<Self>) {
+        if !self.palette_open {
+            return;
+        }
+
+        self.palette_open = false;
+        self.palette_query.clear();
+        self.palette_selected = 0;
+        self.palette_text_input = crate::TextEditState::default();
+        self.reset_palette_scroll_to_top();
+        self.perf_overlay.mark_input(RedrawReason::Palette);
+        cx.notify();
     }
 
     fn palette_visible_row_span(&self) -> usize {
@@ -964,15 +1305,12 @@ impl SeanceWorkspace {
             }
             PaletteAction::LockVault => {
                 self.lock_vault(cx);
-                return;
             }
             PaletteAction::AddSavedHost => {
                 self.begin_add_host(cx);
-                return;
             }
             PaletteAction::OpenVaultPanel => {
                 self.open_vault_panel(cx);
-                return;
             }
             PaletteAction::AddPasswordCredential => {
                 self.open_secure_workspace(SecureSection::Credentials, cx);
@@ -992,19 +1330,12 @@ impl SeanceWorkspace {
                     crate::forms::CredentialDraftOrigin::Standalone,
                     cx,
                 );
-                return;
             }
             PaletteAction::DeletePasswordCredential {
                 vault_id,
                 credential_id,
             } => {
                 self.attempt_delete_credential(&item_scope_key(&vault_id, &credential_id), cx);
-                return;
-            }
-            PaletteAction::ImportPrivateKey => {
-                self.show_toast(
-                    "Private key import backend is ready; UI import form is still pending.",
-                );
             }
             PaletteAction::GenerateEd25519Key => {
                 self.open_secure_workspace(SecureSection::Keys, cx);
@@ -1016,39 +1347,21 @@ impl SeanceWorkspace {
             }
             PaletteAction::DeletePrivateKey { vault_id, key_id } => {
                 self.attempt_delete_private_key(&item_scope_key(&vault_id, &key_id), cx);
-                return;
             }
             PaletteAction::EditSavedHost { vault_id, host_id } => {
                 self.begin_edit_host(&host_scope_key(&vault_id, &host_id), cx);
-                return;
             }
             PaletteAction::DeleteSavedHost { vault_id, host_id } => {
                 self.delete_saved_host(&host_scope_key(&vault_id, &host_id), cx);
-                return;
             }
             PaletteAction::CancelSavedHostConnect { attempt_id } => {
                 self.cancel_connect_attempt(attempt_id, cx);
-                self.palette_open = false;
-                self.palette_query.clear();
-                self.palette_selected = 0;
-                self.reset_palette_scroll_to_top();
-                self.perf_overlay.mark_input(RedrawReason::Palette);
-                cx.notify();
-                return;
             }
             PaletteAction::ConnectSavedHost { vault_id, host_id } => {
                 self.start_connect_attempt(&vault_id, &host_id, window, cx);
-                self.palette_open = false;
-                self.palette_query.clear();
-                self.palette_selected = 0;
-                self.reset_palette_scroll_to_top();
-                self.perf_overlay.mark_input(RedrawReason::Palette);
-                cx.notify();
-                return;
             }
             PaletteAction::OpenSftpBrowser(session_id) => {
                 self.open_sftp_browser(session_id, cx);
-                return;
             }
             PaletteAction::OpenTunnelManager => {
                 self.open_secure_workspace(SecureSection::Tunnels, cx);
@@ -1062,46 +1375,24 @@ impl SeanceWorkspace {
                         self.begin_add_tunnel(cx);
                     }
                 }
-                return;
             }
             PaletteAction::OpenHostTunnelSettings { vault_id, host_id } => {
                 self.activate_host_draft(Some(&host_scope_key(&vault_id, &host_id)), cx);
-                return;
             }
             PaletteAction::StartTunnel {
                 vault_id,
                 port_forward_id,
             } => {
                 self.start_saved_tunnel(&item_scope_key(&vault_id, &port_forward_id), cx);
-                self.palette_open = false;
-                self.palette_query.clear();
-                self.palette_selected = 0;
-                self.reset_palette_scroll_to_top();
-                self.perf_overlay.mark_input(RedrawReason::Palette);
-                cx.notify();
-                return;
             }
             PaletteAction::StopTunnel { tunnel_scope_key } => {
                 self.stop_saved_tunnel(&tunnel_scope_key, cx);
-                self.palette_open = false;
-                self.palette_query.clear();
-                self.palette_selected = 0;
-                self.reset_palette_scroll_to_top();
-                self.perf_overlay.mark_input(RedrawReason::Palette);
-                cx.notify();
-                return;
             }
             PaletteAction::OpenPreferences => {
                 self.open_settings_panel(SettingsSection::General, cx);
-                return;
             }
         }
-        self.perf_overlay.mark_input(RedrawReason::Palette);
-        self.palette_open = false;
-        self.palette_query.clear();
-        self.palette_selected = 0;
-        self.reset_palette_scroll_to_top();
-        cx.notify();
+        self.close_palette(cx);
     }
 
     pub(crate) fn handle_key_down(
@@ -1150,14 +1441,8 @@ impl SeanceWorkspace {
             return;
         }
 
-        if let Some(bytes) = encode_keystroke(event)
-            && let Some(session) = self.active_session()
-        {
-            let summary = session.summary();
-            if matches!(summary.active_screen, TerminalScreenKind::Primary) && !summary.at_bottom {
-                let _ = session.scroll_to_bottom();
-            }
-            let _ = session.send_input(bytes);
+        if self.handle_terminal_input_key(event, cx) {
+            return;
         }
         self.perf_overlay.mark_input(RedrawReason::Input);
         cx.notify();
@@ -1174,11 +1459,7 @@ impl SeanceWorkspace {
 
         match key {
             "escape" => {
-                self.palette_open = false;
-                self.palette_query.clear();
-                self.palette_selected = 0;
-                self.perf_overlay.mark_input(RedrawReason::Palette);
-                cx.notify();
+                self.close_palette(cx);
             }
             "up" => {
                 self.set_palette_selection(self.palette_selected.saturating_sub(1), true);
@@ -1220,24 +1501,15 @@ impl SeanceWorkspace {
                     self.execute_palette_action(action, window, cx);
                 }
             }
-            "backspace" => {
-                self.palette_query.pop();
-                self.palette_selected = 0;
-                self.reset_palette_scroll_to_top();
-                self.perf_overlay.mark_input(RedrawReason::Palette);
-                cx.notify();
-            }
-            "tab" | "left" | "right" => {}
+            "tab" => {}
             _ => {
-                if let Some(ch) = key_char {
-                    let modifiers = event.keystroke.modifiers;
-                    if !modifiers.platform && !modifiers.control && !modifiers.function {
-                        self.palette_query.push_str(ch);
+                if self.handle_palette_text_input(event, cx) {
+                    if text_input_mutated_key(event, key_char) {
                         self.palette_selected = 0;
                         self.reset_palette_scroll_to_top();
-                        self.perf_overlay.mark_input(RedrawReason::Palette);
-                        cx.notify();
                     }
+                    self.perf_overlay.mark_input(RedrawReason::Palette);
+                    cx.notify();
                 }
             }
         }
@@ -1245,47 +1517,23 @@ impl SeanceWorkspace {
 
     fn handle_vault_modal_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
-        let key_char = event.keystroke.key_char.as_deref();
-        let modifiers = event.keystroke.modifiers;
         let field_count = self.vault_modal.passphrase_field_count();
 
         match key {
             "tab" | "down" => {
                 if field_count > 0 {
-                    self.vault_modal.selected_field =
-                        (self.vault_modal.selected_field + 1) % field_count;
+                    self.focus_vault_modal_field(
+                        (self.vault_modal.selected_field + 1) % field_count,
+                    );
                 }
             }
             "up" => {
                 if field_count > 0 {
-                    self.vault_modal.selected_field =
-                        (self.vault_modal.selected_field + field_count - 1) % field_count;
+                    self.focus_vault_modal_field(
+                        (self.vault_modal.selected_field + field_count - 1) % field_count,
+                    );
                 }
             }
-            "backspace" => match self.vault_modal.mode {
-                UnlockMode::Create => match self.vault_modal.selected_field {
-                    0 => {
-                        self.vault_modal.vault_name.pop();
-                    }
-                    1 => {
-                        self.vault_modal.passphrase.pop();
-                    }
-                    _ if field_count > 1 => {
-                        self.vault_modal.confirm_passphrase.pop();
-                    }
-                    _ => {}
-                },
-                UnlockMode::Rename => {
-                    if self.vault_modal.selected_field == 0 {
-                        self.vault_modal.vault_name.pop();
-                    }
-                }
-                UnlockMode::Unlock => {
-                    if self.vault_modal.selected_field == 0 {
-                        self.vault_modal.passphrase.pop();
-                    }
-                }
-            },
             "enter" => {
                 self.submit_vault_modal(cx);
                 return;
@@ -1297,30 +1545,7 @@ impl SeanceWorkspace {
                 }
             }
             _ => {
-                if let Some(ch) = key_char {
-                    if !modifiers.platform && !modifiers.control && !modifiers.function {
-                        match self.vault_modal.mode {
-                            UnlockMode::Create => match self.vault_modal.selected_field {
-                                0 => self.vault_modal.vault_name.push_str(ch),
-                                1 => self.vault_modal.passphrase.push_str(ch),
-                                _ if field_count > 1 => {
-                                    self.vault_modal.confirm_passphrase.push_str(ch)
-                                }
-                                _ => {}
-                            },
-                            UnlockMode::Rename => {
-                                if self.vault_modal.selected_field == 0 {
-                                    self.vault_modal.vault_name.push_str(ch);
-                                }
-                            }
-                            UnlockMode::Unlock => {
-                                if self.vault_modal.selected_field == 0 {
-                                    self.vault_modal.passphrase.push_str(ch);
-                                }
-                            }
-                        }
-                    }
-                }
+                let _ = self.handle_vault_modal_text_input(event, cx);
             }
         }
 
@@ -1330,10 +1555,9 @@ impl SeanceWorkspace {
 
     fn handle_secure_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
-        let key_char = event.keystroke.key_char.as_deref();
         let modifiers = event.keystroke.modifiers;
 
-        if modifiers.platform && key == "s" {
+        if text_primary_modifier(modifiers) && key == "s" {
             if self.secure.host_draft.is_some() {
                 self.save_host_draft(cx);
             } else if self.secure.tunnel_draft.is_some() {
@@ -1360,15 +1584,8 @@ impl SeanceWorkspace {
                     self.save_credential_draft(cx);
                 }
             }
-            "backspace" => {
-                self.backspace_secure_input();
-            }
             _ => {
-                if let Some(ch) = key_char {
-                    if !modifiers.platform && !modifiers.control && !modifiers.function {
-                        self.push_secure_input(ch);
-                    }
-                }
+                let _ = self.handle_secure_text_input(event, cx);
             }
         }
 
@@ -1377,7 +1594,7 @@ impl SeanceWorkspace {
     }
 
     fn cycle_secure_focus(&mut self, backward: bool) {
-        self.secure.input_target = match self.secure.section {
+        let next_target = match self.secure.section {
             SecureSection::Hosts => {
                 let Some(draft) = self.secure.host_draft.as_mut() else {
                     return;
@@ -1429,134 +1646,481 @@ impl SeanceWorkspace {
             }
             SecureSection::Keys => SecureInputTarget::KeySearch,
         };
+        self.focus_secure_input_target(next_target);
     }
 
-    fn backspace_secure_input(&mut self) {
-        match self.secure.input_target {
-            SecureInputTarget::HostSearch => {
-                self.secure.host_search.pop();
-            }
-            SecureInputTarget::TunnelSearch => {
-                self.secure.tunnel_search.pop();
-            }
-            SecureInputTarget::CredentialSearch => {
-                self.secure.credential_search.pop();
-            }
-            SecureInputTarget::KeySearch => {
-                self.secure.key_search.pop();
-            }
-            SecureInputTarget::HostDraft(field) => {
-                if let Some(draft) = self.secure.host_draft.as_mut() {
-                    match field {
-                        HostDraftField::Label => draft.label.pop(),
-                        HostDraftField::Hostname => draft.hostname.pop(),
-                        HostDraftField::Username => draft.username.pop(),
-                        HostDraftField::Port => draft.port.pop(),
-                        HostDraftField::Notes => draft.notes.pop(),
-                    };
-                    draft.dirty = true;
+    pub(crate) fn focus_vault_modal_field(&mut self, field: usize) {
+        self.vault_modal.selected_field = field;
+        self.vault_modal_text_field = Some(field);
+        self.vault_modal_text_input = self
+            .vault_modal_field_value(field)
+            .map(|value| crate::TextEditState::with_text(&value))
+            .unwrap_or_default();
+    }
+
+    pub(crate) fn sync_vault_modal_text_input(&mut self) {
+        let field_count = self.vault_modal.passphrase_field_count();
+        if field_count == 0 {
+            self.vault_modal_text_field = None;
+            self.vault_modal_text_input = crate::TextEditState::default();
+            return;
+        }
+
+        let field = self
+            .vault_modal
+            .selected_field
+            .min(field_count.saturating_sub(1));
+        let value = self.vault_modal_field_value(field).unwrap_or_default();
+        if self.vault_modal_text_field == Some(field) {
+            self.vault_modal_text_input.sync(&value);
+        } else {
+            self.vault_modal.selected_field = field;
+            self.vault_modal_text_field = Some(field);
+            self.vault_modal_text_input = crate::TextEditState::with_text(&value);
+        }
+    }
+
+    fn vault_modal_field_value(&self, field: usize) -> Option<String> {
+        match self.vault_modal.mode {
+            UnlockMode::Create => match field {
+                0 => Some(self.vault_modal.vault_name.to_string()),
+                1 => Some(self.vault_modal.passphrase.to_string()),
+                2 => Some(self.vault_modal.confirm_passphrase.to_string()),
+                _ => None,
+            },
+            UnlockMode::Rename => (field == 0).then(|| self.vault_modal.vault_name.to_string()),
+            UnlockMode::Unlock => (self.vault_modal.unlock_method == UnlockMethod::Passphrase
+                && field == 0)
+                .then(|| self.vault_modal.passphrase.to_string()),
+        }
+    }
+
+    fn handle_vault_modal_text_input(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.sync_vault_modal_text_input();
+        let field = match self.vault_modal_text_field {
+            Some(field) => field,
+            None => return false,
+        };
+        let paste = text_input_paste_text(event, cx);
+        let outcome = match self.vault_modal.mode {
+            UnlockMode::Create => match field {
+                0 => apply_text_input_event(
+                    &mut self.vault_modal_text_input,
+                    &mut self.vault_modal.vault_name,
+                    event,
+                    paste.as_deref(),
+                ),
+                1 => apply_text_input_event(
+                    &mut self.vault_modal_text_input,
+                    &mut self.vault_modal.passphrase,
+                    event,
+                    paste.as_deref(),
+                ),
+                2 => apply_text_input_event(
+                    &mut self.vault_modal_text_input,
+                    &mut self.vault_modal.confirm_passphrase,
+                    event,
+                    paste.as_deref(),
+                ),
+                _ => TextInputOutcome::ignored(),
+            },
+            UnlockMode::Rename => {
+                if field == 0 {
+                    apply_text_input_event(
+                        &mut self.vault_modal_text_input,
+                        &mut self.vault_modal.vault_name,
+                        event,
+                        paste.as_deref(),
+                    )
+                } else {
+                    TextInputOutcome::ignored()
                 }
             }
-            SecureInputTarget::CredentialDraft(field) => {
-                if let Some(draft) = self.secure.credential_draft.as_mut() {
-                    match field {
-                        CredentialDraftField::Label => draft.label.pop(),
-                        CredentialDraftField::UsernameHint => draft.username_hint.pop(),
-                        CredentialDraftField::Secret => draft.secret.pop(),
-                    };
-                    draft.dirty = true;
+            UnlockMode::Unlock => {
+                if field == 0 && self.vault_modal.unlock_method == UnlockMethod::Passphrase {
+                    apply_text_input_event(
+                        &mut self.vault_modal_text_input,
+                        &mut self.vault_modal.passphrase,
+                        event,
+                        paste.as_deref(),
+                    )
+                } else {
+                    TextInputOutcome::ignored()
+                }
+            }
+        };
+        apply_text_input_outcome(&outcome, cx);
+        outcome.consumed
+    }
+
+    pub(crate) fn focus_secure_input_target(&mut self, target: SecureInputTarget) {
+        self.secure.input_target = target;
+        match target {
+            SecureInputTarget::HostDraft(field) => {
+                if let Some(draft) = self.secure.host_draft.as_mut() {
+                    draft.selected_field = field;
                 }
             }
             SecureInputTarget::TunnelDraft(field) => {
                 if let Some(draft) = self.secure.tunnel_draft.as_mut() {
-                    match field {
-                        TunnelDraftField::Label => {
-                            let _ = draft.label.pop();
-                        }
-                        TunnelDraftField::Mode => {}
-                        TunnelDraftField::ListenAddress => {
-                            let _ = draft.listen_address.pop();
-                        }
-                        TunnelDraftField::ListenPort => {
-                            let _ = draft.listen_port.pop();
-                        }
-                        TunnelDraftField::TargetAddress => {
-                            let _ = draft.target_address.pop();
-                        }
-                        TunnelDraftField::TargetPort => {
-                            let _ = draft.target_port.pop();
-                        }
-                        TunnelDraftField::Notes => {
-                            let _ = draft.notes.pop();
-                        }
-                    };
-                    draft.dirty = true;
-                }
-            }
-        }
-    }
-
-    fn push_secure_input(&mut self, text: &str) {
-        match self.secure.input_target {
-            SecureInputTarget::HostSearch => self.secure.host_search.push_str(text),
-            SecureInputTarget::TunnelSearch => self.secure.tunnel_search.push_str(text),
-            SecureInputTarget::CredentialSearch => self.secure.credential_search.push_str(text),
-            SecureInputTarget::KeySearch => self.secure.key_search.push_str(text),
-            SecureInputTarget::HostDraft(field) => {
-                if let Some(draft) = self.secure.host_draft.as_mut() {
-                    match field {
-                        HostDraftField::Label => draft.label.push_str(text),
-                        HostDraftField::Hostname => draft.hostname.push_str(text),
-                        HostDraftField::Username => draft.username.push_str(text),
-                        HostDraftField::Port => {
-                            if text.chars().all(|value| value.is_ascii_digit()) {
-                                draft.port.push_str(text);
-                            }
-                        }
-                        HostDraftField::Notes => draft.notes.push_str(text),
-                    }
-                    draft.dirty = true;
+                    draft.selected_field = field;
                 }
             }
             SecureInputTarget::CredentialDraft(field) => {
                 if let Some(draft) = self.secure.credential_draft.as_mut() {
-                    match field {
-                        CredentialDraftField::Label => draft.label.push_str(text),
-                        CredentialDraftField::UsernameHint => draft.username_hint.push_str(text),
-                        CredentialDraftField::Secret => draft.secret.push_str(text),
-                    }
-                    draft.dirty = true;
+                    draft.selected_field = field;
                 }
+            }
+            SecureInputTarget::HostSearch
+            | SecureInputTarget::TunnelSearch
+            | SecureInputTarget::CredentialSearch
+            | SecureInputTarget::KeySearch => {}
+        }
+
+        self.secure_text_target = Some(target);
+        self.secure_text_input = self
+            .secure_text_value(target)
+            .map(|value| crate::TextEditState::with_text(&value))
+            .unwrap_or_default();
+    }
+
+    fn sync_secure_text_input(&mut self) {
+        let target = self.secure.input_target;
+        let value = match self.secure_text_value(target) {
+            Some(value) => value,
+            None => {
+                self.secure_text_target = Some(target);
+                self.secure_text_input = crate::TextEditState::default();
+                return;
+            }
+        };
+
+        if self.secure_text_target == Some(target) {
+            self.secure_text_input.sync(&value);
+        } else {
+            self.secure_text_target = Some(target);
+            self.secure_text_input = crate::TextEditState::with_text(&value);
+        }
+    }
+
+    fn secure_text_value(&self, target: SecureInputTarget) -> Option<String> {
+        match target {
+            SecureInputTarget::HostSearch => Some(self.secure.host_search.clone()),
+            SecureInputTarget::TunnelSearch => Some(self.secure.tunnel_search.clone()),
+            SecureInputTarget::CredentialSearch => Some(self.secure.credential_search.clone()),
+            SecureInputTarget::KeySearch => Some(self.secure.key_search.clone()),
+            SecureInputTarget::HostDraft(field) => {
+                self.secure.host_draft.as_ref().map(|draft| match field {
+                    HostDraftField::Label => draft.label.clone(),
+                    HostDraftField::Hostname => draft.hostname.clone(),
+                    HostDraftField::Username => draft.username.clone(),
+                    HostDraftField::Port => draft.port.clone(),
+                    HostDraftField::Notes => draft.notes.clone(),
+                })
+            }
+            SecureInputTarget::CredentialDraft(field) => {
+                self.secure
+                    .credential_draft
+                    .as_ref()
+                    .map(|draft| match field {
+                        CredentialDraftField::Label => draft.label.clone(),
+                        CredentialDraftField::UsernameHint => draft.username_hint.clone(),
+                        CredentialDraftField::Secret => draft.secret.clone(),
+                    })
             }
             SecureInputTarget::TunnelDraft(field) => {
-                if let Some(draft) = self.secure.tunnel_draft.as_mut() {
-                    match field {
-                        TunnelDraftField::Label => draft.label.push_str(text),
-                        TunnelDraftField::Mode => {
-                            if text.eq_ignore_ascii_case("l") {
-                                draft.mode = seance_vault::PortForwardMode::Local;
-                            } else if text.eq_ignore_ascii_case("r") {
-                                draft.mode = seance_vault::PortForwardMode::Remote;
-                            }
+                self.secure.tunnel_draft.as_ref().map(|draft| match field {
+                    TunnelDraftField::Label => draft.label.clone(),
+                    TunnelDraftField::Mode => {
+                        if draft.mode == seance_vault::PortForwardMode::Local {
+                            "Local".into()
+                        } else {
+                            "Remote".into()
                         }
-                        TunnelDraftField::ListenAddress => draft.listen_address.push_str(text),
-                        TunnelDraftField::ListenPort => {
-                            if text.chars().all(|value| value.is_ascii_digit()) {
-                                draft.listen_port.push_str(text);
-                            }
-                        }
-                        TunnelDraftField::TargetAddress => draft.target_address.push_str(text),
-                        TunnelDraftField::TargetPort => {
-                            if text.chars().all(|value| value.is_ascii_digit()) {
-                                draft.target_port.push_str(text);
-                            }
-                        }
-                        TunnelDraftField::Notes => draft.notes.push_str(text),
                     }
-                    draft.dirty = true;
-                }
+                    TunnelDraftField::ListenAddress => draft.listen_address.clone(),
+                    TunnelDraftField::ListenPort => draft.listen_port.clone(),
+                    TunnelDraftField::TargetAddress => draft.target_address.clone(),
+                    TunnelDraftField::TargetPort => draft.target_port.clone(),
+                    TunnelDraftField::Notes => draft.notes.clone(),
+                })
             }
         }
+    }
+
+    fn handle_secure_text_input(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.secure.input_target == SecureInputTarget::TunnelDraft(TunnelDraftField::Mode) {
+            if let Some(ch) = event.keystroke.key_char.as_deref()
+                && let Some(draft) = self.secure.tunnel_draft.as_mut()
+            {
+                if ch.eq_ignore_ascii_case("l") {
+                    draft.mode = seance_vault::PortForwardMode::Local;
+                    draft.dirty = true;
+                    return true;
+                }
+                if ch.eq_ignore_ascii_case("r") {
+                    draft.mode = seance_vault::PortForwardMode::Remote;
+                    draft.dirty = true;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        self.sync_secure_text_input();
+        let target = self.secure.input_target;
+        let paste =
+            text_input_paste_text(event, cx).map(|text| filter_secure_input_text(target, &text));
+        let paste = paste.as_deref();
+
+        let outcome = match target {
+            SecureInputTarget::HostSearch => apply_text_input_event(
+                &mut self.secure_text_input,
+                &mut self.secure.host_search,
+                event,
+                paste,
+            ),
+            SecureInputTarget::TunnelSearch => apply_text_input_event(
+                &mut self.secure_text_input,
+                &mut self.secure.tunnel_search,
+                event,
+                paste,
+            ),
+            SecureInputTarget::CredentialSearch => apply_text_input_event(
+                &mut self.secure_text_input,
+                &mut self.secure.credential_search,
+                event,
+                paste,
+            ),
+            SecureInputTarget::KeySearch => apply_text_input_event(
+                &mut self.secure_text_input,
+                &mut self.secure.key_search,
+                event,
+                paste,
+            ),
+            SecureInputTarget::HostDraft(field) => {
+                let Some(draft) = self.secure.host_draft.as_mut() else {
+                    return false;
+                };
+                let outcome = match field {
+                    HostDraftField::Label => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.label,
+                        event,
+                        paste,
+                    ),
+                    HostDraftField::Hostname => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.hostname,
+                        event,
+                        paste,
+                    ),
+                    HostDraftField::Username => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.username,
+                        event,
+                        paste,
+                    ),
+                    HostDraftField::Port => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.port,
+                        event,
+                        paste,
+                    ),
+                    HostDraftField::Notes => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.notes,
+                        event,
+                        paste,
+                    ),
+                };
+                if outcome.changed {
+                    draft.dirty = true;
+                }
+                outcome
+            }
+            SecureInputTarget::CredentialDraft(field) => {
+                let Some(draft) = self.secure.credential_draft.as_mut() else {
+                    return false;
+                };
+                let outcome = match field {
+                    CredentialDraftField::Label => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.label,
+                        event,
+                        paste,
+                    ),
+                    CredentialDraftField::UsernameHint => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.username_hint,
+                        event,
+                        paste,
+                    ),
+                    CredentialDraftField::Secret => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.secret,
+                        event,
+                        paste,
+                    ),
+                };
+                if outcome.changed {
+                    draft.dirty = true;
+                }
+                outcome
+            }
+            SecureInputTarget::TunnelDraft(field) => {
+                let Some(draft) = self.secure.tunnel_draft.as_mut() else {
+                    return false;
+                };
+                let outcome = match field {
+                    TunnelDraftField::Label => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.label,
+                        event,
+                        paste,
+                    ),
+                    TunnelDraftField::Mode => TextInputOutcome::ignored(),
+                    TunnelDraftField::ListenAddress => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.listen_address,
+                        event,
+                        paste,
+                    ),
+                    TunnelDraftField::ListenPort => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.listen_port,
+                        event,
+                        paste,
+                    ),
+                    TunnelDraftField::TargetAddress => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.target_address,
+                        event,
+                        paste,
+                    ),
+                    TunnelDraftField::TargetPort => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.target_port,
+                        event,
+                        paste,
+                    ),
+                    TunnelDraftField::Notes => apply_text_input_event(
+                        &mut self.secure_text_input,
+                        &mut draft.notes,
+                        event,
+                        paste,
+                    ),
+                };
+                if outcome.changed {
+                    draft.dirty = true;
+                }
+                outcome
+            }
+        };
+
+        apply_text_input_outcome(&outcome, cx);
+        outcome.consumed
+    }
+
+    fn handle_palette_text_input(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let paste = text_input_paste_text(event, cx);
+        let outcome = apply_text_input_event(
+            &mut self.palette_text_input,
+            &mut self.palette_query,
+            event,
+            paste.as_deref(),
+        );
+        apply_text_input_outcome(&outcome, cx);
+        outcome.consumed
+    }
+
+    fn clear_terminal_selection(&mut self) {
+        self.terminal_selection = None;
+        self.terminal_drag_anchor = None;
+    }
+
+    pub(crate) fn terminal_scrollbar_layout(&self) -> Option<TerminalScrollbarLayout> {
+        let geometry = self.terminal_surface.geometry?;
+        let scrollbar = self.terminal_surface.scrollbar?;
+        TerminalScrollbarLayout::new(scrollbar, geometry)
+    }
+
+    fn terminal_local_y(&self, position: gpui::Point<gpui::Pixels>) -> Option<f32> {
+        let geometry = self.terminal_surface.geometry?;
+        let local_y = f32::from(position.y) - TERMINAL_PANE_PADDING_PX;
+        (0.0..=f32::from(geometry.pixel_size.height_px))
+            .contains(&local_y)
+            .then_some(local_y)
+    }
+
+    fn terminal_scrollbar_local_position(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+    ) -> Option<(TerminalScrollbarLayout, f32, f32)> {
+        let geometry = self.terminal_surface.geometry?;
+        let layout = self.terminal_scrollbar_layout()?;
+        let local_x =
+            f32::from(position.x) - self.sidebar_occupied_width_px() - TERMINAL_PANE_PADDING_PX;
+        let local_y = f32::from(position.y) - TERMINAL_PANE_PADDING_PX;
+        if local_x < 0.0 || local_y < 0.0 {
+            return None;
+        }
+
+        let max_x = f32::from(geometry.pixel_size.width_px) + TERMINAL_SCROLLBAR_GUTTER_WIDTH_PX;
+        let max_y = f32::from(geometry.pixel_size.height_px);
+        if local_x > max_x || local_y > max_y {
+            return None;
+        }
+
+        Some((layout, local_x, local_y))
+    }
+
+    fn terminal_selection_point(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+    ) -> Option<crate::model::TerminalSelectionPoint> {
+        let geometry = self.terminal_surface.geometry?;
+        terminal_selection_point_at(
+            position,
+            self.sidebar_occupied_width_px(),
+            TERMINAL_PANE_PADDING_PX,
+            geometry,
+            self.terminal_line_height_px(),
+        )
+    }
+
+    fn terminal_mouse_event(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+        kind: TerminalMouseEventKind,
+        button: Option<TerminalMouseButton>,
+        modifiers: gpui::Modifiers,
+    ) -> Option<TerminalMouseEvent> {
+        let geometry = self.terminal_surface.geometry?;
+        let (local_x, local_y) = terminal_local_point(
+            position,
+            self.sidebar_occupied_width_px(),
+            TERMINAL_PANE_PADDING_PX,
+            geometry,
+        )?;
+
+        Some(TerminalMouseEvent {
+            kind,
+            button,
+            x_px: local_x.min(f32::from(geometry.pixel_size.width_px)) as u32,
+            y_px: local_y.min(f32::from(geometry.pixel_size.height_px)) as u32,
+            modifiers: TerminalInputModifiers {
+                control: modifiers.control,
+                alt: modifiers.alt,
+                shift: modifiers.shift,
+                platform: modifiers.platform,
+                function: modifiers.function,
+            },
+        })
     }
 
     pub(crate) fn delete_saved_host(&mut self, host_scope_key: &str, cx: &mut Context<Self>) {
@@ -1578,42 +2142,913 @@ impl SeanceWorkspace {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalScrollbarMouseDownOutcome {
+    command: Option<TerminalScrollCommand>,
+    drag_state: TerminalScrollbarDragState,
+}
+
+fn terminal_scrollbar_is_interactive(
+    active_screen: TerminalScreenKind,
+    mouse_tracking: bool,
+) -> bool {
+    !mouse_tracking && matches!(active_screen, TerminalScreenKind::Primary)
+}
+
+fn terminal_scrollbar_mouse_down_outcome(
+    layout: TerminalScrollbarLayout,
+    local_x: f32,
+    local_y: f32,
+) -> Option<TerminalScrollbarMouseDownOutcome> {
+    match layout.hit_test(local_x, local_y)? {
+        TerminalScrollbarHit::Thumb => Some(TerminalScrollbarMouseDownOutcome {
+            command: None,
+            drag_state: layout.drag_state(local_y - layout.thumb_top_px),
+        }),
+        TerminalScrollbarHit::Track => {
+            let drag_state = layout.drag_state(layout.center_grab_offset_y_px());
+            Some(TerminalScrollbarMouseDownOutcome {
+                command: Some(TerminalScrollCommand::SetOffsetRows(
+                    drag_state.offset_for_pointer_y(local_y),
+                )),
+                drag_state,
+            })
+        }
+    }
+}
+
+fn terminal_scrollbar_drag_command(
+    drag_state: TerminalScrollbarDragState,
+    local_y: f32,
+) -> TerminalScrollCommand {
+    TerminalScrollCommand::SetOffsetRows(drag_state.offset_for_pointer_y(local_y))
+}
+
+fn terminal_local_point(
+    position: gpui::Point<gpui::Pixels>,
+    sidebar_occupied_width_px: f32,
+    terminal_padding_px: f32,
+    geometry: seance_terminal::TerminalGeometry,
+) -> Option<(f32, f32)> {
+    let local_x = f32::from(position.x) - sidebar_occupied_width_px - terminal_padding_px;
+    let local_y = f32::from(position.y) - terminal_padding_px;
+    if local_x < 0.0 || local_y < 0.0 {
+        return None;
+    }
+
+    let max_x = f32::from(geometry.pixel_size.width_px);
+    let max_y = f32::from(geometry.pixel_size.height_px);
+    if local_x > max_x || local_y > max_y {
+        return None;
+    }
+
+    Some((local_x, local_y))
+}
+
+fn terminal_selection_point_at(
+    position: gpui::Point<gpui::Pixels>,
+    sidebar_occupied_width_px: f32,
+    terminal_padding_px: f32,
+    geometry: seance_terminal::TerminalGeometry,
+    line_height_px: f32,
+) -> Option<TerminalSelectionPoint> {
+    let (local_x, local_y) = terminal_local_point(
+        position,
+        sidebar_occupied_width_px,
+        terminal_padding_px,
+        geometry,
+    )?;
+    let row = (local_y / line_height_px).floor().max(0.0) as usize;
+    let col = (local_x / geometry.cell_width_px as f32).floor().max(0.0) as usize;
+    Some(TerminalSelectionPoint { row, col })
+}
+
 impl Focusable for SeanceWorkspace {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-fn encode_keystroke(event: &KeyDownEvent) -> Option<Vec<u8>> {
-    let key = &event.keystroke.key;
-    let key_char = event.keystroke.key_char.as_deref();
+impl SeanceWorkspace {
+    fn try_open_terminal_link(
+        &mut self,
+        event: &MouseDownEvent,
+        active_screen: TerminalScreenKind,
+    ) -> bool {
+        let Some(point) = self.terminal_selection_point(event.position) else {
+            return false;
+        };
+        let Some(session) = self.active_session() else {
+            return false;
+        };
+        let viewport = session.viewport_snapshot();
+        let Some(url) = terminal_link_open_request(
+            &viewport,
+            point,
+            active_screen,
+            event.button,
+            event.modifiers,
+        ) else {
+            return false;
+        };
+
+        if let Err(error) = seance_platform::open_external_url(&url) {
+            self.show_toast(error.to_string());
+        }
+        true
+    }
+
+    pub(crate) fn handle_terminal_modifiers_changed(
+        &mut self,
+        modifiers: gpui::Modifiers,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(hovered_link) = self.terminal_hovered_link.as_mut() else {
+            return;
+        };
+
+        let modifier_active = terminal_link_open_modifier(modifiers);
+        if hovered_link.modifier_active == modifier_active {
+            return;
+        }
+
+        hovered_link.modifier_active = modifier_active;
+        self.perf_overlay.mark_input(RedrawReason::Input);
+        cx.notify();
+    }
+
+    pub(crate) fn terminal_selected_text(&self) -> Option<String> {
+        let selection = self.terminal_selection?;
+        let viewport = self.active_session()?.viewport_snapshot();
+        selected_terminal_text(&viewport, selection)
+    }
+}
+
+fn ordered_selection_points(
+    selection: crate::model::TerminalSelection,
+) -> (
+    crate::model::TerminalSelectionPoint,
+    crate::model::TerminalSelectionPoint,
+) {
+    if (selection.anchor.row, selection.anchor.col) <= (selection.focus.row, selection.focus.col) {
+        (selection.anchor, selection.focus)
+    } else {
+        (selection.focus, selection.anchor)
+    }
+}
+
+fn terminal_row_text_slice(
+    row: &seance_terminal::TerminalRow,
+    start_col: usize,
+    end_col: usize,
+) -> String {
+    let mut current_col = 0usize;
+    let mut text = String::new();
+
+    for cell in &row.cells {
+        let cell_width = usize::from(cell.width.max(1));
+        let cell_start = current_col;
+        let cell_end = current_col + cell_width;
+        current_col = cell_end;
+
+        if cell_end <= start_col {
+            continue;
+        }
+        if cell_start >= end_col {
+            break;
+        }
+        text.push_str(&cell.text);
+    }
+
+    text
+}
+
+#[derive(Default)]
+struct TextInputOutcome {
+    consumed: bool,
+    changed: bool,
+    clipboard_write: Option<String>,
+}
+
+impl TextInputOutcome {
+    fn ignored() -> Self {
+        Self::default()
+    }
+}
+
+fn apply_text_input_event(
+    state: &mut crate::TextEditState,
+    text: &mut String,
+    event: &KeyDownEvent,
+    clipboard_text: Option<&str>,
+) -> TextInputOutcome {
+    let key = event.keystroke.key.as_str();
     let modifiers = event.keystroke.modifiers;
 
-    if modifiers.platform || modifiers.alt || modifiers.function {
+    if is_text_select_all_shortcut(event) {
+        state.select_all(text);
+        return TextInputOutcome {
+            consumed: true,
+            changed: false,
+            clipboard_write: None,
+        };
+    }
+    if is_text_copy_shortcut(event) {
+        return TextInputOutcome {
+            consumed: true,
+            changed: false,
+            clipboard_write: state.copy(text),
+        };
+    }
+    if is_text_cut_shortcut(event) {
+        let copied = state.cut(text);
+        return TextInputOutcome {
+            consumed: true,
+            changed: copied.is_some(),
+            clipboard_write: copied,
+        };
+    }
+    if is_text_paste_shortcut(event) {
+        if let Some(clipboard_text) = clipboard_text {
+            state.insert_text(text, clipboard_text);
+        }
+        return TextInputOutcome {
+            consumed: true,
+            changed: clipboard_text.is_some(),
+            clipboard_write: None,
+        };
+    }
+
+    match key {
+        "left" => {
+            state.move_left(text, modifiers.shift);
+            TextInputOutcome {
+                consumed: true,
+                changed: false,
+                clipboard_write: None,
+            }
+        }
+        "right" => {
+            state.move_right(text, modifiers.shift);
+            TextInputOutcome {
+                consumed: true,
+                changed: false,
+                clipboard_write: None,
+            }
+        }
+        "home" => {
+            state.move_home(modifiers.shift);
+            TextInputOutcome {
+                consumed: true,
+                changed: false,
+                clipboard_write: None,
+            }
+        }
+        "end" => {
+            state.move_end(text, modifiers.shift);
+            TextInputOutcome {
+                consumed: true,
+                changed: false,
+                clipboard_write: None,
+            }
+        }
+        "backspace" => {
+            state.backspace(text);
+            TextInputOutcome {
+                consumed: true,
+                changed: true,
+                clipboard_write: None,
+            }
+        }
+        "delete" => {
+            state.delete_forward(text);
+            TextInputOutcome {
+                consumed: true,
+                changed: true,
+                clipboard_write: None,
+            }
+        }
+        _ => {
+            if let Some(ch) = event.keystroke.key_char.as_deref()
+                && !modifiers.platform
+                && !modifiers.control
+                && !modifiers.function
+            {
+                state.insert_text(text, ch);
+                return TextInputOutcome {
+                    consumed: true,
+                    changed: true,
+                    clipboard_write: None,
+                };
+            }
+
+            TextInputOutcome::ignored()
+        }
+    }
+}
+
+fn apply_text_input_outcome(outcome: &TextInputOutcome, cx: &mut Context<SeanceWorkspace>) {
+    if let Some(text) = outcome.clipboard_write.as_ref() {
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+    }
+}
+
+fn text_input_paste_text(
+    event: &KeyDownEvent,
+    cx: &mut Context<SeanceWorkspace>,
+) -> Option<String> {
+    is_text_paste_shortcut(event)
+        .then(|| cx.read_from_clipboard().and_then(|item| item.text()))
+        .flatten()
+}
+
+fn text_input_mutated_key(event: &KeyDownEvent, key_char: Option<&str>) -> bool {
+    matches!(event.keystroke.key.as_str(), "backspace" | "delete")
+        || is_text_cut_shortcut(event)
+        || is_text_paste_shortcut(event)
+        || key_char.is_some_and(|_| {
+            let modifiers = event.keystroke.modifiers;
+            !modifiers.platform && !modifiers.control && !modifiers.function
+        })
+}
+
+fn text_primary_modifier(modifiers: gpui::Modifiers) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        modifiers.platform && !modifiers.control
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        modifiers.control && !modifiers.platform
+    }
+}
+
+fn is_text_select_all_shortcut(event: &KeyDownEvent) -> bool {
+    text_primary_modifier(event.keystroke.modifiers) && event.keystroke.key == "a"
+}
+
+fn is_text_copy_shortcut(event: &KeyDownEvent) -> bool {
+    text_primary_modifier(event.keystroke.modifiers) && event.keystroke.key == "c"
+}
+
+fn is_text_cut_shortcut(event: &KeyDownEvent) -> bool {
+    text_primary_modifier(event.keystroke.modifiers) && event.keystroke.key == "x"
+}
+
+fn is_text_paste_shortcut(event: &KeyDownEvent) -> bool {
+    text_primary_modifier(event.keystroke.modifiers) && event.keystroke.key == "v"
+}
+
+fn filter_secure_input_text(target: SecureInputTarget, text: &str) -> String {
+    match target {
+        SecureInputTarget::HostDraft(HostDraftField::Port)
+        | SecureInputTarget::TunnelDraft(TunnelDraftField::ListenPort)
+        | SecureInputTarget::TunnelDraft(TunnelDraftField::TargetPort) => text
+            .chars()
+            .filter(|value| value.is_ascii_digit())
+            .collect(),
+        _ => text.to_string(),
+    }
+}
+
+fn terminal_mouse_button(button: MouseButton) -> Option<TerminalMouseButton> {
+    match button {
+        MouseButton::Left => Some(TerminalMouseButton::Left),
+        MouseButton::Right => Some(TerminalMouseButton::Right),
+        MouseButton::Middle => Some(TerminalMouseButton::Middle),
+        _ => None,
+    }
+}
+
+fn terminal_link_open_request(
+    viewport: &TerminalViewportSnapshot,
+    point: TerminalSelectionPoint,
+    active_screen: TerminalScreenKind,
+    button: MouseButton,
+    modifiers: gpui::Modifiers,
+) -> Option<String> {
+    if button != MouseButton::Left || !terminal_link_open_modifier(modifiers) {
         return None;
     }
 
-    if modifiers.control && key.len() == 1 {
-        let byte = key.as_bytes()[0].to_ascii_lowercase();
-        if byte.is_ascii_lowercase() {
-            return Some(vec![byte - b'a' + 1]);
+    if !matches!(active_screen, TerminalScreenKind::Primary) {
+        return None;
+    }
+
+    let row = viewport.rows.get(point.row)?;
+    terminal_link_at_column(row, point.col)
+}
+
+fn terminal_link_open_modifier(modifiers: gpui::Modifiers) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        modifiers.platform && !modifiers.control && !modifiers.alt && !modifiers.function
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        modifiers.control && !modifiers.platform && !modifiers.alt && !modifiers.function
+    }
+}
+
+fn terminal_hovered_link_at_position(
+    viewport: &TerminalViewportSnapshot,
+    point: TerminalSelectionPoint,
+    active_screen: TerminalScreenKind,
+    mouse_tracking: bool,
+    modifiers: gpui::Modifiers,
+) -> Option<TerminalHoveredLink> {
+    if !matches!(active_screen, TerminalScreenKind::Primary) || mouse_tracking {
+        return None;
+    }
+
+    let row = viewport.rows.get(point.row)?;
+    let row_revision = viewport
+        .row_revisions
+        .get(point.row)
+        .copied()
+        .unwrap_or_default();
+    let visible_cols = viewport.cols as usize;
+    let link = terminal_links_for_row(row, visible_cols)
+        .into_iter()
+        .find(|link| link.col_range.contains(&point.col))?;
+
+    Some(TerminalHoveredLink {
+        row: point.row,
+        row_revision,
+        col_range: link.col_range,
+        url: link.url,
+        modifier_active: terminal_link_open_modifier(modifiers),
+    })
+}
+
+fn selected_terminal_text(
+    viewport: &seance_terminal::TerminalViewportSnapshot,
+    selection: crate::model::TerminalSelection,
+) -> Option<String> {
+    let (start, end) = ordered_selection_points(selection);
+    if start == end || start.row >= viewport.rows.len() {
+        return None;
+    }
+
+    let end_row = end.row.min(viewport.rows.len().saturating_sub(1));
+    let mut lines = Vec::new();
+    for row_index in start.row..=end_row {
+        let Some(row) = viewport.rows.get(row_index) else {
+            break;
+        };
+        let line = if row_index == start.row && row_index == end_row {
+            terminal_row_text_slice(row, start.col, end.col)
+        } else if row_index == start.row {
+            terminal_row_text_slice(row, start.col, usize::MAX)
+        } else if row_index == end_row {
+            terminal_row_text_slice(row, 0, end.col)
+        } else {
+            row.plain_text()
+        };
+        lines.push(line.trim_end_matches(' ').to_string());
+    }
+
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, mpsc};
+
+    use anyhow::Result;
+    use gpui::{Modifiers, MouseButton, point, px};
+    use seance_terminal::{
+        SessionPerfSnapshot, SessionSummary, TerminalCell, TerminalGeometry, TerminalKeyEvent,
+        TerminalMouseEvent, TerminalPaste, TerminalRow, TerminalScreenKind, TerminalScrollCommand,
+        TerminalScrollbarState, TerminalSession, TerminalTextEvent, TerminalViewportSnapshot,
+    };
+
+    use crate::model::{
+        SIDEBAR_DRAG_TARGET_PX, TerminalSelection, TerminalSelectionPoint,
+        sidebar_occupied_width_px,
+    };
+
+    use super::{
+        selected_terminal_text, terminal_hovered_link_at_position, terminal_link_open_modifier,
+        terminal_link_open_request, terminal_local_point, terminal_scrollbar_drag_command,
+        terminal_scrollbar_is_interactive, terminal_scrollbar_mouse_down_outcome,
+        terminal_selection_point_at,
+    };
+
+    #[derive(Default)]
+    struct RecordingSession {
+        scroll_commands: Mutex<Vec<TerminalScrollCommand>>,
+    }
+
+    impl RecordingSession {
+        fn scroll_commands(&self) -> Vec<TerminalScrollCommand> {
+            self.scroll_commands
+                .lock()
+                .expect("scroll commands poisoned")
+                .clone()
         }
     }
 
-    match key.as_str() {
-        "enter" => Some(vec![b'\r']),
-        "tab" => Some(vec![b'\t']),
-        "backspace" => Some(vec![0x7f]),
-        "escape" => Some(vec![0x1b]),
-        "space" => Some(vec![b' ']),
-        "up" => Some(b"\x1b[A".to_vec()),
-        "down" => Some(b"\x1b[B".to_vec()),
-        "right" => Some(b"\x1b[C".to_vec()),
-        "left" => Some(b"\x1b[D".to_vec()),
-        "home" => Some(b"\x1b[H".to_vec()),
-        "end" => Some(b"\x1b[F".to_vec()),
-        "pageup" => Some(b"\x1b[5~".to_vec()),
-        "pagedown" => Some(b"\x1b[6~".to_vec()),
-        _ => key_char.map(|text| text.as_bytes().to_vec()),
+    impl TerminalSession for RecordingSession {
+        fn id(&self) -> u64 {
+            7
+        }
+
+        fn title(&self) -> &str {
+            "recording"
+        }
+
+        fn summary(&self) -> SessionSummary {
+            SessionSummary::default()
+        }
+
+        fn viewport_snapshot(&self) -> TerminalViewportSnapshot {
+            TerminalViewportSnapshot::default()
+        }
+
+        fn send_input(&self, _bytes: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_text(&self, _event: TerminalTextEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_key(&self, _event: TerminalKeyEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_mouse(&self, _event: TerminalMouseEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn paste(&self, _paste: TerminalPaste) -> Result<()> {
+            Ok(())
+        }
+
+        fn resize(&self, _geometry: TerminalGeometry) -> Result<()> {
+            Ok(())
+        }
+
+        fn scroll_viewport(&self, command: TerminalScrollCommand) -> Result<()> {
+            self.scroll_commands
+                .lock()
+                .expect("scroll commands poisoned")
+                .push(command);
+            Ok(())
+        }
+
+        fn scroll_to_bottom(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn perf_snapshot(&self) -> SessionPerfSnapshot {
+            SessionPerfSnapshot::default()
+        }
+
+        fn take_notify_rx(&self) -> Option<mpsc::Receiver<()>> {
+            None
+        }
+    }
+
+    fn snapshot(rows: &[&str]) -> TerminalViewportSnapshot {
+        TerminalViewportSnapshot {
+            rows: rows
+                .iter()
+                .map(|row| {
+                    Arc::new(TerminalRow {
+                        cells: row
+                            .chars()
+                            .map(|ch| TerminalCell {
+                                text: ch.to_string(),
+                                style: Default::default(),
+                                width: 1,
+                            })
+                            .collect(),
+                    })
+                })
+                .collect(),
+            row_revisions: Arc::from(vec![0; rows.len()]),
+            cursor: None,
+            scrollbar: None,
+            revision: 0,
+            cols: 80,
+            rows_visible: rows.len() as u16,
+        }
+    }
+
+    #[test]
+    fn selected_terminal_text_trims_trailing_spaces_per_line() {
+        let viewport = snapshot(&["alpha   ", "beta   "]);
+        let selection = TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, col: 0 },
+            focus: TerminalSelectionPoint { row: 1, col: 4 },
+        };
+
+        assert_eq!(
+            selected_terminal_text(&viewport, selection).as_deref(),
+            Some("alpha\nbeta")
+        );
+    }
+
+    #[test]
+    fn selected_terminal_text_handles_reverse_selection() {
+        let viewport = snapshot(&["alpha", "beta"]);
+        let selection = TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 1, col: 2 },
+            focus: TerminalSelectionPoint { row: 0, col: 2 },
+        };
+
+        assert_eq!(
+            selected_terminal_text(&viewport, selection).as_deref(),
+            Some("pha\nbe")
+        );
+    }
+
+    fn geometry() -> TerminalGeometry {
+        TerminalGeometry::new(80, 24, 640, 456, 8, 19).expect("terminal geometry")
+    }
+
+    fn scrollbar_layout() -> crate::TerminalScrollbarLayout {
+        crate::TerminalScrollbarLayout::new(
+            TerminalScrollbarState {
+                total_rows: 180,
+                offset_rows: 60,
+                visible_rows: 24,
+            },
+            geometry(),
+        )
+        .expect("scrollbar layout")
+    }
+
+    #[test]
+    fn terminal_local_point_rejects_positions_before_drag_target_and_padding() {
+        let occupied_width = sidebar_occupied_width_px(260.0);
+        let x_before_terminal = occupied_width + 16.0 - 1.0;
+
+        assert_eq!(
+            terminal_local_point(
+                point(px(x_before_terminal), px(20.0)),
+                occupied_width,
+                16.0,
+                geometry()
+            ),
+            None
+        );
+        assert_eq!(occupied_width, 260.0 + SIDEBAR_DRAG_TARGET_PX);
+    }
+
+    #[test]
+    fn terminal_local_point_starts_at_zero_after_sidebar_handle_and_padding() {
+        let occupied_width = sidebar_occupied_width_px(260.0);
+
+        assert_eq!(
+            terminal_local_point(
+                point(px(occupied_width + 16.0), px(16.0)),
+                occupied_width,
+                16.0,
+                geometry()
+            ),
+            Some((0.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn terminal_selection_point_uses_first_cell_after_divider() {
+        let occupied_width = sidebar_occupied_width_px(260.0);
+
+        assert_eq!(
+            terminal_selection_point_at(
+                point(px(occupied_width + 16.0), px(16.0)),
+                occupied_width,
+                16.0,
+                geometry(),
+                19.0
+            ),
+            Some(TerminalSelectionPoint { row: 0, col: 0 })
+        );
+        assert_eq!(
+            terminal_selection_point_at(
+                point(px(occupied_width + 16.0 + 8.0), px(16.0 + 19.0)),
+                occupied_width,
+                16.0,
+                geometry(),
+                19.0
+            ),
+            Some(TerminalSelectionPoint { row: 1, col: 1 })
+        );
+    }
+
+    #[test]
+    fn clicking_scrollbar_track_issues_absolute_scroll_command() {
+        let layout = scrollbar_layout();
+        let session = RecordingSession::default();
+        let click_y = layout.thumb_top_px + layout.thumb_height_px + 18.0;
+        let outcome =
+            terminal_scrollbar_mouse_down_outcome(layout, layout.gutter_left_px + 2.0, click_y)
+                .expect("track outcome");
+
+        if let Some(command) = outcome.command {
+            session
+                .scroll_viewport(command)
+                .expect("scroll command should record");
+        }
+
+        assert_eq!(
+            session.scroll_commands(),
+            vec![TerminalScrollCommand::SetOffsetRows(
+                outcome.drag_state.offset_for_pointer_y(click_y)
+            )]
+        );
+        assert_eq!(
+            outcome.drag_state.grab_offset_y_px,
+            layout.center_grab_offset_y_px()
+        );
+    }
+
+    #[test]
+    fn dragging_scrollbar_thumb_emits_absolute_offset_commands() {
+        let layout = scrollbar_layout();
+        let session = RecordingSession::default();
+        let thumb_x = layout.thumb_left_px(layout.active_thumb_width_px()) + 1.0;
+        let thumb_y = layout.thumb_top_px + 4.0;
+        let drag_state = terminal_scrollbar_mouse_down_outcome(layout, thumb_x, thumb_y)
+            .expect("thumb outcome")
+            .drag_state;
+        let command = terminal_scrollbar_drag_command(
+            drag_state,
+            layout.track_top_px + layout.track_height_px,
+        );
+
+        session
+            .scroll_viewport(command)
+            .expect("scroll command should record");
+
+        assert_eq!(
+            session.scroll_commands(),
+            vec![TerminalScrollCommand::SetOffsetRows(layout.max_offset_rows)]
+        );
+    }
+
+    #[test]
+    fn scrollbar_drag_state_is_cleared_when_released() {
+        let layout = scrollbar_layout();
+        let mut drag_state = Some(layout.drag_state(layout.center_grab_offset_y_px()));
+
+        assert!(drag_state.take().is_some());
+        assert_eq!(drag_state, None);
+    }
+
+    #[test]
+    fn scrollbar_interaction_is_disabled_on_alternate_screen() {
+        assert!(!terminal_scrollbar_is_interactive(
+            TerminalScreenKind::Alternate,
+            false
+        ));
+    }
+
+    #[test]
+    fn scrollbar_interaction_is_disabled_during_mouse_tracking() {
+        assert!(!terminal_scrollbar_is_interactive(
+            TerminalScreenKind::Primary,
+            true
+        ));
+        assert!(terminal_scrollbar_is_interactive(
+            TerminalScreenKind::Primary,
+            false
+        ));
+    }
+
+    #[test]
+    fn hovering_link_on_primary_screen_sets_hover_state() {
+        let viewport = snapshot(&["visit https://example.com now"]);
+        let hovered_link = terminal_hovered_link_at_position(
+            &viewport,
+            TerminalSelectionPoint { row: 0, col: 10 },
+            TerminalScreenKind::Primary,
+            false,
+            Modifiers::default(),
+        )
+        .expect("hovered link");
+
+        assert_eq!(hovered_link.row, 0);
+        assert_eq!(hovered_link.col_range, 6..25);
+        assert_eq!(hovered_link.url, "https://example.com");
+        assert!(!hovered_link.modifier_active);
+    }
+
+    #[test]
+    fn moving_off_link_returns_none() {
+        let viewport = snapshot(&["visit https://example.com now"]);
+
+        assert_eq!(
+            terminal_hovered_link_at_position(
+                &viewport,
+                TerminalSelectionPoint { row: 0, col: 2 },
+                TerminalScreenKind::Primary,
+                false,
+                Modifiers::default(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn mouse_tracking_disables_hovered_link_state() {
+        let viewport = snapshot(&["visit https://example.com now"]);
+
+        assert_eq!(
+            terminal_hovered_link_at_position(
+                &viewport,
+                TerminalSelectionPoint { row: 0, col: 10 },
+                TerminalScreenKind::Primary,
+                true,
+                Modifiers::default(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn alternate_screen_disables_hovered_link_state() {
+        let viewport = snapshot(&["visit https://example.com now"]);
+
+        assert_eq!(
+            terminal_hovered_link_at_position(
+                &viewport,
+                TerminalSelectionPoint { row: 0, col: 10 },
+                TerminalScreenKind::Alternate,
+                false,
+                Modifiers::default(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hovered_link_tracks_modifier_state() {
+        let viewport = snapshot(&["visit https://example.com now"]);
+        let hovered_link = terminal_hovered_link_at_position(
+            &viewport,
+            TerminalSelectionPoint { row: 0, col: 10 },
+            TerminalScreenKind::Primary,
+            false,
+            link_open_modifiers(),
+        )
+        .expect("hovered link");
+
+        assert!(hovered_link.modifier_active);
+    }
+
+    #[test]
+    fn modifier_click_on_link_returns_open_request() {
+        let viewport = snapshot(&["visit https://example.com now"]);
+
+        assert_eq!(
+            terminal_link_open_request(
+                &viewport,
+                TerminalSelectionPoint { row: 0, col: 10 },
+                TerminalScreenKind::Primary,
+                MouseButton::Left,
+                link_open_modifiers(),
+            )
+            .as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn plain_click_on_link_does_not_return_open_request() {
+        let viewport = snapshot(&["visit https://example.com now"]);
+
+        assert_eq!(
+            terminal_link_open_request(
+                &viewport,
+                TerminalSelectionPoint { row: 0, col: 10 },
+                TerminalScreenKind::Primary,
+                MouseButton::Left,
+                Modifiers::default(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn link_open_modifier_matches_expected_platform_shortcut() {
+        assert!(terminal_link_open_modifier(link_open_modifiers()));
+        assert!(!terminal_link_open_modifier(Modifiers::default()));
+    }
+
+    fn link_open_modifiers() -> Modifiers {
+        #[cfg(target_os = "macos")]
+        {
+            Modifiers::command()
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Modifiers::control()
+        }
     }
 }

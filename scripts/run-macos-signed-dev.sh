@@ -35,6 +35,7 @@ dylib_path="$(resolve_ghostty_dylib_path debug)"
 rm -rf "${app_bundle}"
 mkdir -p "${app_bundle}/Contents/MacOS" "${app_bundle}/Contents/Resources"
 cp packaging/macos/Info.plist "${app_bundle}/Contents/Info.plist"
+cp -R packaging/macos/Resources/. "${app_bundle}/Contents/Resources/"
 cp "${binary_path}" "${app_bundle}/Contents/MacOS/seance-app"
 chmod +x "${app_bundle}/Contents/MacOS/seance-app"
 

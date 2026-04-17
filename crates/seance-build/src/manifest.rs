@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{artifacts, changelog, sparkle, workspace};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReleaseManifest {
+pub(crate) struct ReleaseManifest {
     pub version: String,
     pub tag_name: String,
     pub release_title: String,
@@ -23,14 +23,14 @@ pub struct ReleaseManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppcastPlan {
+pub(crate) struct AppcastPlan {
     pub sparkle_item_path: String,
     pub output_path: String,
     pub download_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlatformPlan {
+pub(crate) struct PlatformPlan {
     pub platform: String,
     pub arch: String,
     pub manifest_path: String,
@@ -38,19 +38,19 @@ pub struct PlatformPlan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtifactPlan {
+pub(crate) struct ArtifactPlan {
     pub kind: String,
     pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlatformManifest {
+pub(crate) struct PlatformManifest {
     pub platform: String,
     pub arch: String,
     pub artifacts: Vec<ArtifactPlan>,
 }
 
-pub fn prepare_release(
+pub(crate) fn prepare_release(
     tag_ref: &str,
     release_dir: &Path,
     manifest_out: &Path,
@@ -98,7 +98,7 @@ pub fn prepare_release(
     write_json(manifest_out, &manifest)
 }
 
-pub fn ensure_draft_release(manifest_path: &Path) -> Result<()> {
+pub(crate) fn ensure_draft_release(manifest_path: &Path) -> Result<()> {
     let manifest = read_release_manifest(manifest_path)?;
     let status = Command::new("gh")
         .args(["release", "view", &manifest.tag_name])
@@ -128,7 +128,7 @@ pub fn ensure_draft_release(manifest_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn write_platform_manifest(
+pub(crate) fn write_platform_manifest(
     manifest_path: &Path,
     platform: &str,
     arch: &str,
@@ -171,7 +171,11 @@ pub fn write_platform_manifest(
     write_json(Path::new(&plan.manifest_path), &platform_manifest)
 }
 
-pub fn upload_platform_assets(manifest_path: &Path, platform: &str, arch: &str) -> Result<()> {
+pub(crate) fn upload_platform_assets(
+    manifest_path: &Path,
+    platform: &str,
+    arch: &str,
+) -> Result<()> {
     let manifest = read_release_manifest(manifest_path)?;
     let plan = manifest.platform(platform, arch)?;
     let platform_manifest = read_platform_manifest(Path::new(&plan.manifest_path))?;
@@ -193,7 +197,7 @@ pub fn upload_platform_assets(manifest_path: &Path, platform: &str, arch: &str) 
     Ok(())
 }
 
-pub fn validate_from_manifest(manifest_path: &Path) -> Result<()> {
+pub(crate) fn validate_from_manifest(manifest_path: &Path) -> Result<()> {
     let manifest = read_release_manifest(manifest_path)?;
     sparkle::validate_artifacts(
         Path::new(&manifest.release_dir),
@@ -216,7 +220,7 @@ pub fn validate_from_manifest(manifest_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn write_checksums_from_manifest(manifest_path: &Path) -> Result<()> {
+pub(crate) fn write_checksums_from_manifest(manifest_path: &Path) -> Result<()> {
     let manifest = read_release_manifest(manifest_path)?;
     artifacts::write_checksums(
         Path::new(&manifest.release_dir),
@@ -224,7 +228,7 @@ pub fn write_checksums_from_manifest(manifest_path: &Path) -> Result<()> {
     )
 }
 
-pub fn generate_appcast_from_manifest(manifest_path: &Path) -> Result<()> {
+pub(crate) fn generate_appcast_from_manifest(manifest_path: &Path) -> Result<()> {
     let manifest = read_release_manifest(manifest_path)?;
     sparkle::write_appcast(
         Path::new(&manifest.appcast.sparkle_item_path),
@@ -234,7 +238,7 @@ pub fn generate_appcast_from_manifest(manifest_path: &Path) -> Result<()> {
     )
 }
 
-pub fn read_release_manifest(path: &Path) -> Result<ReleaseManifest> {
+pub(crate) fn read_release_manifest(path: &Path) -> Result<ReleaseManifest> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read release manifest at {}", path.display()))?;
     serde_json::from_str(&raw)

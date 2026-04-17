@@ -134,7 +134,7 @@ impl SeanceWorkspace {
         self.refresh_sftp_listing(&mut browser);
         self.sftp_browser = Some(browser);
         self.surface = WorkspaceSurface::Sftp;
-        self.palette_open = false;
+        self.close_palette(cx);
         cx.notify();
     }
 
@@ -219,44 +219,6 @@ impl SeanceWorkspace {
             }
             Err(err) => {
                 self.show_toast(format!("Download failed: {err}"));
-            }
-        }
-        cx.notify();
-    }
-
-    #[allow(dead_code)]
-    fn sftp_upload_file(&mut self, local_path: &std::path::Path, cx: &mut Context<Self>) {
-        let Some(browser) = &self.sftp_browser else {
-            return;
-        };
-        let session_id = browser.session_id;
-        let file_name = local_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("uploaded_file")
-            .to_string();
-        let remote_path = if browser.current_path == "/" {
-            format!("/{file_name}")
-        } else {
-            format!("{}/{file_name}", browser.current_path)
-        };
-
-        match fs::read(local_path) {
-            Ok(data) => match self
-                .backend
-                .sftp_write_file(session_id, &remote_path, &data)
-            {
-                Ok(()) => {
-                    self.show_toast(format!("Uploaded {file_name}"));
-                    self.sftp_refresh(cx);
-                    return;
-                }
-                Err(err) => {
-                    self.show_toast(format!("Upload failed: {err}"));
-                }
-            },
-            Err(err) => {
-                self.show_toast(format!("Failed to read local file: {err}"));
             }
         }
         cx.notify();
@@ -552,6 +514,7 @@ impl SeanceWorkspace {
             .h_full()
             .bg(t.bg_void)
             .track_focus(&self.focus_handle)
+            .key_context("WorkspaceSftp")
             .on_mouse_down(MouseButton::Left, {
                 let focus_handle = self.focus_handle.clone();
                 move |_: &gpui::MouseDownEvent, window: &mut Window, _cx: &mut App| {

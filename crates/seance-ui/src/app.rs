@@ -7,8 +7,9 @@ use std::sync::{
 use anyhow::Result;
 use gpui::{
     AnyWindowHandle, App, AppContext, Application, BorrowAppContext, Bounds, Context, Global,
-    KeyBinding, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, px, size,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, px, size,
 };
+use seance_config::AppConfig;
 use seance_core::{AppControllerHandle, PlatformCloseAction, WindowTarget};
 use seance_terminal::TerminalGeometry;
 use tracing::trace;
@@ -16,10 +17,12 @@ use tracing::trace;
 use crate::{
     CheckForUpdates, CloseActiveSession, ConnectHost, ConnectHostInNewWindow, HideOtherApps,
     HideSeance, NewTerminal, OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance,
-    SeanceWorkspace, SelectSession, SettingsSection, ShowAllApps, SwitchTheme, TogglePerfHud,
+    SeanceWorkspace, SelectNextSession, SelectPreviousSession, SelectSession, SelectSessionSlot,
+    SettingsSection, ShowAllApps, SwitchTheme, TogglePerfHud,
     backend::UiBackend,
     connect::ConnectAttemptTracker,
     forms::{SecureWorkspaceState, SettingsPanelState, VaultModalState, WorkspaceSurface},
+    keybindings::{install_app_keybindings, rebuild_app_keybindings},
     perf::{PerfOverlayState, perf_mode_from_config, perf_mode_override_from_env},
     surface::TerminalSurfaceState,
     ui_components::theme_id_from_config,
@@ -66,12 +69,14 @@ pub fn run(runtime: UiRuntime) -> Result<()> {
         }
         cx.set_global(WorkspaceWindowRegistry::default());
         register_app_actions(cx, backend.clone());
+        install_app_keybindings(cx, &backend.controller().config_snapshot());
         if let Some(configure_app) = integration.configure_app.take() {
             configure_app(cx);
         }
         refresh_app_menus(cx);
 
         let async_app = cx.to_async();
+        schedule_app_keybinding_watcher(cx, backend.clone(), async_app.clone());
         let quit_requested = Arc::new(AtomicBool::new(false));
         let backend_for_close = backend.clone();
         let quit_requested_for_close = Arc::clone(&quit_requested);
@@ -287,17 +292,6 @@ fn with_registered_workspace(
 }
 
 fn register_app_actions(cx: &mut App, backend: UiBackend) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-,", OpenPreferences, None),
-        KeyBinding::new("cmd-k", OpenCommandPalette, None),
-        KeyBinding::new("cmd-t", NewTerminal, None),
-        KeyBinding::new("cmd-w", CloseActiveSession, None),
-        KeyBinding::new("cmd-shift-.", TogglePerfHud, None),
-        KeyBinding::new("cmd-n", OpenNewWindow, None),
-        KeyBinding::new("cmd-q", QuitSeance, None),
-        KeyBinding::new("cmd-h", HideSeance, None),
-    ]);
-
     let backend_for_new_terminal = backend.clone();
     cx.on_action(move |_: &NewTerminal, cx| {
         if !with_registered_workspace(cx, |this, window, cx| this.spawn_session(window, cx)) {
@@ -356,6 +350,32 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
             if this.active_session_id != 0 {
                 this.close_session(this.active_session_id, window, cx);
             }
+        });
+        if handled {
+            refresh_app_menus(cx);
+        }
+    });
+
+    cx.on_action(move |_: &SelectPreviousSession, cx| {
+        let handled = with_registered_workspace(cx, |this, window, cx| {
+            this.select_previous_session(window, cx)
+        });
+        if handled {
+            refresh_app_menus(cx);
+        }
+    });
+
+    cx.on_action(move |_: &SelectNextSession, cx| {
+        let handled =
+            with_registered_workspace(cx, |this, window, cx| this.select_next_session(window, cx));
+        if handled {
+            refresh_app_menus(cx);
+        }
+    });
+
+    cx.on_action(move |action: &SelectSessionSlot, cx| {
+        let handled = with_registered_workspace(cx, |this, window, cx| {
+            this.select_session_slot(action.slot, window, cx);
         });
         if handled {
             refresh_app_menus(cx);
@@ -467,6 +487,35 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
     });
 }
 
+fn schedule_app_keybinding_watcher(cx: &mut App, backend: UiBackend, async_app: gpui::AsyncApp) {
+    let config_rx = Arc::new(Mutex::new(backend.subscribe_config_changes()));
+    cx.foreground_executor()
+        .spawn(async move {
+            loop {
+                let rx = Arc::clone(&config_rx);
+                let next_config = async_app
+                    .background_executor()
+                    .spawn(async move { rx.lock().unwrap().recv().ok() })
+                    .await;
+                let Some(mut next_config) = next_config else {
+                    break;
+                };
+                while let Ok(config) = config_rx.lock().unwrap().try_recv() {
+                    next_config = config;
+                }
+                let _ = async_app.update(move |cx| {
+                    apply_app_keybinding_snapshot(cx, next_config);
+                });
+            }
+        })
+        .detach();
+}
+
+fn apply_app_keybinding_snapshot(cx: &mut App, config: AppConfig) {
+    rebuild_app_keybindings(cx, &config);
+    refresh_app_menus(cx);
+}
+
 fn open_workspace_window(
     cx: &mut App,
     backend: UiBackend,
@@ -540,6 +589,11 @@ fn open_workspace_window(
                     palette_query: String::new(),
                     palette_selected: 0,
                     palette_scroll_handle: gpui::ScrollHandle::new(),
+                    palette_text_input: crate::TextEditState::default(),
+                    secure_text_input: crate::TextEditState::default(),
+                    secure_text_target: None,
+                    vault_modal_text_input: crate::TextEditState::default(),
+                    vault_modal_text_field: None,
                     terminal_metrics: None,
                     last_applied_geometry: None,
                     terminal_resize_epoch: 0,
@@ -548,10 +602,17 @@ fn open_workspace_window(
                         theme_id: theme_id_from_config(&bootstrap.config),
                         ..Default::default()
                     },
+                    terminal_ime: crate::model::TerminalImeState::default(),
                     perf_mode_env_override: perf_mode_override_from_env(),
                     perf_overlay: PerfOverlayState::new(perf_mode_from_config(&bootstrap.config)),
                     sidebar_width: crate::model::DEFAULT_SIDEBAR_WIDTH,
                     sidebar_resizing: false,
+                    terminal_selection: None,
+                    terminal_drag_anchor: None,
+                    terminal_hovered_link: None,
+                    terminal_scroll_remainder_rows: 0.0,
+                    terminal_scrollbar_hovered: false,
+                    terminal_scrollbar_drag: None,
                     toast: None,
                 };
                 cx.observe_window_bounds(window, |this: &mut SeanceWorkspace, window, cx| {
@@ -635,15 +696,15 @@ mod tests {
 
     use anyhow::Result;
     use gpui::{
-        App, AppContext as GpuiAppContext, Entity, TestAppContext, VisualTestContext, Window, px,
-        size,
+        App, AppContext as GpuiAppContext, Entity, TestAppContext, VisualTestContext, Window,
+        point, px, size,
     };
     use seance_config::PerfHudDefault;
     use seance_core::{AppContext, AppPaths, SessionOrigin};
     use seance_ssh::{PortForwardRuntimeSnapshot, PortForwardStatus, SshPortForwardMode};
     use seance_terminal::{
-        SessionPerfSnapshot, SessionSummary, TerminalScrollCommand, TerminalSession,
-        TerminalViewportSnapshot,
+        SessionPerfSnapshot, SessionSummary, TerminalKeyEvent, TerminalMouseEvent, TerminalPaste,
+        TerminalScrollCommand, TerminalSession, TerminalTextEvent, TerminalViewportSnapshot,
     };
     use seance_vault::{
         HostAuthRef, PortForwardMode, SecretString, VaultHostProfile, VaultPasswordCredential,
@@ -703,6 +764,22 @@ mod tests {
         }
 
         fn send_input(&self, _bytes: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_text(&self, _event: TerminalTextEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_key(&self, _event: TerminalKeyEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_mouse(&self, _event: TerminalMouseEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn paste(&self, _paste: TerminalPaste) -> Result<()> {
             Ok(())
         }
 
@@ -894,6 +971,47 @@ mod tests {
         )
     }
 
+    fn open_workspace_with_sessions(
+        cx: &mut TestAppContext,
+        session_ids: &[u64],
+        target_id: u64,
+    ) -> (
+        Vec<Arc<RecordingSession>>,
+        Entity<SeanceWorkspace>,
+        VisualTestContext,
+    ) {
+        let controller = make_test_controller();
+        let backend = UiBackend::new(controller.clone()).expect("backend");
+        let sessions = session_ids
+            .iter()
+            .map(|id| Arc::new(RecordingSession::new(*id, format!("session-{id}"))))
+            .collect::<Vec<_>>();
+
+        cx.update(|cx: &mut App| {
+            cx.set_global(WorkspaceWindowRegistry::default());
+            for session in &sessions {
+                controller.register_remote_session(session.clone());
+            }
+            open_workspace_window(
+                cx,
+                backend,
+                WindowTarget::Session {
+                    session_id: target_id,
+                },
+                None,
+            )
+            .expect("open workspace window");
+        });
+
+        let window_handle = cx.windows().into_iter().next().expect("workspace window");
+        let workspace = workspace_root(cx, window_handle);
+        (
+            sessions,
+            workspace,
+            VisualTestContext::from_window(window_handle, cx),
+        )
+    }
+
     fn open_workspace_with_controller(
         cx: &mut TestAppContext,
         controller: AppControllerHandle,
@@ -909,6 +1027,20 @@ mod tests {
         let window_handle = cx.windows().into_iter().next().expect("workspace window");
         let workspace = workspace_root(cx, window_handle);
         (workspace, VisualTestContext::from_window(window_handle, cx))
+    }
+
+    fn seed_palette_state(workspace: &Entity<SeanceWorkspace>, visual: &mut VisualTestContext) {
+        workspace.update_in(
+            visual,
+            |this: &mut SeanceWorkspace, _window: &mut Window, _| {
+                this.palette_open = true;
+                this.palette_query = "theme".into();
+                this.palette_selected = 3;
+                this.palette_text_input = crate::TextEditState::with_text(&this.palette_query);
+                this.palette_scroll_handle
+                    .set_offset(point(px(0.0), px(96.0)));
+            },
+        );
     }
 
     fn expected_geometry(
@@ -1185,6 +1317,47 @@ mod tests {
     }
 
     #[gpui::test]
+    fn session_navigation_wraps_between_visible_sessions(cx: &mut TestAppContext) {
+        let (sessions, workspace, mut visual) = open_workspace_with_sessions(cx, &[11, 12, 13], 11);
+        let first_id = sessions[0].id();
+        let last_id = sessions[2].id();
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.select_previous_session(window, cx);
+                assert_eq!(this.active_session_id, last_id);
+                this.select_next_session(window, cx);
+                assert_eq!(this.active_session_id, first_id);
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn session_slot_selection_uses_visible_order_and_respects_surface_scope(
+        cx: &mut TestAppContext,
+    ) {
+        let (sessions, workspace, mut visual) = open_workspace_with_sessions(cx, &[21, 22, 23], 21);
+        let third_id = sessions[2].id();
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.select_session_slot(3, window, cx);
+                assert_eq!(this.active_session_id, third_id);
+
+                this.surface = WorkspaceSurface::Settings;
+                this.select_session_slot(1, window, cx);
+                assert_eq!(this.active_session_id, third_id);
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
     fn startup_with_perf_hud_enabled_does_not_panic(cx: &mut TestAppContext) {
         let controller = make_test_controller_with_perf_hud(PerfHudDefault::Expanded);
         let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
@@ -1192,6 +1365,178 @@ mod tests {
         workspace.update_in(&mut visual, |this: &mut SeanceWorkspace, _, _| {
             assert!(this.perf_overlay.mode.is_enabled());
         });
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn close_palette_resets_palette_state(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+        seed_palette_state(&workspace, &mut visual);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, _window: &mut Window, cx| {
+                this.close_palette(cx);
+                assert!(!this.palette_open);
+                assert!(this.palette_query.is_empty());
+                assert_eq!(this.palette_selected, 0);
+                assert_eq!(this.palette_text_input, crate::TextEditState::default());
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn unlock_vault_action_closes_palette_and_leaves_modal_visible(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+        seed_palette_state(&workspace, &mut visual);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.execute_palette_action(crate::palette::PaletteAction::UnlockVault, window, cx);
+                assert!(!this.palette_open);
+                assert!(this.vault_modal.is_visible());
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn add_saved_host_action_closes_palette_and_opens_host_draft_when_unlocked(
+        cx: &mut TestAppContext,
+    ) {
+        let controller = make_test_controller();
+        controller
+            .create_named_vault(
+                "Personal".into(),
+                &SecretString::from("passphrase".to_string()),
+                "device",
+            )
+            .expect("create vault");
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+        seed_palette_state(&workspace, &mut visual);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.execute_palette_action(
+                    crate::palette::PaletteAction::AddSavedHost,
+                    window,
+                    cx,
+                );
+                assert!(!this.palette_open);
+                assert_eq!(this.surface, WorkspaceSurface::Secure);
+                assert_eq!(this.secure.section, crate::forms::SecureSection::Hosts);
+                assert!(this.secure.host_draft.is_some());
+                assert!(!this.vault_modal.is_visible());
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn add_saved_host_action_closes_palette_and_opens_unlock_modal_when_locked(
+        cx: &mut TestAppContext,
+    ) {
+        let controller = make_test_controller();
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+        seed_palette_state(&workspace, &mut visual);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.execute_palette_action(
+                    crate::palette::PaletteAction::AddSavedHost,
+                    window,
+                    cx,
+                );
+                assert!(!this.palette_open);
+                assert!(this.vault_modal.is_visible());
+                assert!(this.secure.host_draft.is_none());
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn open_vault_panel_action_closes_palette_and_switches_surface(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+        seed_palette_state(&workspace, &mut visual);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.execute_palette_action(
+                    crate::palette::PaletteAction::OpenVaultPanel,
+                    window,
+                    cx,
+                );
+                assert!(!this.palette_open);
+                assert_eq!(this.surface, WorkspaceSurface::Secure);
+                assert_eq!(
+                    this.secure.section,
+                    crate::forms::SecureSection::Credentials
+                );
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn open_tunnel_manager_action_closes_palette_and_switches_surface(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (vault, _credential, host) = seed_saved_host(&controller);
+        let _tunnel = seed_saved_tunnel(&controller, &vault.vault_id, &host.host.id);
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+        seed_palette_state(&workspace, &mut visual);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.execute_palette_action(
+                    crate::palette::PaletteAction::OpenTunnelManager,
+                    window,
+                    cx,
+                );
+                assert!(!this.palette_open);
+                assert_eq!(this.surface, WorkspaceSurface::Secure);
+                assert_eq!(this.secure.section, crate::forms::SecureSection::Tunnels);
+                assert!(this.secure.tunnel_draft.is_some());
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn open_preferences_action_leaves_palette_closed(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+        seed_palette_state(&workspace, &mut visual);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.execute_palette_action(
+                    crate::palette::PaletteAction::OpenPreferences,
+                    window,
+                    cx,
+                );
+                assert!(!this.palette_open);
+                assert_eq!(this.surface, WorkspaceSurface::Settings);
+                assert!(this.palette_query.is_empty());
+            },
+        );
 
         close_window(&mut visual);
     }

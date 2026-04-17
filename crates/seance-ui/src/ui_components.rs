@@ -6,8 +6,9 @@ use seance_terminal::TerminalGeometry;
 use seance_terminal::TerminalRow;
 
 use crate::{
-    TerminalMetrics, TerminalRendererMetrics,
+    TERMINAL_SCROLLBAR_GUTTER_WIDTH_PX, TerminalMetrics, TerminalRendererMetrics, TextEditState,
     forms::SettingsSection,
+    model::sidebar_occupied_width_px,
     perf::{PerfOverlayState, UiPerfMode},
     theme::{Theme, ThemeId},
 };
@@ -274,6 +275,22 @@ pub(crate) fn expanded_perf_strings(
         ("shape hits", renderer.shape_hits.to_string()),
         ("shape misses", renderer.shape_misses.to_string()),
         (
+            "width mismatch",
+            renderer.width_mismatch_fragments.to_string(),
+        ),
+        (
+            "grid fallback",
+            renderer.cell_aligned_fallback_fragments.to_string(),
+        ),
+        (
+            "max err px",
+            format_milli_px(renderer.max_width_error_milli_px as u64),
+        ),
+        (
+            "total err px",
+            format_milli_px(renderer.total_width_error_milli_px),
+        ),
+        (
             "drops",
             terminal
                 .map(|metrics| metrics.transcript_dropped_events.to_string())
@@ -406,8 +423,11 @@ pub(crate) fn settings_choice_chip(
 
 pub(crate) fn settings_action_chip(label: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
+        .flex()
+        .items_center()
+        .justify_center()
         .px(px(12.0))
-        .py(px(5.0))
+        .py(px(6.0))
         .rounded_full()
         .border_1()
         .border_color(theme.glass_border_bright)
@@ -545,6 +565,7 @@ pub(crate) fn unlock_field_card(
     label: &'static str,
     value: String,
     selected: bool,
+    text_input: Option<&TextEditState>,
     theme: &Theme,
 ) -> Div {
     let mut card = div()
@@ -561,18 +582,23 @@ pub(crate) fn unlock_field_card(
     }
 
     card.child(div().text_xs().text_color(theme.text_muted).child(label))
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.text_primary)
-                .child(if value.is_empty() { " ".into() } else { value }),
-        )
+        .child(render_text_edit_value(
+            value,
+            selected,
+            text_input,
+            Some(" ".to_string()),
+            theme.text_primary,
+            theme.text_primary,
+            theme.accent,
+            theme.accent.alpha(0.24),
+        ))
 }
 
 pub(crate) fn editor_field_card(
     label: &'static str,
     value: String,
     selected: bool,
+    text_input: Option<&TextEditState>,
     theme: &Theme,
 ) -> Div {
     let is_empty = value.is_empty();
@@ -602,24 +628,91 @@ pub(crate) fn editor_field_card(
             })
             .child(label),
     )
-    .child(
-        div()
-            .text_sm()
-            .text_color(if is_empty {
-                theme.text_ghost
-            } else {
-                theme.text_primary
-            })
-            .child(if is_empty { label.to_string() } else { value }),
-    )
+    .child(render_text_edit_value(
+        value,
+        selected,
+        text_input,
+        is_empty.then(|| label.to_string()),
+        theme.text_primary,
+        theme.text_ghost,
+        theme.accent,
+        theme.accent.alpha(0.22),
+    ))
+}
+
+fn render_text_edit_value(
+    value: String,
+    selected: bool,
+    text_input: Option<&TextEditState>,
+    placeholder: Option<String>,
+    value_color: gpui::Hsla,
+    placeholder_color: gpui::Hsla,
+    caret_color: gpui::Hsla,
+    selection_color: gpui::Hsla,
+) -> Div {
+    if selected && let Some(text_input) = text_input {
+        let fragments = text_input.display_fragments(&value);
+        let mut row = div().flex().items_center().gap(px(0.0)).text_sm();
+
+        if !fragments.prefix.is_empty() {
+            row = row.child(div().text_color(value_color).child(fragments.prefix));
+        }
+        if let Some(selected_text) = fragments.selected {
+            row = row.child(
+                div()
+                    .px(px(1.0))
+                    .rounded_sm()
+                    .bg(selection_color)
+                    .text_color(value_color)
+                    .child(if selected_text.is_empty() {
+                        " ".to_string()
+                    } else {
+                        selected_text
+                    }),
+            );
+        }
+        if fragments.caret_visible {
+            row = row.child(
+                div()
+                    .w(px(2.0))
+                    .h(px(16.0))
+                    .mx(px(1.0))
+                    .rounded_sm()
+                    .bg(caret_color),
+            );
+        }
+        if !fragments.suffix.is_empty() {
+            row = row.child(div().text_color(value_color).child(fragments.suffix));
+        }
+
+        return row.when(value.is_empty(), |row| {
+            row.child(div().text_color(value_color.alpha(0.0)).child(" "))
+        });
+    }
+
+    div()
+        .text_sm()
+        .text_color(if value.is_empty() {
+            placeholder_color
+        } else {
+            value_color
+        })
+        .child(if value.is_empty() {
+            placeholder.unwrap_or_else(|| " ".into())
+        } else {
+            value
+        })
 }
 
 /// Primary action button — filled accent background, prominent hover state.
 /// Used for save/submit actions. Pass `enabled = false` for disabled state.
 pub(crate) fn primary_button(label: impl Into<SharedString>, enabled: bool, theme: &Theme) -> Div {
     let base = div()
+        .flex()
+        .items_center()
+        .justify_center()
         .px(px(16.0))
-        .py(px(8.0))
+        .py(px(7.0))
         .rounded_lg()
         .text_sm()
         .font_weight(FontWeight::SEMIBOLD)
@@ -640,6 +733,9 @@ pub(crate) fn primary_button(label: impl Into<SharedString>, enabled: bool, them
 /// Danger action button — tinted red, used for delete operations.
 pub(crate) fn danger_button(label: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
+        .flex()
+        .items_center()
+        .justify_center()
         .px(px(14.0))
         .py(px(7.0))
         .rounded_lg()
@@ -718,9 +814,12 @@ pub(crate) fn compute_terminal_geometry(
     metrics: TerminalMetrics,
     sidebar_width: f32,
 ) -> Option<TerminalGeometry> {
-    let pane_width_px = (f32::from(viewport_size.width) - sidebar_width).max(0.0);
+    let pane_width_px =
+        (f32::from(viewport_size.width) - sidebar_occupied_width_px(sidebar_width)).max(0.0);
     let pane_height_px = f32::from(viewport_size.height).max(0.0);
-    let usable_width_px = (pane_width_px - (TERMINAL_PANE_PADDING_PX * 2.0)).max(1.0);
+    let usable_width_px =
+        (pane_width_px - (TERMINAL_PANE_PADDING_PX * 2.0) - TERMINAL_SCROLLBAR_GUTTER_WIDTH_PX)
+            .max(1.0);
     let usable_height_px = (pane_height_px - (TERMINAL_PANE_PADDING_PX * 2.0)).max(1.0);
     let cols = (usable_width_px / metrics.cell_width_px).floor().max(1.0) as u16;
     let rows = (usable_height_px / metrics.cell_height_px).floor().max(1.0) as u16;
@@ -730,10 +829,14 @@ pub(crate) fn compute_terminal_geometry(
         rows,
         usable_width_px.floor() as u16,
         usable_height_px.floor() as u16,
-        metrics.cell_width_px.ceil() as u16,
-        metrics.line_height_px.ceil() as u16,
+        metrics.cell_width_px.round().max(1.0) as u16,
+        metrics.line_height_px.round().max(1.0) as u16,
     )
     .ok()
+}
+
+fn format_milli_px(milli_px: u64) -> String {
+    format!("{:.3}", milli_px as f64 / 1_000.0)
 }
 
 #[cfg(test)]
@@ -826,7 +929,7 @@ mod tests {
     use gpui::{px, size};
     use seance_terminal::{TerminalCell, TerminalCellStyle, TerminalRow};
 
-    use crate::model::DEFAULT_SIDEBAR_WIDTH;
+    use crate::model::{DEFAULT_SIDEBAR_WIDTH, SIDEBAR_DRAG_TARGET_PX};
     use crate::perf::RedrawReason;
 
     #[test]
@@ -843,16 +946,23 @@ mod tests {
         )
         .expect("geometry");
 
-        assert_eq!(geometry.pixel_size.width_px, 988);
+        assert_eq!(
+            geometry.pixel_size.width_px,
+            (1280.0
+                - DEFAULT_SIDEBAR_WIDTH
+                - SIDEBAR_DRAG_TARGET_PX
+                - 32.0
+                - TERMINAL_SCROLLBAR_GUTTER_WIDTH_PX) as u16
+        );
         assert_eq!(geometry.pixel_size.height_px, 788);
-        assert_eq!(geometry.size.cols, 123);
+        assert_eq!(geometry.size.cols, 121);
         assert_eq!(geometry.size.rows, 41);
         assert_eq!(geometry.cell_width_px, 8);
         assert_eq!(geometry.cell_height_px, 19);
     }
 
     #[test]
-    fn compute_geometry_clamps_small_windows_to_one_by_one() {
+    fn compute_geometry_clamps_small_windows_to_one_by_one_after_drag_target_subtraction() {
         let geometry = compute_terminal_geometry(
             size(px(10.0), px(10.0)),
             TerminalMetrics {
@@ -867,6 +977,24 @@ mod tests {
 
         assert_eq!(geometry.size.cols, 1);
         assert_eq!(geometry.size.rows, 1);
+    }
+
+    #[test]
+    fn compute_geometry_rounds_fractional_cell_metrics_at_terminal_boundary() {
+        let geometry = compute_terminal_geometry(
+            size(px(1280.0), px(820.0)),
+            TerminalMetrics {
+                cell_width_px: 8.6,
+                cell_height_px: 19.4,
+                line_height_px: 19.4,
+                font_size_px: 13.0,
+            },
+            DEFAULT_SIDEBAR_WIDTH,
+        )
+        .expect("geometry");
+
+        assert_eq!(geometry.cell_width_px, 9);
+        assert_eq!(geometry.cell_height_px, 19);
     }
 
     #[test]

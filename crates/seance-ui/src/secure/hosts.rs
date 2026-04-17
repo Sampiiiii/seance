@@ -114,13 +114,17 @@ impl SeanceWorkspace {
 
         let make_field = |field: HostDraftField, value: String, cx: &mut Context<Self>| {
             let selected = self.secure.input_target == SecureInputTarget::HostDraft(field);
-            editor_field_card(field.title(), value, selected, &t).on_mouse_down(
+            editor_field_card(
+                field.title(),
+                value,
+                selected,
+                selected.then_some(&self.secure_text_input),
+                &t,
+            )
+            .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    this.secure.input_target = SecureInputTarget::HostDraft(field);
-                    if let Some(draft) = this.secure.host_draft.as_mut() {
-                        draft.selected_field = field;
-                    }
+                    this.focus_secure_input_target(SecureInputTarget::HostDraft(field));
                     cx.notify();
                 }),
             )

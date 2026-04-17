@@ -130,6 +130,31 @@ pub struct TerminalCursor {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminalCursorVisualStyle {
+    Bar,
+    #[default]
+    Block,
+    Underline,
+    BlockHollow,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalCursorState {
+    pub position: TerminalCursor,
+    pub visual_style: TerminalCursorVisualStyle,
+    pub visible: bool,
+    pub blinking: bool,
+    pub color: Option<TerminalColor>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalScrollbarState {
+    pub total_rows: u64,
+    pub offset_rows: u64,
+    pub visible_rows: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TerminalScreenKind {
     #[default]
     Primary,
@@ -141,6 +166,7 @@ pub enum TerminalScrollCommand {
     Top,
     Bottom,
     DeltaRows(isize),
+    SetOffsetRows(u64),
     PageUp,
     PageDown,
 }
@@ -160,7 +186,8 @@ pub struct SessionSummary {
 pub struct TerminalViewportSnapshot {
     pub rows: Arc<[Arc<TerminalRow>]>,
     pub row_revisions: Arc<[u64]>,
-    pub cursor: Option<TerminalCursor>,
+    pub cursor: Option<TerminalCursorState>,
+    pub scrollbar: Option<TerminalScrollbarState>,
     pub revision: u64,
     pub cols: u16,
     pub rows_visible: u16,

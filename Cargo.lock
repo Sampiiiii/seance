@@ -3917,6 +3917,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "linkify"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1dfa36d52c581e9ec783a7ce2a5e0143da6237be5811a0b3153fedfdbe9f780"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "linux-keyutils"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6237,6 +6246,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fs2",
+ "open",
  "seance-core",
  "serde",
  "serde_json",
@@ -6308,6 +6318,7 @@ dependencies = [
  "anyhow",
  "dirs 6.0.0",
  "gpui",
+ "linkify",
  "seance-config",
  "seance-core",
  "seance-platform",
@@ -6316,6 +6327,7 @@ dependencies = [
  "seance-vault",
  "serde_json",
  "tracing",
+ "url",
  "zeroize",
 ]
 

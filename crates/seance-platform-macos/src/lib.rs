@@ -1,5 +1,7 @@
 #![allow(unexpected_cfgs)]
 
+mod dock_icon;
+
 use std::{sync::Arc, sync::mpsc::Sender};
 
 use anyhow::{Context, Result, anyhow};
@@ -57,6 +59,7 @@ impl MacosPlatformAppBridge {
                     MenuItem::separator(),
                     MenuItem::action("Quit", QuitSeance),
                 ]);
+                dock_icon::install_default_live_icon();
                 install_macos_menus(cx, &controller_for_install);
             })),
             refresh_app_menus: Some(refresh_app_menus),

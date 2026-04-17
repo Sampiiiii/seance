@@ -2,17 +2,19 @@ use std::{sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
 use libghostty_vt::{
-    RenderState, Terminal, TerminalOptions,
+    RenderState, Terminal, TerminalOptions, key, mouse,
     render::{CellIterator, Dirty, RowIterator},
     screen::CellWide,
     style::{RgbColor, Style, Underline},
     terminal::{Mode, ScrollViewport},
 };
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::{
     SessionSummary, SharedSessionState, TerminalCell, TerminalCellStyle, TerminalColor,
-    TerminalCursor, TerminalGeometry, TerminalRow, TerminalScreenKind, TerminalScrollCommand,
+    TerminalCursor, TerminalCursorState, TerminalCursorVisualStyle, TerminalGeometry,
+    TerminalKeyEvent, TerminalMouseEvent, TerminalPaste, TerminalRow, TerminalScreenKind,
+    TerminalScrollCommand, TerminalScrollbarState, TerminalTextEvent, input,
     state::PublishedViewport, viewport::ViewportCache,
 };
 
@@ -23,6 +25,9 @@ pub struct TerminalEmulator {
     render_state: RenderState<'static>,
     row_iterator: RowIterator<'static>,
     cell_iterator: CellIterator<'static>,
+    key_encoder: key::Encoder<'static>,
+    mouse_encoder: mouse::Encoder<'static>,
+    mouse_any_button_pressed: bool,
     pending_vt_bytes: usize,
     viewport_cache: ViewportCache,
 }
@@ -41,6 +46,10 @@ impl TerminalEmulator {
                 .context("failed to initialize Ghostty render state")?,
             row_iterator: RowIterator::new().context("failed to create Ghostty row iterator")?,
             cell_iterator: CellIterator::new().context("failed to create Ghostty cell iterator")?,
+            key_encoder: key::Encoder::new().context("failed to create Ghostty key encoder")?,
+            mouse_encoder: mouse::Encoder::new()
+                .context("failed to create Ghostty mouse encoder")?,
+            mouse_any_button_pressed: false,
             pending_vt_bytes: 0,
             viewport_cache: ViewportCache::new(
                 geometry,
@@ -72,11 +81,94 @@ impl TerminalEmulator {
             .context("failed to resize Ghostty terminal")
     }
 
+    pub fn encode_key_event(&mut self, event: &TerminalKeyEvent) -> Result<Vec<u8>> {
+        let mapped_key = match input::map_terminal_key(&event.key) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                warn!(key = %event.key, ?event.modifiers, %error, "ignoring unsupported terminal key event");
+                None
+            }
+        };
+        let Some(mapped_key) = mapped_key else {
+            return Ok(Vec::new());
+        };
+
+        let mut encoded = Vec::new();
+        let mut key_event = key::Event::new().context("failed to create Ghostty key event")?;
+        key_event
+            .set_action(key::Action::Press)
+            .set_key(mapped_key)
+            .set_mods(input::modifiers_to_ghostty(event.modifiers));
+        self.key_encoder
+            .set_options_from_terminal(&self.terminal)
+            .encode_to_vec(&key_event, &mut encoded)
+            .context("failed to encode terminal key event")?;
+        Ok(encoded)
+    }
+
+    pub fn encode_text_event(&mut self, event: &TerminalTextEvent) -> Vec<u8> {
+        input::encode_text_event(event)
+    }
+
+    pub fn encode_mouse_event(&mut self, event: &TerminalMouseEvent) -> Result<Vec<u8>> {
+        let geometry = self.viewport_cache.geometry();
+        let mut encoded = Vec::new();
+        let mut mouse_event =
+            mouse::Event::new().context("failed to create Ghostty mouse event")?;
+        mouse_event
+            .set_action(input::mouse_kind(event.kind))
+            .set_mods(input::modifiers_to_ghostty(event.modifiers))
+            .set_position(mouse::Position {
+                x: event.x_px as f32,
+                y: event.y_px as f32,
+            });
+        mouse_event.set_button(event.button.map(input::map_mouse_button));
+        self.mouse_encoder
+            .set_options_from_terminal(&self.terminal)
+            .set_size(mouse::EncoderSize {
+                screen_width: u32::from(geometry.pixel_size.width_px),
+                screen_height: u32::from(geometry.pixel_size.height_px),
+                cell_width: u32::from(geometry.cell_width_px),
+                cell_height: u32::from(geometry.cell_height_px),
+                padding_top: 0,
+                padding_bottom: 0,
+                padding_right: 0,
+                padding_left: 0,
+            })
+            .set_any_button_pressed(self.mouse_any_button_pressed)
+            .set_track_last_cell(true)
+            .encode_to_vec(&mouse_event, &mut encoded)
+            .context("failed to encode terminal mouse event")?;
+
+        self.mouse_any_button_pressed = match event.kind {
+            input::TerminalMouseEventKind::Press => event.button.is_some(),
+            input::TerminalMouseEventKind::Release => false,
+            input::TerminalMouseEventKind::Move => self.mouse_any_button_pressed,
+        };
+
+        Ok(encoded)
+    }
+
+    pub fn encode_paste(&mut self, paste: &TerminalPaste) -> Vec<u8> {
+        input::encode_bracketed_paste(&paste.text, input::bracketed_paste_enabled(&self.terminal))
+    }
+
     pub fn scroll_viewport(&mut self, command: TerminalScrollCommand) {
         let delta = match command {
             TerminalScrollCommand::Top => Some(ScrollViewport::Top),
             TerminalScrollCommand::Bottom => Some(ScrollViewport::Bottom),
             TerminalScrollCommand::DeltaRows(delta) => Some(ScrollViewport::Delta(delta)),
+            TerminalScrollCommand::SetOffsetRows(target_offset_rows) => {
+                self.viewport_cache.snapshot().scrollbar.map(|scrollbar| {
+                    let max_offset_rows =
+                        scrollbar.total_rows.saturating_sub(scrollbar.visible_rows);
+                    let clamped_target = target_offset_rows.min(max_offset_rows);
+                    let delta = clamped_target as i128 - scrollbar.offset_rows as i128;
+                    ScrollViewport::Delta(
+                        delta.clamp(isize::MIN as i128, isize::MAX as i128) as isize
+                    )
+                })
+            }
             TerminalScrollCommand::PageUp => Some(ScrollViewport::Delta(
                 -(self.viewport_cache.geometry().size.rows.saturating_sub(1) as isize),
             )),
@@ -87,10 +179,20 @@ impl TerminalEmulator {
 
         if let Some(delta) = delta {
             self.terminal.scroll_viewport(delta);
-            self.viewport_cache.at_bottom = matches!(
-                command,
-                TerminalScrollCommand::Bottom | TerminalScrollCommand::PageDown
-            );
+            self.viewport_cache.at_bottom = match command {
+                TerminalScrollCommand::Bottom | TerminalScrollCommand::PageDown => true,
+                TerminalScrollCommand::SetOffsetRows(target_offset_rows) => self
+                    .viewport_cache
+                    .snapshot()
+                    .scrollbar
+                    .map(|scrollbar| {
+                        target_offset_rows
+                            .min(scrollbar.total_rows.saturating_sub(scrollbar.visible_rows))
+                            == scrollbar.total_rows.saturating_sub(scrollbar.visible_rows)
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            };
         }
     }
 
@@ -129,9 +231,10 @@ impl TerminalEmulator {
         exit_status: Option<String>,
         force_full: bool,
     ) -> Result<RefreshSnapshot> {
+        let terminal = &self.terminal;
         let snapshot = self
             .render_state
-            .update(&self.terminal)
+            .update(terminal)
             .context("failed to update Ghostty render state")?;
         let dirty = match snapshot.dirty() {
             Ok(dirty) => dirty,
@@ -157,6 +260,10 @@ impl TerminalEmulator {
         let colors = snapshot
             .colors()
             .context("failed to read Ghostty render colors")?;
+        let cursor = cursor_state(&snapshot, colors.cursor)?;
+        let scrollbar = scrollbar_state(terminal)?;
+        let cursor_changed = self.viewport_cache.set_cursor(cursor);
+        let scrollbar_changed = self.viewport_cache.set_scrollbar(scrollbar);
 
         let mut rows = self
             .row_iterator
@@ -216,7 +323,7 @@ impl TerminalEmulator {
             self.viewport_cache.reset_rows(rows);
         }
 
-        if dirty_row_count > 0 && !should_force_all {
+        if (dirty_row_count > 0 && !should_force_all) || cursor_changed || scrollbar_changed {
             self.viewport_cache.bump_viewport_revision();
         }
 
@@ -229,6 +336,10 @@ impl TerminalEmulator {
             } else {
                 TerminalScreenKind::Primary
             };
+            if matches!(active_screen, TerminalScreenKind::Primary) && self.viewport_cache.at_bottom
+            {
+                self.viewport_cache.refresh_stable_preview();
+            }
             if matches!(active_screen, TerminalScreenKind::Alternate) {
                 self.viewport_cache.at_bottom = true;
             }
@@ -248,15 +359,6 @@ impl TerminalEmulator {
             });
         }
 
-        let cursor = snapshot
-            .cursor_viewport()
-            .context("failed to query Ghostty cursor viewport")?
-            .map(|cursor| TerminalCursor {
-                x: cursor.x,
-                y: cursor.y,
-                at_wide_tail: cursor.at_wide_tail,
-            });
-        self.viewport_cache.set_cursor(cursor);
         snapshot
             .set_dirty(Dirty::Clean)
             .context("failed to clear Ghostty frame dirty state")?;
@@ -269,6 +371,9 @@ impl TerminalEmulator {
         } else {
             TerminalScreenKind::Primary
         };
+        if matches!(active_screen, TerminalScreenKind::Primary) && self.viewport_cache.at_bottom {
+            self.viewport_cache.refresh_stable_preview();
+        }
         if matches!(active_screen, TerminalScreenKind::Alternate) {
             self.viewport_cache.at_bottom = true;
         }
@@ -287,6 +392,63 @@ impl TerminalEmulator {
             rendered_cell_count,
         })
     }
+}
+
+fn cursor_state(
+    snapshot: &libghostty_vt::render::Snapshot<'_, '_>,
+    fallback_color: Option<RgbColor>,
+) -> Result<Option<TerminalCursorState>> {
+    let Some(cursor) = snapshot
+        .cursor_viewport()
+        .context("failed to query Ghostty cursor viewport")?
+    else {
+        return Ok(None);
+    };
+
+    let color = snapshot
+        .cursor_color()
+        .context("failed to query Ghostty cursor color")?
+        .or(fallback_color)
+        .map(ghostty_color_to_terminal);
+    let visual_style = match snapshot
+        .cursor_visual_style()
+        .context("failed to query Ghostty cursor style")?
+    {
+        libghostty_vt::render::CursorVisualStyle::Bar => TerminalCursorVisualStyle::Bar,
+        libghostty_vt::render::CursorVisualStyle::Block => TerminalCursorVisualStyle::Block,
+        libghostty_vt::render::CursorVisualStyle::Underline => TerminalCursorVisualStyle::Underline,
+        libghostty_vt::render::CursorVisualStyle::BlockHollow => {
+            TerminalCursorVisualStyle::BlockHollow
+        }
+        _ => TerminalCursorVisualStyle::Block,
+    };
+
+    Ok(Some(TerminalCursorState {
+        position: TerminalCursor {
+            x: cursor.x,
+            y: cursor.y,
+            at_wide_tail: cursor.at_wide_tail,
+        },
+        visual_style,
+        visible: snapshot
+            .cursor_visible()
+            .context("failed to query Ghostty cursor visibility")?,
+        blinking: snapshot
+            .cursor_blinking()
+            .context("failed to query Ghostty cursor blinking")?,
+        color,
+    }))
+}
+
+fn scrollbar_state(terminal: &Terminal<'_, '_>) -> Result<Option<TerminalScrollbarState>> {
+    let scrollbar = terminal
+        .scrollbar()
+        .context("failed to query Ghostty scrollbar state")?;
+    Ok((scrollbar.total > 0).then_some(TerminalScrollbarState {
+        total_rows: scrollbar.total,
+        offset_rows: scrollbar.offset,
+        visible_rows: scrollbar.len,
+    }))
 }
 
 struct RefreshSnapshot {
@@ -380,7 +542,7 @@ fn ghostty_color_to_terminal(value: RgbColor) -> TerminalColor {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{fmt::Write as _, sync::Arc};
 
     use super::*;
     use crate::TerminalViewportSnapshot;
@@ -410,6 +572,23 @@ mod tests {
         emulator.write(vt);
         emulator.refresh(&state, None, true, 0);
         (state.viewport_snapshot(), state.summary())
+    }
+
+    fn scrollback_fixture(
+        line_count: usize,
+        visible_rows: u16,
+    ) -> (TerminalEmulator, SharedSessionState) {
+        let geometry = TerminalGeometry::new(80, visible_rows, 640, visible_rows * 19, 8, 19)
+            .expect("terminal geometry");
+        let (state, _notify_rx) = SharedSessionState::new("init", geometry);
+        let mut emulator = TerminalEmulator::new(geometry, "init").expect("terminal emulator");
+        let mut vt = String::new();
+        for index in 0..line_count {
+            let _ = writeln!(&mut vt, "line-{index:03}\r");
+        }
+        emulator.write(vt.as_bytes());
+        emulator.refresh(&state, None, true, 0);
+        (emulator, state)
     }
 
     fn last_non_empty_row(rows: &[TerminalRow]) -> &TerminalRow {
@@ -530,6 +709,41 @@ mod tests {
     }
 
     #[test]
+    fn encode_key_event_falls_back_to_printable_symbol_text() {
+        let (mut emulator, _state, _) = new_test_emulator();
+        let bytes = emulator.encode_text_event(&TerminalTextEvent {
+            text: "@".into(),
+            alt: false,
+        });
+
+        assert_eq!(bytes, b"@");
+    }
+
+    #[test]
+    fn encode_key_event_ignores_unknown_non_text_keys() {
+        let (mut emulator, _state, _) = new_test_emulator();
+        let bytes = emulator
+            .encode_key_event(&TerminalKeyEvent {
+                key: "dead_acute".into(),
+                modifiers: crate::TerminalInputModifiers::default(),
+            })
+            .expect("encode key event");
+
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn encode_text_event_supports_alt_prefixed_utf8() {
+        let (mut emulator, _state, _) = new_test_emulator();
+        let bytes = emulator.encode_text_event(&TerminalTextEvent {
+            text: "é".into(),
+            alt: true,
+        });
+
+        assert_eq!(bytes, b"\x1b\xc3\xa9");
+    }
+
+    #[test]
     fn invalid_partial_dirty_state_falls_back_to_full_redraw() {
         let (mut emulator, state, _) = new_test_emulator();
         emulator.write(b"alpha\x1b[2;1Hbeta\x1b[3;1Hgamma");
@@ -613,5 +827,155 @@ mod tests {
         assert!(viewport.row_count() >= 2);
         assert_eq!(summary.preview_line.trim_end(), "beta");
         assert!(summary.at_bottom);
+    }
+
+    #[test]
+    fn clean_refresh_preserves_cursor_state() {
+        let (mut emulator, state, _) = new_test_emulator();
+        emulator.write(b"hello");
+        emulator.refresh(&state, None, true, 0);
+
+        let initial = state.viewport_snapshot();
+        emulator.refresh(&state, None, false, 0);
+        let refreshed = state.viewport_snapshot();
+
+        assert!(initial.cursor.is_some());
+        assert_eq!(refreshed.cursor, initial.cursor);
+    }
+
+    #[test]
+    fn cursor_only_motion_bumps_viewport_revision() {
+        let (mut emulator, state, _) = new_test_emulator();
+        emulator.write(b"hello");
+        emulator.refresh(&state, None, true, 0);
+        let initial = state.viewport_snapshot();
+
+        emulator.write(b"\x1b[D");
+        emulator.refresh(&state, None, false, 0);
+        let updated = state.viewport_snapshot();
+
+        assert_ne!(updated.cursor, initial.cursor);
+        assert!(updated.revision > initial.revision);
+    }
+
+    #[test]
+    fn set_offset_rows_scrolls_to_top() {
+        let (mut emulator, state) = scrollback_fixture(80, 10);
+        let initial = state.viewport_snapshot();
+        let scrollbar = initial.scrollbar.expect("scrollbar");
+
+        emulator.scroll_viewport(TerminalScrollCommand::SetOffsetRows(0));
+        emulator.refresh(&state, None, false, 0);
+        let updated = state.viewport_snapshot().scrollbar.expect("scrollbar");
+
+        assert!(scrollbar.offset_rows > 0);
+        assert_eq!(updated.offset_rows, 0);
+        assert!(!state.summary().at_bottom);
+    }
+
+    #[test]
+    fn set_offset_rows_applies_signed_delta_from_current_offset() {
+        let (mut emulator, state) = scrollback_fixture(80, 10);
+        let initial = state.viewport_snapshot().scrollbar.expect("scrollbar");
+        let target = initial.total_rows.saturating_sub(initial.visible_rows) / 2;
+
+        emulator.scroll_viewport(TerminalScrollCommand::SetOffsetRows(target));
+        emulator.refresh(&state, None, false, 0);
+        let updated = state.viewport_snapshot().scrollbar.expect("scrollbar");
+
+        assert_eq!(updated.offset_rows, target);
+        assert!(updated.offset_rows < initial.offset_rows);
+    }
+
+    #[test]
+    fn set_offset_rows_clamps_to_maximum() {
+        let (mut emulator, state) = scrollback_fixture(80, 10);
+        let initial = state.viewport_snapshot().scrollbar.expect("scrollbar");
+        let max_offset = initial.total_rows.saturating_sub(initial.visible_rows);
+
+        emulator.scroll_viewport(TerminalScrollCommand::SetOffsetRows(max_offset + 50));
+        emulator.refresh(&state, None, false, 0);
+        let updated = state.viewport_snapshot().scrollbar.expect("scrollbar");
+
+        assert_eq!(updated.offset_rows, max_offset);
+    }
+
+    #[test]
+    fn set_offset_rows_to_bottom_marks_summary_at_bottom() {
+        let (mut emulator, state) = scrollback_fixture(80, 10);
+        emulator.scroll_viewport(TerminalScrollCommand::SetOffsetRows(0));
+        emulator.refresh(&state, None, false, 0);
+        let max_offset = state
+            .viewport_snapshot()
+            .scrollbar
+            .expect("scrollbar")
+            .total_rows
+            .saturating_sub(
+                state
+                    .viewport_snapshot()
+                    .scrollbar
+                    .expect("scrollbar")
+                    .visible_rows,
+            );
+
+        emulator.scroll_viewport(TerminalScrollCommand::SetOffsetRows(max_offset));
+        emulator.refresh(&state, None, false, 0);
+
+        assert_eq!(
+            state
+                .viewport_snapshot()
+                .scrollbar
+                .expect("scrollbar")
+                .offset_rows,
+            max_offset
+        );
+        assert!(state.summary().at_bottom);
+    }
+
+    #[test]
+    fn set_offset_rows_is_noop_without_scrollbar_state() {
+        let (mut emulator, state, _) = new_test_emulator();
+        emulator.write(b"hello");
+        emulator.refresh(&state, None, true, 0);
+        let initial = state.viewport_snapshot();
+
+        emulator.scroll_viewport(TerminalScrollCommand::SetOffsetRows(10));
+        emulator.refresh(&state, None, false, 0);
+        let updated = state.viewport_snapshot();
+
+        assert_eq!(initial.scrollbar, updated.scrollbar);
+    }
+
+    #[test]
+    fn scrolling_away_from_bottom_keeps_sidebar_preview_stable() {
+        let (mut emulator, state) = scrollback_fixture(80, 10);
+        let initial_preview = state.summary().preview_line;
+
+        emulator.scroll_viewport(TerminalScrollCommand::SetOffsetRows(0));
+        emulator.refresh(&state, None, false, 0);
+
+        assert_eq!(state.summary().preview_line, initial_preview);
+        assert!(!state.summary().at_bottom);
+    }
+
+    #[test]
+    fn new_output_while_scrolled_up_does_not_change_sidebar_preview_until_bottom() {
+        let (mut emulator, state) = scrollback_fixture(80, 10);
+        let initial_preview = state.summary().preview_line;
+
+        emulator.scroll_viewport(TerminalScrollCommand::SetOffsetRows(0));
+        emulator.refresh(&state, None, false, 0);
+        emulator.write(b"tail\r\n");
+        emulator.refresh(&state, None, false, 0);
+
+        assert_eq!(state.summary().preview_line, initial_preview);
+
+        let scrollbar = state.viewport_snapshot().scrollbar.expect("scrollbar");
+        let max_offset = scrollbar.total_rows.saturating_sub(scrollbar.visible_rows);
+        emulator.scroll_viewport(TerminalScrollCommand::SetOffsetRows(max_offset));
+        emulator.refresh(&state, None, false, 0);
+
+        assert_eq!(state.summary().preview_line.trim_end(), "tail");
+        assert!(state.summary().at_bottom);
     }
 }

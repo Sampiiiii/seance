@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{VaultError, VaultResult, crypto::SecretKey};
 
-pub const KDF_SALT_LEN: usize = 16;
-pub const WRAP_KEY_LEN: usize = 32;
+const KDF_SALT_LEN: usize = 16;
+const WRAP_KEY_LEN: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KdfParams {
@@ -29,7 +29,7 @@ impl KdfParams {
         }
     }
 
-    pub fn derive_wrap_key(&self, passphrase: &SecretString) -> VaultResult<SecretKey> {
+    pub(crate) fn derive_wrap_key(&self, passphrase: &SecretString) -> VaultResult<SecretKey> {
         let params = Params::new(
             self.memory_kib,
             self.iterations,

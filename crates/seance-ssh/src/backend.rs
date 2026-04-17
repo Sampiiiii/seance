@@ -37,16 +37,58 @@ pub(crate) async fn run_ssh_session(
             Some(command) = command_rx.recv() => {
                 match command {
                     SessionCommand::Input(bytes) => {
-                        transcript_sink.record(TranscriptEvent {
-                            timestamp: SystemTime::now(),
-                            stream: TranscriptStream::Input,
-                            bytes: Arc::from(bytes.as_slice()),
-                        });
-                        if let Err(error) = writer.write_all(&bytes).await {
+                        if let Err(error) = write_input_bytes(&mut writer, &transcript_sink, &bytes).await {
                             state.set_error(&anyhow!("failed to write to SSH channel: {error}"), geometry);
                             break;
                         }
-                        let _ = writer.flush().await;
+                    }
+                    SessionCommand::Text(event) => {
+                        let bytes = emulator.encode_text_event(&event);
+                        if !bytes.is_empty()
+                            && let Err(error) = write_input_bytes(&mut writer, &transcript_sink, &bytes).await
+                        {
+                            state.set_error(&anyhow!("failed to write to SSH channel: {error}"), geometry);
+                            break;
+                        }
+                    }
+                    SessionCommand::Key(event) => {
+                        let bytes = match emulator.encode_key_event(&event) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                state.set_error(&error, geometry);
+                                break;
+                            }
+                        };
+                        if !bytes.is_empty()
+                            && let Err(error) = write_input_bytes(&mut writer, &transcript_sink, &bytes).await
+                        {
+                            state.set_error(&anyhow!("failed to write to SSH channel: {error}"), geometry);
+                            break;
+                        }
+                    }
+                    SessionCommand::Mouse(event) => {
+                        let bytes = match emulator.encode_mouse_event(&event) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                state.set_error(&error, geometry);
+                                break;
+                            }
+                        };
+                        if !bytes.is_empty()
+                            && let Err(error) = write_input_bytes(&mut writer, &transcript_sink, &bytes).await
+                        {
+                            state.set_error(&anyhow!("failed to write to SSH channel: {error}"), geometry);
+                            break;
+                        }
+                    }
+                    SessionCommand::Paste(paste) => {
+                        let bytes = emulator.encode_paste(&paste);
+                        if !bytes.is_empty()
+                            && let Err(error) = write_input_bytes(&mut writer, &transcript_sink, &bytes).await
+                        {
+                            state.set_error(&anyhow!("failed to write to SSH channel: {error}"), geometry);
+                            break;
+                        }
                     }
                     SessionCommand::Resize(geometry) => {
                         let _ = write_half
@@ -62,11 +104,21 @@ pub(crate) async fn run_ssh_session(
                     }
                     SessionCommand::ScrollViewport(command) => {
                         emulator.scroll_viewport(command);
-                        emulator.refresh(&state, exit_status.clone(), true, transcript_sink.dropped_events());
+                        emulator.refresh(
+                            &state,
+                            exit_status.clone(),
+                            false,
+                            transcript_sink.dropped_events(),
+                        );
                     }
                     SessionCommand::ScrollToBottom => {
                         emulator.scroll_viewport(TerminalScrollCommand::Bottom);
-                        emulator.refresh(&state, exit_status.clone(), true, transcript_sink.dropped_events());
+                        emulator.refresh(
+                            &state,
+                            exit_status.clone(),
+                            false,
+                            transcript_sink.dropped_events(),
+                        );
                     }
                 }
             }
@@ -112,4 +164,18 @@ pub(crate) async fn run_ssh_session(
             }
         }
     }
+}
+
+async fn write_input_bytes(
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    transcript_sink: &Arc<dyn TerminalTranscriptSink>,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    transcript_sink.record(TranscriptEvent {
+        timestamp: SystemTime::now(),
+        stream: TranscriptStream::Input,
+        bytes: Arc::from(bytes),
+    });
+    writer.write_all(bytes).await?;
+    writer.flush().await
 }

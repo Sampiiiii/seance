@@ -1,4 +1,7 @@
 use crate::{connect::PendingConnectSummary, theme::ThemeId};
+use seance_config::{
+    COMMAND_APP_OPEN_PREFERENCES, COMMAND_SESSION_CLOSE_ACTIVE, COMMAND_SESSION_NEW_LOCAL,
+};
 use std::{collections::HashMap, sync::Arc};
 
 use seance_core::{
@@ -10,7 +13,7 @@ use seance_terminal::TerminalSession;
 use seance_vault::PrivateKeyAlgorithm;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PaletteGroup {
+pub(crate) enum PaletteGroup {
     Sessions,
     Hosts,
     Tunnels,
@@ -20,7 +23,7 @@ pub enum PaletteGroup {
 }
 
 impl PaletteGroup {
-    pub fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             PaletteGroup::Sessions => "SESSIONS",
             PaletteGroup::Hosts => "HOSTS",
@@ -33,7 +36,7 @@ impl PaletteGroup {
 }
 
 #[derive(Clone)]
-pub enum PaletteAction {
+pub(crate) enum PaletteAction {
     NewLocalTerminal,
     CheckForUpdates,
     InstallAvailableUpdate,
@@ -53,8 +56,6 @@ pub enum PaletteAction {
         vault_id: String,
         credential_id: String,
     },
-    #[allow(dead_code)]
-    ImportPrivateKey,
     GenerateEd25519Key,
     GenerateRsaKey,
     DeletePrivateKey {
@@ -93,14 +94,14 @@ pub enum PaletteAction {
 }
 
 #[derive(Clone)]
-pub struct PaletteItem {
-    pub glyph: &'static str,
-    pub label: String,
-    pub hint: String,
-    pub action: PaletteAction,
-    pub group: PaletteGroup,
-    pub shortcut: Option<&'static str>,
-    pub match_indices: Vec<usize>,
+pub(crate) struct PaletteItem {
+    pub(crate) glyph: &'static str,
+    pub(crate) label: String,
+    pub(crate) hint: String,
+    pub(crate) action: PaletteAction,
+    pub(crate) group: PaletteGroup,
+    pub(crate) shortcut_command: Option<&'static str>,
+    pub(crate) match_indices: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -189,7 +190,7 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<(i32, Vec<usize>)> {
     Some((score, indices))
 }
 
-pub fn build_items(
+pub(crate) fn build_items(
     sessions: &[Arc<dyn TerminalSession>],
     session_labels: &HashMap<u64, String>,
     saved_hosts: &[VaultScopedHostSummary],
@@ -223,7 +224,7 @@ pub fn build_items(
         hint: "Spawn a new shell session".into(),
         action: PaletteAction::NewLocalTerminal,
         group: PaletteGroup::Sessions,
-        shortcut: Some("\u{2318}T"),
+        shortcut_command: Some(COMMAND_SESSION_NEW_LOCAL),
         match_indices: Vec::new(),
     });
 
@@ -239,7 +240,7 @@ pub fn build_items(
                 hint: format!("session #{}", session.id()),
                 action: PaletteAction::SwitchSession(session.id()),
                 group: PaletteGroup::Sessions,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             });
         }
@@ -252,7 +253,7 @@ pub fn build_items(
             hint: "Terminate the current terminal".into(),
             action: PaletteAction::CloseActiveSession,
             group: PaletteGroup::Sessions,
-            shortcut: Some("\u{2318}W"),
+            shortcut_command: Some(COMMAND_SESSION_CLOSE_ACTIVE),
             match_indices: Vec::new(),
         });
     }
@@ -269,7 +270,7 @@ pub fn build_items(
                 hint: "Open SFTP file browser".into(),
                 action: PaletteAction::OpenSftpBrowser(session.id()),
                 group: PaletteGroup::Sessions,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             });
         }
@@ -284,7 +285,7 @@ pub fn build_items(
             hint: "Store an encrypted SSH config".into(),
             action: PaletteAction::AddSavedHost,
             group: PaletteGroup::Hosts,
-            shortcut: None,
+            shortcut_command: None,
             match_indices: Vec::new(),
         });
 
@@ -306,7 +307,7 @@ pub fn build_items(
                         attempt_id: pending.id,
                     },
                     group: PaletteGroup::Hosts,
-                    shortcut: None,
+                    shortcut_command: None,
                     match_indices: Vec::new(),
                 });
             } else {
@@ -319,7 +320,7 @@ pub fn build_items(
                         host_id: host.host.id.clone(),
                     },
                     group: PaletteGroup::Hosts,
-                    shortcut: None,
+                    shortcut_command: None,
                     match_indices: Vec::new(),
                 });
             }
@@ -332,7 +333,7 @@ pub fn build_items(
                     host_id: host.host.id.clone(),
                 },
                 group: PaletteGroup::Hosts,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             });
             items.push(PaletteItem {
@@ -344,7 +345,7 @@ pub fn build_items(
                     host_id: host.host.id.clone(),
                 },
                 group: PaletteGroup::Hosts,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             });
         }
@@ -359,7 +360,7 @@ pub fn build_items(
             hint: "Manage saved port forwarding rules".into(),
             action: PaletteAction::OpenTunnelManager,
             group: PaletteGroup::Tunnels,
-            shortcut: None,
+            shortcut_command: None,
             match_indices: Vec::new(),
         });
 
@@ -395,7 +396,7 @@ pub fn build_items(
                         tunnel_scope_key: scope_key,
                     },
                     group: PaletteGroup::Tunnels,
-                    shortcut: None,
+                    shortcut_command: None,
                     match_indices: Vec::new(),
                 });
             } else {
@@ -413,7 +414,7 @@ pub fn build_items(
                         port_forward_id: port_forward.port_forward.id.clone(),
                     },
                     group: PaletteGroup::Tunnels,
-                    shortcut: None,
+                    shortcut_command: None,
                     match_indices: Vec::new(),
                 });
             }
@@ -433,7 +434,7 @@ pub fn build_items(
                         host_id: host.host.id.clone(),
                     },
                     group: PaletteGroup::Tunnels,
-                    shortcut: None,
+                    shortcut_command: None,
                     match_indices: Vec::new(),
                 });
             }
@@ -449,7 +450,7 @@ pub fn build_items(
             hint: "Manage credentials and SSH keys".into(),
             action: PaletteAction::OpenVaultPanel,
             group: PaletteGroup::Vault,
-            shortcut: None,
+            shortcut_command: None,
             match_indices: Vec::new(),
         });
         items.push(PaletteItem {
@@ -458,7 +459,7 @@ pub fn build_items(
             hint: "Store an encrypted password".into(),
             action: PaletteAction::AddPasswordCredential,
             group: PaletteGroup::Vault,
-            shortcut: None,
+            shortcut_command: None,
             match_indices: Vec::new(),
         });
         items.push(PaletteItem {
@@ -467,7 +468,7 @@ pub fn build_items(
             hint: "Create a new vault-backed Ed25519 key".into(),
             action: PaletteAction::GenerateEd25519Key,
             group: PaletteGroup::Vault,
-            shortcut: None,
+            shortcut_command: None,
             match_indices: Vec::new(),
         });
         items.push(PaletteItem {
@@ -476,7 +477,7 @@ pub fn build_items(
             hint: "Create a new vault-backed RSA key".into(),
             action: PaletteAction::GenerateRsaKey,
             group: PaletteGroup::Vault,
-            shortcut: None,
+            shortcut_command: None,
             match_indices: Vec::new(),
         });
 
@@ -495,7 +496,7 @@ pub fn build_items(
                     credential_id: cred.credential.id.clone(),
                 },
                 group: PaletteGroup::Vault,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             });
             items.push(PaletteItem {
@@ -507,7 +508,7 @@ pub fn build_items(
                     credential_id: cred.credential.id.clone(),
                 },
                 group: PaletteGroup::Vault,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             });
         }
@@ -532,7 +533,7 @@ pub fn build_items(
                     key_id: key.key.id.clone(),
                 },
                 group: PaletteGroup::Vault,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             });
         }
@@ -543,7 +544,7 @@ pub fn build_items(
             hint: "Remove decrypted keys from memory".into(),
             action: PaletteAction::LockVault,
             group: PaletteGroup::Vault,
-            shortcut: None,
+            shortcut_command: None,
             match_indices: Vec::new(),
         });
     } else {
@@ -553,7 +554,7 @@ pub fn build_items(
             hint: "Use your passphrase or enrolled device".into(),
             action: PaletteAction::UnlockVault,
             group: PaletteGroup::Vault,
-            shortcut: None,
+            shortcut_command: None,
             match_indices: Vec::new(),
         });
     }
@@ -569,7 +570,7 @@ pub fn build_items(
                 hint: "Switch appearance".into(),
                 action: PaletteAction::SwitchTheme(tid),
                 group: PaletteGroup::Appearance,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             });
         }
@@ -583,7 +584,7 @@ pub fn build_items(
         hint: "App settings and configuration".into(),
         action: PaletteAction::OpenPreferences,
         group: PaletteGroup::System,
-        shortcut: Some("\u{2318},"),
+        shortcut_command: Some(COMMAND_APP_OPEN_PREFERENCES),
         match_indices: Vec::new(),
     });
 
@@ -593,7 +594,7 @@ pub fn build_items(
         hint: "Query the stable release channel".into(),
         action: PaletteAction::CheckForUpdates,
         group: PaletteGroup::System,
-        shortcut: None,
+        shortcut_command: None,
         match_indices: Vec::new(),
     });
 
@@ -604,7 +605,7 @@ pub fn build_items(
             hint: "Download and install the newest release".into(),
             action: PaletteAction::InstallAvailableUpdate,
             group: PaletteGroup::System,
-            shortcut: None,
+            shortcut_command: None,
             match_indices: Vec::new(),
         });
     }
@@ -727,8 +728,9 @@ mod tests {
 
     use anyhow::Result;
     use seance_terminal::{
-        SessionPerfSnapshot, SessionSummary, TerminalGeometry, TerminalScrollCommand,
-        TerminalSession, TerminalViewportSnapshot,
+        SessionPerfSnapshot, SessionSummary, TerminalGeometry, TerminalKeyEvent,
+        TerminalMouseEvent, TerminalPaste, TerminalScrollCommand, TerminalSession,
+        TerminalTextEvent, TerminalViewportSnapshot,
     };
 
     struct StubSession {
@@ -754,6 +756,22 @@ mod tests {
         }
 
         fn send_input(&self, _bytes: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_text(&self, _event: TerminalTextEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_key(&self, _event: TerminalKeyEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_mouse(&self, _event: TerminalMouseEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn paste(&self, _paste: TerminalPaste) -> Result<()> {
             Ok(())
         }
 
@@ -841,7 +859,7 @@ mod tests {
                 hint: "Spawn a new shell session".into(),
                 action: PaletteAction::NewLocalTerminal,
                 group: PaletteGroup::Sessions,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             },
             PaletteItem {
@@ -850,7 +868,7 @@ mod tests {
                 hint: "Store an encrypted SSH config".into(),
                 action: PaletteAction::AddSavedHost,
                 group: PaletteGroup::Hosts,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             },
         ];
@@ -878,7 +896,7 @@ mod tests {
                 hint: "first".into(),
                 action: PaletteAction::NewLocalTerminal,
                 group: PaletteGroup::Sessions,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             },
             PaletteItem {
@@ -887,7 +905,7 @@ mod tests {
                 hint: "second".into(),
                 action: PaletteAction::OpenPreferences,
                 group: PaletteGroup::System,
-                shortcut: None,
+                shortcut_command: None,
                 match_indices: Vec::new(),
             },
         ];

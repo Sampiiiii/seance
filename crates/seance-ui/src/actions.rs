@@ -12,6 +12,8 @@ actions!(
         OpenCommandPalette,
         OpenPreferences,
         CloseActiveSession,
+        SelectPreviousSession,
+        SelectNextSession,
         OpenNewWindow,
         TogglePerfHud,
         QuitSeance,
@@ -179,5 +181,43 @@ impl Action for SelectSession {
             .and_then(Value::as_u64)
             .ok_or_else(|| anyhow!("missing session_id"))?;
         Ok(Box::new(Self { session_id }))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectSessionSlot {
+    pub slot: u8,
+}
+
+impl Action for SelectSessionSlot {
+    fn boxed_clone(&self) -> Box<dyn Action> {
+        Box::new(self.clone())
+    }
+
+    fn partial_eq(&self, action: &dyn Action) -> bool {
+        action.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
+    fn name(&self) -> &'static str {
+        Self::name_for_type()
+    }
+
+    fn name_for_type() -> &'static str
+    where
+        Self: Sized,
+    {
+        "seance_ui::SelectSessionSlot"
+    }
+
+    fn build(value: Value) -> Result<Box<dyn Action>>
+    where
+        Self: Sized,
+    {
+        let slot = value
+            .get("slot")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("missing slot"))?;
+        let slot = u8::try_from(slot).map_err(|_| anyhow!("slot out of range"))?;
+        Ok(Box::new(Self { slot }))
     }
 }

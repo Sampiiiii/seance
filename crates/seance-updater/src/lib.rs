@@ -115,7 +115,7 @@ mod sparkle_bridge {
         }
     }
 
-    pub fn initialize(feed_url: &str) -> Result<()> {
+    pub(super) fn initialize(feed_url: &str) -> Result<()> {
         let feed_url = CString::new(feed_url)
             .map_err(|_| anyhow!("Sparkle feed URL contains an interior nul byte"))?;
         let Some(init) = resolve::<InitFn>(b"seance_sparkle_initialize\0") else {
@@ -133,7 +133,7 @@ mod sparkle_bridge {
         }
     }
 
-    pub fn check_for_updates() -> Result<()> {
+    pub(super) fn check_for_updates() -> Result<()> {
         let Some(check) = resolve::<CheckFn>(b"seance_sparkle_check_for_updates\0") else {
             return Err(anyhow!(
                 "Sparkle.framework bridge is unavailable in this process"

@@ -12,8 +12,9 @@ use tracing::{debug, trace};
 
 use crate::{
     SessionPerfSnapshot, SessionSummary, SharedSessionState, TerminalEmulator, TerminalGeometry,
-    TerminalScrollCommand, TerminalSession, TerminalTranscriptSink, TerminalViewportSnapshot,
-    TranscriptEvent, TranscriptStream, next_session_id,
+    TerminalKeyEvent, TerminalMouseEvent, TerminalPaste, TerminalScrollCommand, TerminalSession,
+    TerminalTextEvent, TerminalTranscriptSink, TerminalViewportSnapshot, TranscriptEvent,
+    TranscriptStream, next_session_id,
 };
 
 pub struct LocalSessionHandle {
@@ -63,6 +64,30 @@ impl TerminalSession for LocalSessionHandle {
         self.command_tx
             .send(SessionCommand::Input(bytes))
             .context("failed to forward input to local shell")
+    }
+
+    fn send_text(&self, event: TerminalTextEvent) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::Text(event))
+            .context("failed to forward text event to local shell")
+    }
+
+    fn send_key(&self, event: TerminalKeyEvent) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::Key(event))
+            .context("failed to forward key event to local shell")
+    }
+
+    fn send_mouse(&self, event: TerminalMouseEvent) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::Mouse(event))
+            .context("failed to forward mouse event to local shell")
+    }
+
+    fn paste(&self, paste: TerminalPaste) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::Paste(paste))
+            .context("failed to forward paste to local shell")
     }
 
     fn resize(&self, geometry: TerminalGeometry) -> Result<()> {
@@ -115,6 +140,10 @@ impl LocalSessionFactory {
 
 pub(crate) enum SessionCommand {
     Input(Vec<u8>),
+    Text(TerminalTextEvent),
+    Key(TerminalKeyEvent),
+    Mouse(TerminalMouseEvent),
+    Paste(TerminalPaste),
     Resize(TerminalGeometry),
     ScrollViewport(TerminalScrollCommand),
     ScrollToBottom,
@@ -225,15 +254,31 @@ fn run_local_session(
 
         match command_rx.recv_timeout(Duration::from_millis(16)) {
             Ok(SessionCommand::Input(bytes)) => {
-                transcript_sink.record(TranscriptEvent {
-                    timestamp: SystemTime::now(),
-                    stream: TranscriptStream::Input,
-                    bytes: Arc::from(bytes.as_slice()),
-                });
-                writer
-                    .write_all(&bytes)
-                    .context("failed to write input to PTY")?;
-                writer.flush().ok();
+                write_input_bytes(&mut writer, &transcript_sink, &bytes)?;
+            }
+            Ok(SessionCommand::Text(event)) => {
+                let bytes = terminal.encode_text_event(&event);
+                if !bytes.is_empty() {
+                    write_input_bytes(&mut writer, &transcript_sink, &bytes)?;
+                }
+            }
+            Ok(SessionCommand::Key(event)) => {
+                let bytes = terminal.encode_key_event(&event)?;
+                if !bytes.is_empty() {
+                    write_input_bytes(&mut writer, &transcript_sink, &bytes)?;
+                }
+            }
+            Ok(SessionCommand::Mouse(event)) => {
+                let bytes = terminal.encode_mouse_event(&event)?;
+                if !bytes.is_empty() {
+                    write_input_bytes(&mut writer, &transcript_sink, &bytes)?;
+                }
+            }
+            Ok(SessionCommand::Paste(paste)) => {
+                let bytes = terminal.encode_paste(&paste);
+                if !bytes.is_empty() {
+                    write_input_bytes(&mut writer, &transcript_sink, &bytes)?;
+                }
             }
             Ok(SessionCommand::Resize(new_geometry)) => {
                 if new_geometry == current_geometry {
@@ -252,11 +297,11 @@ fn run_local_session(
             }
             Ok(SessionCommand::ScrollViewport(command)) => {
                 terminal.scroll_viewport(command);
-                terminal.refresh(&state, None, true, transcript_sink.dropped_events());
+                terminal.refresh(&state, None, false, transcript_sink.dropped_events());
             }
             Ok(SessionCommand::ScrollToBottom) => {
                 terminal.scroll_viewport(TerminalScrollCommand::Bottom);
-                terminal.refresh(&state, None, true, transcript_sink.dropped_events());
+                terminal.refresh(&state, None, false, transcript_sink.dropped_events());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -286,6 +331,23 @@ fn run_local_session(
         }
     }
 
+    Ok(())
+}
+
+fn write_input_bytes(
+    writer: &mut dyn Write,
+    transcript_sink: &Arc<dyn TerminalTranscriptSink>,
+    bytes: &[u8],
+) -> Result<()> {
+    transcript_sink.record(TranscriptEvent {
+        timestamp: SystemTime::now(),
+        stream: TranscriptStream::Input,
+        bytes: Arc::from(bytes),
+    });
+    writer
+        .write_all(bytes)
+        .context("failed to write input to PTY")?;
+    writer.flush().ok();
     Ok(())
 }
 

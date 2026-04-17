@@ -1,9 +1,15 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use gpui::{Pixels, ShapedLine};
-use seance_terminal::{TerminalCellStyle, TerminalGeometry};
+use seance_terminal::{
+    TerminalCellStyle, TerminalCursorState, TerminalGeometry, TerminalScrollbarState,
+};
 
-use crate::{TerminalRendererMetrics, theme::ThemeId};
+use crate::{
+    TerminalMetrics, TerminalRendererMetrics,
+    model::{TerminalHoveredLink, TerminalSelection},
+    theme::ThemeId,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TerminalGlyphPolicy {
@@ -29,7 +35,10 @@ pub(crate) struct TerminalPaintQuad {
 pub(crate) struct TerminalPaintRow {
     pub(crate) y: Pixels,
     pub(crate) backgrounds: Vec<TerminalPaintQuad>,
+    pub(crate) link_highlights: Vec<TerminalPaintQuad>,
     pub(crate) underlines: Vec<TerminalPaintQuad>,
+    pub(crate) link_underlines: Vec<TerminalPaintQuad>,
+    pub(crate) link_ranges: Vec<Range<usize>>,
     pub(crate) fragments: Vec<TerminalPaintFragment>,
 }
 
@@ -40,6 +49,9 @@ pub(crate) struct TerminalSurfaceState {
     pub(crate) row_revisions: Vec<u64>,
     pub(crate) geometry: Option<TerminalGeometry>,
     pub(crate) theme_id: ThemeId,
+    pub(crate) cursor: Option<TerminalCursorState>,
+    pub(crate) scrollbar: Option<TerminalScrollbarState>,
+    pub(crate) selection: Option<TerminalSelection>,
     pub(crate) rows: Arc<[TerminalPaintRow]>,
     pub(crate) metrics: TerminalRendererMetrics,
     pub(crate) shape_cache: ShapeCache,
@@ -53,6 +65,9 @@ impl Default for TerminalSurfaceState {
             row_revisions: Vec::new(),
             geometry: None,
             theme_id: ThemeId::ObsidianSmoke,
+            cursor: None,
+            scrollbar: None,
+            selection: None,
             rows: Arc::from(Vec::<TerminalPaintRow>::new()),
             metrics: TerminalRendererMetrics::default(),
             shape_cache: ShapeCache::default(),
@@ -102,5 +117,16 @@ pub(crate) struct TerminalFragmentPlan {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedTerminalSurface {
     pub(crate) rows: Arc<[TerminalPaintRow]>,
-    pub(crate) line_height_px: f32,
+    pub(crate) metrics: TerminalMetrics,
+    pub(crate) cursor: Option<TerminalCursorState>,
+    pub(crate) selection: Option<TerminalSelection>,
+    pub(crate) hovered_link: Option<TerminalHoveredLink>,
+    pub(crate) terminal_focused: bool,
+    pub(crate) cursor_fallback: gpui::Hsla,
+    pub(crate) cursor_dim: gpui::Hsla,
+    pub(crate) selection_background: gpui::Hsla,
+    pub(crate) link_hover_background: gpui::Hsla,
+    pub(crate) link_hover_underline: gpui::Hsla,
+    pub(crate) link_modifier_background: gpui::Hsla,
+    pub(crate) link_modifier_underline: gpui::Hsla,
 }

@@ -53,6 +53,10 @@ pub enum InstanceStartup {
     Secondary(IpcResponse),
 }
 
+pub fn open_external_url(url: &str) -> Result<()> {
+    open::that_detached(url).with_context(|| format!("failed to open external URL: {url}"))
+}
+
 pub fn acquire_or_notify(paths: &AppPaths, request: IpcRequest) -> Result<InstanceStartup> {
     let lock_file = OpenOptions::new()
         .create(true)

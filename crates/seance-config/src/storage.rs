@@ -83,7 +83,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::{AppConfig, ConfigStore, DEFAULT_THEME_KEY, PerfHudDefault};
+    use crate::{
+        AppConfig, COMMAND_APP_OPEN_COMMAND_PALETTE, ConfigStore, CustomKeybinding,
+        DEFAULT_THEME_KEY, KeybindingContext, KeybindingOverride, PerfHudDefault,
+    };
 
     #[test]
     fn missing_file_loads_defaults() {
@@ -149,5 +152,70 @@ mod tests {
         assert_eq!(config.appearance.theme, DEFAULT_THEME_KEY);
         assert_eq!(config.terminal.font_family, "Menlo");
         assert_eq!(config.terminal.local_shell.as_deref(), Some("/bin/zsh"));
+    }
+
+    #[test]
+    fn keybindings_round_trip_with_new_schema() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut store = ConfigStore::with_defaults(&path);
+
+        let saved = store
+            .update(|config| {
+                config.keybindings.overrides = vec![KeybindingOverride {
+                    id: COMMAND_APP_OPEN_COMMAND_PALETTE.into(),
+                    chord: Some("primary-p".into()),
+                    disabled: false,
+                }];
+                config.keybindings.custom = vec![CustomKeybinding {
+                    chord: "primary-shift-k".into(),
+                    command: COMMAND_APP_OPEN_COMMAND_PALETTE.into(),
+                    context: KeybindingContext::AppGlobal,
+                }];
+            })
+            .unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("[[keybindings.overrides]]"));
+        assert!(contents.contains("id = \"app.open_command_palette\""));
+        assert!(contents.contains("[[keybindings.custom]]"));
+
+        let reloaded = ConfigStore::load_or_default(&path).unwrap();
+        assert_eq!(reloaded.snapshot(), saved);
+    }
+
+    #[test]
+    fn legacy_keybinding_overrides_migrate_into_custom_bindings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[appearance]
+theme = "obsidian-smoke"
+
+[terminal]
+font_family = "Menlo"
+font_size_px = 13.0
+line_height_px = 19.0
+
+[keybindings]
+[[keybindings.overrides]]
+chord = "cmd-k"
+action = "seance_ui_app::OpenCommandPalette"
+"#,
+        )
+        .unwrap();
+
+        let store = ConfigStore::load_or_default(&path).unwrap();
+        assert!(store.snapshot().keybindings.overrides.is_empty());
+        assert_eq!(
+            store.snapshot().keybindings.custom,
+            vec![CustomKeybinding {
+                chord: "cmd-k".into(),
+                command: COMMAND_APP_OPEN_COMMAND_PALETTE.into(),
+                context: KeybindingContext::AppGlobal,
+            }]
+        );
     }
 }

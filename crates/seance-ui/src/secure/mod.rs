@@ -93,12 +93,12 @@ impl SeanceWorkspace {
                 self.secure.tunnel_draft = None;
                 self.secure.credential_draft = None;
                 self.secure.message = None;
-                self.secure.input_target = match section {
+                self.focus_secure_input_target(match section {
                     SecureSection::Hosts => SecureInputTarget::HostSearch,
                     SecureSection::Tunnels => SecureInputTarget::TunnelSearch,
                     SecureSection::Credentials => SecureInputTarget::CredentialSearch,
                     SecureSection::Keys => SecureInputTarget::KeySearch,
-                };
+                });
             }
             PendingAction::OpenHostDraft(host_id) => {
                 self.activate_host_draft(host_id.as_deref(), cx);
@@ -187,7 +187,7 @@ impl SeanceWorkspace {
             Some(draft)
         };
         if self.secure.host_draft.is_some() {
-            self.secure.input_target = SecureInputTarget::HostDraft(HostDraftField::Label);
+            self.focus_secure_input_target(SecureInputTarget::HostDraft(HostDraftField::Label));
         }
         self.secure.tunnel_draft = None;
         self.secure.credential_draft = None;
@@ -250,8 +250,9 @@ impl SeanceWorkspace {
             Some(draft)
         };
         if self.secure.credential_draft.is_some() {
-            self.secure.input_target =
-                SecureInputTarget::CredentialDraft(CredentialDraftField::Label);
+            self.focus_secure_input_target(SecureInputTarget::CredentialDraft(
+                CredentialDraftField::Label,
+            ));
         }
         self.secure.tunnel_draft = None;
         self.confirm_dialog = None;
@@ -493,12 +494,13 @@ impl SeanceWorkspace {
                                 Some(host_draft.auth_items.len().saturating_sub(1));
                             host_draft.dirty = true;
                         }
-                        self.secure.input_target = self
+                        let target = self
                             .secure
                             .host_draft
                             .as_ref()
                             .map(|draft| SecureInputTarget::HostDraft(draft.selected_field))
                             .unwrap_or(SecureInputTarget::HostSearch);
+                        self.focus_secure_input_target(target);
                     }
                 }
             }
@@ -739,6 +741,7 @@ impl SeanceWorkspace {
             .h_full()
             .bg(t.bg_void)
             .track_focus(&self.focus_handle)
+            .key_context("WorkspaceSecure")
             .on_mouse_down(MouseButton::Left, {
                 let fh = self.focus_handle.clone();
                 move |_: &gpui::MouseDownEvent, window: &mut Window, _cx: &mut App| {
@@ -873,7 +876,7 @@ impl SeanceWorkspace {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
-                                this.secure.input_target = SecureInputTarget::HostSearch;
+                                this.focus_secure_input_target(SecureInputTarget::HostSearch);
                                 cx.notify();
                             }),
                         ),
@@ -907,7 +910,7 @@ impl SeanceWorkspace {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
-                                this.secure.input_target = SecureInputTarget::CredentialSearch;
+                                this.focus_secure_input_target(SecureInputTarget::CredentialSearch);
                                 cx.notify();
                             }),
                         ),
@@ -944,7 +947,7 @@ impl SeanceWorkspace {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
-                                this.secure.input_target = SecureInputTarget::KeySearch;
+                                this.focus_secure_input_target(SecureInputTarget::KeySearch);
                                 cx.notify();
                             }),
                         ),
@@ -1001,6 +1004,8 @@ impl SeanceWorkspace {
             .absolute()
             .size_full()
             .bg(t.scrim)
+            .track_focus(&self.focus_handle)
+            .key_context("ConfirmDialog")
             .flex()
             .items_center()
             .justify_center()

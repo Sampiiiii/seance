@@ -26,17 +26,17 @@ use crate::SessionKind;
 const TRANSCRIPT_CHANNEL_CAPACITY: usize = 512;
 
 #[derive(Debug)]
-pub struct SessionLogManager {
+pub(crate) struct SessionLogManager {
     root_dir: PathBuf,
 }
 
 impl SessionLogManager {
-    pub fn new(root_dir: PathBuf) -> Result<Self> {
+    pub(crate) fn new(root_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root_dir).context("failed to create session log directory")?;
         Ok(Self { root_dir })
     }
 
-    pub fn sink_for_session(
+    pub(crate) fn sink_for_session(
         &self,
         config: &AppConfig,
         kind: SessionKind,
@@ -64,13 +64,13 @@ impl SessionLogManager {
 }
 
 #[derive(Debug)]
-pub struct FileTranscriptSink {
+pub(crate) struct FileTranscriptSink {
     tx: SyncSender<TranscriptEvent>,
     dropped_events: Arc<DroppedEventCounter>,
 }
 
 impl FileTranscriptSink {
-    pub fn new(
+    pub(crate) fn new(
         root_dir: &Path,
         kind: SessionKind,
         title: &str,

@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail};
 
-pub fn release_notes(changelog_path: &Path, version: &str) -> Result<String> {
+pub(crate) fn release_notes(changelog_path: &Path, version: &str) -> Result<String> {
     let content = fs::read_to_string(changelog_path)
         .with_context(|| format!("failed to read changelog at {}", changelog_path.display()))?;
     let heading = format!("## [{version}]");

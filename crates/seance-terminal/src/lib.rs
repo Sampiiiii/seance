@@ -2,6 +2,7 @@
 //! live in dedicated modules while downstream crates keep importing from the crate root.
 
 mod history;
+mod input;
 mod local;
 mod model;
 mod render;
@@ -12,11 +13,16 @@ pub use history::{
     DroppedEventCounter, NoopTranscriptSink, TerminalTranscriptSink, TranscriptEvent,
     TranscriptStream,
 };
+pub use input::{
+    TerminalInputModifiers, TerminalKeyEvent, TerminalMouseButton, TerminalMouseEvent,
+    TerminalMouseEventKind, TerminalPaste, TerminalTextEvent,
+};
 pub use local::{LocalSessionFactory, LocalSessionHandle};
 pub use model::{
     SessionSummary, TerminalCell, TerminalCellStyle, TerminalColor, TerminalCursor,
-    TerminalGeometry, TerminalPixelSize, TerminalRow, TerminalScreenKind, TerminalScrollCommand,
-    TerminalSize, TerminalViewportSnapshot,
+    TerminalCursorState, TerminalCursorVisualStyle, TerminalGeometry, TerminalPixelSize,
+    TerminalRow, TerminalScreenKind, TerminalScrollCommand, TerminalScrollbarState, TerminalSize,
+    TerminalViewportSnapshot,
 };
 pub use render::TerminalEmulator;
 pub use state::{

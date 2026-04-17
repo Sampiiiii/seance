@@ -73,7 +73,7 @@ pub struct AppContext {
     vaults: HashMap<String, ManagedVaultState>,
     pub ssh: Arc<SshSessionManager>,
     pub local: LocalSessionFactory,
-    pub session_logs: Arc<SessionLogManager>,
+    pub(crate) session_logs: Arc<SessionLogManager>,
     pub updater: Arc<UpdateManager>,
 }
 
@@ -540,10 +540,10 @@ impl AppControllerHandle {
 
     pub fn lock_vault(&self) {
         self.with_lock(|controller| {
-            if let Some(vault_id) = controller.default_target_vault_id_for_actions() {
-                if controller.lock_vault(&vault_id).is_ok() {
-                    controller.publish_vault_update();
-                }
+            if let Some(vault_id) = controller.default_target_vault_id_for_actions()
+                && controller.lock_vault(&vault_id).is_ok()
+            {
+                controller.publish_vault_update();
             }
         });
     }
@@ -1717,8 +1717,9 @@ mod tests {
 
     use anyhow::Result;
     use seance_terminal::{
-        SessionPerfSnapshot, SessionSummary, TerminalGeometry, TerminalScrollCommand,
-        TerminalSession, TerminalViewportSnapshot,
+        SessionPerfSnapshot, SessionSummary, TerminalGeometry, TerminalKeyEvent,
+        TerminalMouseEvent, TerminalPaste, TerminalScrollCommand, TerminalSession,
+        TerminalViewportSnapshot,
     };
     use seance_vault::{
         GenerateKeyAlgorithm, GenerateKeyRequest, HostAuthRef, PortForwardMode, SecretString,
@@ -1747,6 +1748,15 @@ mod tests {
             TerminalViewportSnapshot::default()
         }
         fn send_input(&self, _bytes: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+        fn send_key(&self, _event: TerminalKeyEvent) -> Result<()> {
+            Ok(())
+        }
+        fn send_mouse(&self, _event: TerminalMouseEvent) -> Result<()> {
+            Ok(())
+        }
+        fn paste(&self, _paste: TerminalPaste) -> Result<()> {
             Ok(())
         }
         fn resize(&self, _geometry: TerminalGeometry) -> Result<()> {

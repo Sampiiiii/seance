@@ -9,7 +9,7 @@ use crate::{
     },
 };
 
-pub fn initialize_schema(conn: &Connection) -> VaultResult<()> {
+pub(crate) fn initialize_schema(conn: &Connection) -> VaultResult<()> {
     conn.execute_batch(
         "
         PRAGMA foreign_keys = ON;
@@ -80,7 +80,7 @@ pub fn initialize_schema(conn: &Connection) -> VaultResult<()> {
     Ok(())
 }
 
-pub fn load_header(conn: &Connection) -> VaultResult<Option<VaultHeader>> {
+pub(crate) fn load_header(conn: &Connection) -> VaultResult<Option<VaultHeader>> {
     conn.query_row(
         "
         SELECT vault_id, schema_version, cipher, recovery_salt, recovery_memory_kib,
@@ -110,7 +110,7 @@ pub fn load_header(conn: &Connection) -> VaultResult<Option<VaultHeader>> {
     .map_err(Into::into)
 }
 
-pub fn insert_header(conn: &Connection, header: &VaultHeader) -> VaultResult<()> {
+pub(crate) fn insert_header(conn: &Connection, header: &VaultHeader) -> VaultResult<()> {
     conn.execute(
         "
         INSERT INTO vault_header (
@@ -136,7 +136,7 @@ pub fn insert_header(conn: &Connection, header: &VaultHeader) -> VaultResult<()>
     Ok(())
 }
 
-pub fn update_header_after_rotation(
+pub(crate) fn update_header_after_rotation(
     conn: &Connection,
     updated_at: i64,
     kdf: &KdfParams,
@@ -163,7 +163,7 @@ pub fn update_header_after_rotation(
     Ok(())
 }
 
-pub fn bump_logical_clock(conn: &Connection) -> VaultResult<u64> {
+pub(crate) fn bump_logical_clock(conn: &Connection) -> VaultResult<u64> {
     let current: u64 = conn.query_row(
         "SELECT last_logical_clock FROM vault_header WHERE singleton = 1",
         [],
@@ -177,7 +177,10 @@ pub fn bump_logical_clock(conn: &Connection) -> VaultResult<u64> {
     Ok(next)
 }
 
-pub fn insert_recovery_bundle(conn: &Connection, bundle: &RecoveryBundle) -> VaultResult<()> {
+pub(crate) fn insert_recovery_bundle(
+    conn: &Connection,
+    bundle: &RecoveryBundle,
+) -> VaultResult<()> {
     conn.execute("DELETE FROM recovery_bundles", [])?;
     conn.execute(
         "
@@ -202,7 +205,7 @@ pub fn insert_recovery_bundle(conn: &Connection, bundle: &RecoveryBundle) -> Vau
     Ok(())
 }
 
-pub fn load_recovery_bundle(conn: &Connection) -> VaultResult<Option<RecoveryBundle>> {
+pub(crate) fn load_recovery_bundle(conn: &Connection) -> VaultResult<Option<RecoveryBundle>> {
     conn.query_row(
         "
         SELECT bundle_id, salt, memory_kib, iterations, parallelism, wrapping_nonce,
@@ -231,7 +234,7 @@ pub fn load_recovery_bundle(conn: &Connection) -> VaultResult<Option<RecoveryBun
     .map_err(Into::into)
 }
 
-pub fn upsert_device_enrollment(
+pub(crate) fn upsert_device_enrollment(
     conn: &Connection,
     enrollment: &DeviceEnrollment,
 ) -> VaultResult<()> {
@@ -262,7 +265,7 @@ pub fn upsert_device_enrollment(
     Ok(())
 }
 
-pub fn load_device_enrollment(
+pub(crate) fn load_device_enrollment(
     conn: &Connection,
     device_id: &str,
 ) -> VaultResult<Option<DeviceEnrollment>> {
@@ -280,7 +283,7 @@ pub fn load_device_enrollment(
     .map_err(Into::into)
 }
 
-pub fn update_device_last_used(
+pub(crate) fn update_device_last_used(
     conn: &Connection,
     device_id: &str,
     timestamp: i64,
@@ -296,7 +299,7 @@ pub fn update_device_last_used(
     Ok(())
 }
 
-pub fn list_device_enrollments(conn: &Connection) -> VaultResult<Vec<DeviceEnrollment>> {
+pub(crate) fn list_device_enrollments(conn: &Connection) -> VaultResult<Vec<DeviceEnrollment>> {
     let mut stmt = conn.prepare(
         "
         SELECT device_id, device_name, wrapping_nonce, wrapped_master_key,
@@ -310,12 +313,12 @@ pub fn list_device_enrollments(conn: &Connection) -> VaultResult<Vec<DeviceEnrol
     Ok(enrollments)
 }
 
-pub fn clear_device_enrollments(conn: &Connection) -> VaultResult<()> {
+pub(crate) fn clear_device_enrollments(conn: &Connection) -> VaultResult<()> {
     conn.execute("DELETE FROM device_enrollments", [])?;
     Ok(())
 }
 
-pub fn set_local_state(conn: &Connection, key: &str, value: &str) -> VaultResult<()> {
+pub(crate) fn set_local_state(conn: &Connection, key: &str, value: &str) -> VaultResult<()> {
     conn.execute(
         "
         INSERT INTO local_state (key, value)
@@ -327,7 +330,7 @@ pub fn set_local_state(conn: &Connection, key: &str, value: &str) -> VaultResult
     Ok(())
 }
 
-pub fn get_local_state(conn: &Connection, key: &str) -> VaultResult<Option<String>> {
+pub(crate) fn get_local_state(conn: &Connection, key: &str) -> VaultResult<Option<String>> {
     conn.query_row(
         "SELECT value FROM local_state WHERE key = ?1",
         params![key],
@@ -337,12 +340,12 @@ pub fn get_local_state(conn: &Connection, key: &str) -> VaultResult<Option<Strin
     .map_err(Into::into)
 }
 
-pub fn delete_local_state(conn: &Connection, key: &str) -> VaultResult<()> {
+pub(crate) fn delete_local_state(conn: &Connection, key: &str) -> VaultResult<()> {
     conn.execute("DELETE FROM local_state WHERE key = ?1", params![key])?;
     Ok(())
 }
 
-pub fn upsert_record(conn: &Connection, record: &EncryptedRecord) -> VaultResult<()> {
+pub(crate) fn upsert_record(conn: &Connection, record: &EncryptedRecord) -> VaultResult<()> {
     conn.execute(
         "
         INSERT INTO records (
@@ -382,7 +385,7 @@ pub fn upsert_record(conn: &Connection, record: &EncryptedRecord) -> VaultResult
     Ok(())
 }
 
-pub fn list_records_by_kind(
+pub(crate) fn list_records_by_kind(
     conn: &Connection,
     kind: RecordKind,
 ) -> VaultResult<Vec<EncryptedRecord>> {
@@ -402,7 +405,7 @@ pub fn list_records_by_kind(
     Ok(records)
 }
 
-pub fn load_record(
+pub(crate) fn load_record(
     conn: &Connection,
     record_id: &str,
     kind: RecordKind,
@@ -422,7 +425,7 @@ pub fn load_record(
     .map_err(Into::into)
 }
 
-pub fn list_all_records(conn: &Connection) -> VaultResult<Vec<EncryptedRecord>> {
+pub(crate) fn list_all_records(conn: &Connection) -> VaultResult<Vec<EncryptedRecord>> {
     let mut stmt = conn.prepare(
         "
         SELECT record_id, kind, version, logical_clock, modified_at, deleted_at,
@@ -437,7 +440,7 @@ pub fn list_all_records(conn: &Connection) -> VaultResult<Vec<EncryptedRecord>> 
     Ok(records)
 }
 
-pub fn list_records_after_clock(
+pub(crate) fn list_records_after_clock(
     conn: &Connection,
     logical_clock: u64,
 ) -> VaultResult<Vec<EncryptedRecord>> {
@@ -456,12 +459,12 @@ pub fn list_records_after_clock(
     Ok(records)
 }
 
-pub fn count_records(conn: &Connection) -> VaultResult<u64> {
+pub(crate) fn count_records(conn: &Connection) -> VaultResult<u64> {
     let count = conn.query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))?;
     Ok(count)
 }
 
-pub fn set_last_logical_clock(conn: &Connection, logical_clock: u64) -> VaultResult<()> {
+pub(crate) fn set_last_logical_clock(conn: &Connection, logical_clock: u64) -> VaultResult<()> {
     conn.execute(
         "UPDATE vault_header SET last_logical_clock = ?1, updated_at = ?2 WHERE singleton = 1",
         params![logical_clock, crate::now_ts()],
@@ -469,7 +472,7 @@ pub fn set_last_logical_clock(conn: &Connection, logical_clock: u64) -> VaultRes
     Ok(())
 }
 
-pub fn verify_header_integrity(header: &VaultHeader) -> VaultResult<()> {
+pub(crate) fn verify_header_integrity(header: &VaultHeader) -> VaultResult<()> {
     if header.schema_version != VAULT_SCHEMA_VERSION {
         return Err(VaultError::UnsupportedSchemaVersion {
             version: header.schema_version,

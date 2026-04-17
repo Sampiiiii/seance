@@ -9,6 +9,7 @@ repository.workspace = true
 anyhow = "1.0"
 dirs = "6.0"
 gpui = "0.2.2"
+linkify = "0.10"
 seance-config = { path = "../seance-config" }
 seance-core = { path = "../seance-core" }
 seance-platform = { path = "../seance-platform" }
@@ -17,6 +18,7 @@ seance-terminal = { path = "../seance-terminal" }
 seance-vault = { path = "../seance-vault" }
 serde_json = "1.0"
 tracing = "0.1"
+url = "2.5"
 zeroize = "1.8"
 
 [dev-dependencies]

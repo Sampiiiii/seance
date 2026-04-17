@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use crate::{
-    SessionSummary, TerminalCursor, TerminalGeometry, TerminalRow, TerminalScreenKind,
-    TerminalViewportSnapshot,
+    SessionSummary, TerminalCursorState, TerminalGeometry, TerminalRow, TerminalScreenKind,
+    TerminalScrollbarState, TerminalViewportSnapshot,
 };
 
 #[derive(Debug)]
@@ -15,7 +15,9 @@ pub(crate) struct ViewportCache {
     next_row_revision: u64,
     geometry: TerminalGeometry,
     pub(crate) at_bottom: bool,
-    cursor: Option<TerminalCursor>,
+    cursor: Option<TerminalCursorState>,
+    scrollbar: Option<TerminalScrollbarState>,
+    stable_preview_line: String,
 }
 
 impl ViewportCache {
@@ -28,8 +30,11 @@ impl ViewportCache {
             geometry,
             at_bottom: true,
             cursor: None,
+            scrollbar: None,
+            stable_preview_line: String::new(),
         };
         cache.reset_rows(vec![initial_row]);
+        cache.refresh_stable_preview();
         cache
     }
 
@@ -49,8 +54,20 @@ impl ViewportCache {
         self.rows.len()
     }
 
-    pub(crate) fn set_cursor(&mut self, cursor: Option<TerminalCursor>) {
+    pub(crate) fn set_cursor(&mut self, cursor: Option<TerminalCursorState>) -> bool {
+        if self.cursor == cursor {
+            return false;
+        }
         self.cursor = cursor;
+        true
+    }
+
+    pub(crate) fn set_scrollbar(&mut self, scrollbar: Option<TerminalScrollbarState>) -> bool {
+        if self.scrollbar == scrollbar {
+            return false;
+        }
+        self.scrollbar = scrollbar;
+        true
     }
 
     pub(crate) fn reset_rows(&mut self, rows: Vec<TerminalRow>) {
@@ -87,19 +104,24 @@ impl ViewportCache {
             rows: Arc::from(self.rows.clone()),
             row_revisions: Arc::from(self.row_revisions.clone()),
             cursor: self.cursor,
+            scrollbar: self.scrollbar,
             revision: self.viewport_revision,
             cols: self.geometry.size.cols,
             rows_visible: self.geometry.size.rows,
         }
     }
 
-    pub(crate) fn preview_line(&self) -> String {
+    fn computed_preview_line(&self) -> String {
         self.rows
             .iter()
             .rev()
             .map(|row| row.plain_text())
             .find(|line| !line.trim().is_empty())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn refresh_stable_preview(&mut self) {
+        self.stable_preview_line = self.computed_preview_line();
     }
 
     pub(crate) fn summary(
@@ -111,7 +133,7 @@ impl ViewportCache {
     ) -> SessionSummary {
         SessionSummary {
             exit_status,
-            preview_line: self.preview_line(),
+            preview_line: self.stable_preview_line.clone(),
             viewport_revision: self.viewport_revision,
             scrollback_rows,
             active_screen,

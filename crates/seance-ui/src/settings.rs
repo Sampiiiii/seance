@@ -7,6 +7,7 @@ use seance_core::UpdateState;
 use crate::{
     SeanceWorkspace,
     forms::{SettingsSection, WorkspaceSurface},
+    keybindings::builtin_keybinding_entries,
     theme::ThemeId,
     ui_components::{
         perf_mode_label, settings_action_chip, settings_choice_chip, settings_info_card,
@@ -19,7 +20,7 @@ impl SeanceWorkspace {
         self.surface = WorkspaceSurface::Settings;
         self.settings_panel.section = section;
         self.settings_panel.message = None;
-        self.palette_open = false;
+        self.close_palette(cx);
         cx.notify();
     }
 
@@ -219,6 +220,7 @@ impl SeanceWorkspace {
             .bg(t.bg_void)
             .overflow_y_scroll()
             .track_focus(&self.focus_handle)
+            .key_context("WorkspaceSettings")
             .on_mouse_down(MouseButton::Left, {
                 let fh = self.focus_handle.clone();
                 move |_: &gpui::MouseDownEvent, window: &mut Window, _cx: &mut App| {
@@ -319,8 +321,7 @@ impl SeanceWorkspace {
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
                                 let mut next = window_settings;
-                                next.hide_on_last_window_close =
-                                    !next.hide_on_last_window_close;
+                                next.hide_on_last_window_close = !next.hide_on_last_window_close;
                                 this.persist_window_settings(next, cx);
                             }),
                         ),
@@ -342,45 +343,148 @@ impl SeanceWorkspace {
                             }),
                         ),
                     )
-                    .child(settings_section_group("Keybindings", &t))
-                    .child(
+            }
+            SettingsSection::Keybindings => {
+                let keymap = builtin_keybinding_entries(&self.config);
+                let mut entries = div().flex().flex_col().gap(px(8.0));
+                for entry in keymap.entries {
+                    let status = if entry.is_custom {
+                        "custom"
+                    } else if entry.disabled {
+                        "disabled"
+                    } else if entry.customized {
+                        "override"
+                    } else {
+                        "default"
+                    };
+                    let binding_id = entry.id.clone().unwrap_or_else(|| "custom".into());
+                    let default_label = entry.default_display.unwrap_or_else(|| "none".into());
+                    let effective_label =
+                        entry.effective_display.unwrap_or_else(|| "disabled".into());
+                    entries = entries.child(
                         div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
                             .p_4()
                             .rounded_lg()
                             .bg(t.glass_tint)
                             .border_1()
                             .border_color(t.glass_border)
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
                             .child(
                                 div()
                                     .flex()
-                                    .flex_col()
-                                    .gap(px(3.0))
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(12.0))
                                     .child(
                                         div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(t.text_primary)
-                                            .child("Keybindings"),
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(3.0))
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(t.text_primary)
+                                                    .child(entry.label),
+                                            )
+                                            .child(div().text_xs().text_color(t.text_muted).child(
+                                                format!(
+                                                    "{} · {}",
+                                                    binding_id,
+                                                    entry.context.display_name()
+                                                ),
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(8.0))
+                                            .py(px(3.0))
+                                            .rounded_md()
+                                            .bg(t.glass_hover)
+                                            .text_xs()
+                                            .text_color(t.text_ghost)
+                                            .child(status),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(12.0))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(t.text_muted)
+                                            .child(format!("default: {default_label}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(t.text_secondary)
+                                            .child(format!("effective: {effective_label}")),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(t.text_muted)
-                                            .child("Override schema is persisted; runtime rebinding UI is deferred."),
-                                    ),
-                            )
-                            .child(
-                                settings_action_chip("reset defaults", &t)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.reset_settings_to_defaults(cx);
-                                        }),
+                                            .child(format!("command: {}", entry.command)),
                                     ),
                             ),
+                    );
+                }
+
+                let example = r#"[[keybindings.overrides]]
+id = "session.select_next"
+chord = "primary-l"
+
+[[keybindings.custom]]
+chord = "primary-shift-k"
+command = "app.open_command_palette"
+context = "app-global""#;
+
+                content
+                    .child(settings_section_group("Keybindings", &t))
+                    .child(
+                        settings_info_card(
+                            "Config-first rebinding",
+                            "Effective keymap".to_string(),
+                            "Edit config TOML for now. Runtime capture UI is intentionally deferred.",
+                            &t,
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(8.0))
+                                .child(settings_action_chip("reset all defaults", &t).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.reset_settings_to_defaults(cx);
+                                    }),
+                                ))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(t.text_muted)
+                                        .child(format!("{} active conflicts", keymap.conflicts.len())),
+                                ),
+                        ),
+                    )
+                    .child(entries)
+                    .child(settings_section_group("TOML Example", &t))
+                    .child(
+                        div()
+                            .p_4()
+                            .rounded_lg()
+                            .bg(t.glass_tint)
+                            .border_1()
+                            .border_color(t.glass_border)
+                            .font_family(crate::SIDEBAR_FONT_MONO)
+                            .text_size(px(11.0))
+                            .text_color(t.text_secondary)
+                            .child(example),
                     )
             }
             SettingsSection::Updates => {

@@ -47,7 +47,7 @@ impl SeanceWorkspace {
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         this.secure.selected_key_id = Some(key_scope_key.clone());
-                        this.secure.input_target = SecureInputTarget::KeySearch;
+                        this.focus_secure_input_target(SecureInputTarget::KeySearch);
                         cx.notify();
                     }),
                 ),

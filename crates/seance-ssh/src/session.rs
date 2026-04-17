@@ -2,14 +2,19 @@ use std::sync::{Arc, Mutex, mpsc::Receiver};
 
 use anyhow::{Result, anyhow};
 use seance_terminal::{
-    SessionPerfSnapshot, SessionSummary, SharedSessionState, TerminalGeometry,
-    TerminalScrollCommand, TerminalSession, TerminalViewportSnapshot,
+    SessionPerfSnapshot, SessionSummary, SharedSessionState, TerminalGeometry, TerminalKeyEvent,
+    TerminalMouseEvent, TerminalPaste, TerminalScrollCommand, TerminalSession, TerminalTextEvent,
+    TerminalViewportSnapshot,
 };
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub(crate) enum SessionCommand {
     Input(Vec<u8>),
+    Text(TerminalTextEvent),
+    Key(TerminalKeyEvent),
+    Mouse(TerminalMouseEvent),
+    Paste(TerminalPaste),
     Resize(TerminalGeometry),
     ScrollViewport(TerminalScrollCommand),
     ScrollToBottom,
@@ -71,6 +76,30 @@ impl TerminalSession for SshSessionHandle {
         self.command_tx
             .send(SessionCommand::Input(bytes))
             .map_err(|_| anyhow!("failed to forward input to SSH session"))
+    }
+
+    fn send_text(&self, event: TerminalTextEvent) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::Text(event))
+            .map_err(|_| anyhow!("failed to forward text event to SSH session"))
+    }
+
+    fn send_key(&self, event: TerminalKeyEvent) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::Key(event))
+            .map_err(|_| anyhow!("failed to forward key event to SSH session"))
+    }
+
+    fn send_mouse(&self, event: TerminalMouseEvent) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::Mouse(event))
+            .map_err(|_| anyhow!("failed to forward mouse event to SSH session"))
+    }
+
+    fn paste(&self, paste: TerminalPaste) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::Paste(paste))
+            .map_err(|_| anyhow!("failed to forward paste to SSH session"))
     }
 
     fn resize(&self, geometry: TerminalGeometry) -> Result<()> {

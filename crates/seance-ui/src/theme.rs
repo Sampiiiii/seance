@@ -108,6 +108,12 @@ pub struct Theme {
 
     pub accent: Hsla,
     pub accent_glow: Hsla,
+    pub terminal_link: Hsla,
+    pub terminal_link_underline: Hsla,
+    pub terminal_link_hover_bg: Hsla,
+    pub terminal_link_hover_underline: Hsla,
+    pub terminal_link_modifier_bg: Hsla,
+    pub terminal_link_modifier_underline: Hsla,
     pub selection_soft: Hsla,
 
     pub text_primary: Hsla,
@@ -122,6 +128,13 @@ pub struct Theme {
 
     pub palette_group_label: Hsla,
     pub palette_group_separator: Hsla,
+
+    pub scrollbar_track: Hsla,
+    pub scrollbar_track_focus: Hsla,
+    pub scrollbar_thumb_idle: Hsla,
+    pub scrollbar_thumb_hover: Hsla,
+    pub scrollbar_thumb_drag: Hsla,
+    pub scrollbar_thumb_border: Hsla,
 }
 
 fn obsidian_smoke() -> Theme {
@@ -149,6 +162,12 @@ fn obsidian_smoke() -> Theme {
         shell_divider_glow: alpha(0xc9885f, 0.08),
         accent: solid(0xc9885f),
         accent_glow: alpha(0xc9885f, 0.14),
+        terminal_link: alpha(0xc9885f, 0.12),
+        terminal_link_underline: alpha(0xc9885f, 0.72),
+        terminal_link_hover_bg: alpha(0xc9885f, 0.20),
+        terminal_link_hover_underline: alpha(0xc9885f, 0.88),
+        terminal_link_modifier_bg: alpha(0xc9885f, 0.28),
+        terminal_link_modifier_underline: alpha(0xe8e4dd, 0.96),
         selection_soft: alpha(0xffffff, 0.06),
         text_primary: solid(0xe8e4dd),
         text_secondary: solid(0xa8a29c),
@@ -160,6 +179,12 @@ fn obsidian_smoke() -> Theme {
         scrim: alpha(0x08070a, 0.85),
         palette_group_label: solid(0x58534c),
         palette_group_separator: alpha(0xffffff, 0.05),
+        scrollbar_track: alpha(0xffffff, 0.05),
+        scrollbar_track_focus: alpha(0xffffff, 0.09),
+        scrollbar_thumb_idle: alpha(0xc9885f, 0.46),
+        scrollbar_thumb_hover: alpha(0xc9885f, 0.62),
+        scrollbar_thumb_drag: alpha(0xc9885f, 0.78),
+        scrollbar_thumb_border: alpha(0xffffff, 0.20),
     }
 }
 
@@ -188,6 +213,12 @@ fn midnight_frost() -> Theme {
         shell_divider_glow: alpha(0x5b9bd5, 0.08),
         accent: solid(0x5b9bd5),
         accent_glow: alpha(0x5b9bd5, 0.14),
+        terminal_link: alpha(0x5b9bd5, 0.12),
+        terminal_link_underline: alpha(0x5b9bd5, 0.72),
+        terminal_link_hover_bg: alpha(0x5b9bd5, 0.20),
+        terminal_link_hover_underline: alpha(0x5b9bd5, 0.88),
+        terminal_link_modifier_bg: alpha(0x5b9bd5, 0.28),
+        terminal_link_modifier_underline: alpha(0xe4eaf0, 0.96),
         selection_soft: alpha(0x80b0e0, 0.07),
         text_primary: solid(0xe4eaf0),
         text_secondary: solid(0x8ea4b8),
@@ -199,6 +230,12 @@ fn midnight_frost() -> Theme {
         scrim: alpha(0x060a10, 0.85),
         palette_group_label: solid(0x4a6078),
         palette_group_separator: alpha(0x80b0e0, 0.06),
+        scrollbar_track: alpha(0x80b0e0, 0.05),
+        scrollbar_track_focus: alpha(0x80b0e0, 0.10),
+        scrollbar_thumb_idle: alpha(0x5b9bd5, 0.44),
+        scrollbar_thumb_hover: alpha(0x5b9bd5, 0.60),
+        scrollbar_thumb_drag: alpha(0x5b9bd5, 0.76),
+        scrollbar_thumb_border: alpha(0xb7d2ee, 0.24),
     }
 }
 
@@ -227,6 +264,12 @@ fn bone() -> Theme {
         shell_divider_glow: alpha(0x8b5e3c, 0.07),
         accent: solid(0x8b5e3c),
         accent_glow: alpha(0x8b5e3c, 0.10),
+        terminal_link: alpha(0x8b5e3c, 0.12),
+        terminal_link_underline: alpha(0x8b5e3c, 0.72),
+        terminal_link_hover_bg: alpha(0x8b5e3c, 0.20),
+        terminal_link_hover_underline: alpha(0x8b5e3c, 0.88),
+        terminal_link_modifier_bg: alpha(0x8b5e3c, 0.28),
+        terminal_link_modifier_underline: alpha(0x1a1816, 0.96),
         selection_soft: alpha(0x000000, 0.045),
         text_primary: solid(0x1a1816),
         text_secondary: solid(0x5c564e),
@@ -238,6 +281,12 @@ fn bone() -> Theme {
         scrim: alpha(0x1a1816, 0.50),
         palette_group_label: solid(0x9a9088),
         palette_group_separator: alpha(0x000000, 0.06),
+        scrollbar_track: alpha(0x000000, 0.07),
+        scrollbar_track_focus: alpha(0x000000, 0.13),
+        scrollbar_thumb_idle: alpha(0x8b5e3c, 0.36),
+        scrollbar_thumb_hover: alpha(0x8b5e3c, 0.52),
+        scrollbar_thumb_drag: alpha(0x8b5e3c, 0.66),
+        scrollbar_thumb_border: alpha(0xffffff, 0.34),
     }
 }
 
@@ -266,6 +315,12 @@ fn phosphor() -> Theme {
         shell_divider_glow: alpha(0x33ff66, 0.07),
         accent: solid(0x33ff66),
         accent_glow: alpha(0x33ff66, 0.12),
+        terminal_link: alpha(0x33ff66, 0.12),
+        terminal_link_underline: alpha(0x33ff66, 0.72),
+        terminal_link_hover_bg: alpha(0x33ff66, 0.20),
+        terminal_link_hover_underline: alpha(0x33ff66, 0.88),
+        terminal_link_modifier_bg: alpha(0x33ff66, 0.28),
+        terminal_link_modifier_underline: alpha(0x33ff66, 0.96),
         selection_soft: alpha(0x33ff66, 0.055),
         text_primary: solid(0x33ff66),
         text_secondary: solid(0x22cc44),
@@ -277,6 +332,12 @@ fn phosphor() -> Theme {
         scrim: alpha(0x040604, 0.90),
         palette_group_label: solid(0x0e6624),
         palette_group_separator: alpha(0x33ff66, 0.04),
+        scrollbar_track: alpha(0x33ff66, 0.05),
+        scrollbar_track_focus: alpha(0x33ff66, 0.10),
+        scrollbar_thumb_idle: alpha(0x33ff66, 0.40),
+        scrollbar_thumb_hover: alpha(0x33ff66, 0.58),
+        scrollbar_thumb_drag: alpha(0x33ff66, 0.74),
+        scrollbar_thumb_border: alpha(0xb9ffcb, 0.22),
     }
 }
 
@@ -305,6 +366,12 @@ fn tokyo_night() -> Theme {
         shell_divider_glow: alpha(0x7aa2f7, 0.08),
         accent: solid(0x7aa2f7),
         accent_glow: alpha(0x7aa2f7, 0.14),
+        terminal_link: alpha(0x7aa2f7, 0.12),
+        terminal_link_underline: alpha(0x7aa2f7, 0.72),
+        terminal_link_hover_bg: alpha(0x7aa2f7, 0.20),
+        terminal_link_hover_underline: alpha(0x7aa2f7, 0.88),
+        terminal_link_modifier_bg: alpha(0x7aa2f7, 0.28),
+        terminal_link_modifier_underline: alpha(0xa9b1d6, 0.96),
         selection_soft: alpha(0x7aa2f7, 0.07),
         text_primary: solid(0xa9b1d6),
         text_secondary: solid(0x787c99),
@@ -316,6 +383,12 @@ fn tokyo_night() -> Theme {
         scrim: alpha(0x16161e, 0.87),
         palette_group_label: solid(0x4a5070),
         palette_group_separator: alpha(0x7aa2f7, 0.06),
+        scrollbar_track: alpha(0x7aa2f7, 0.05),
+        scrollbar_track_focus: alpha(0x7aa2f7, 0.10),
+        scrollbar_thumb_idle: alpha(0x7aa2f7, 0.42),
+        scrollbar_thumb_hover: alpha(0x7aa2f7, 0.58),
+        scrollbar_thumb_drag: alpha(0x7aa2f7, 0.74),
+        scrollbar_thumb_border: alpha(0xc8d7ff, 0.20),
     }
 }
 
@@ -344,6 +417,12 @@ fn catppuccin_mocha() -> Theme {
         shell_divider_glow: alpha(0xcba6f7, 0.08),
         accent: solid(0xcba6f7),
         accent_glow: alpha(0xcba6f7, 0.14),
+        terminal_link: alpha(0xcba6f7, 0.12),
+        terminal_link_underline: alpha(0xcba6f7, 0.72),
+        terminal_link_hover_bg: alpha(0xcba6f7, 0.20),
+        terminal_link_hover_underline: alpha(0xcba6f7, 0.88),
+        terminal_link_modifier_bg: alpha(0xcba6f7, 0.28),
+        terminal_link_modifier_underline: alpha(0xcdd6f4, 0.96),
         selection_soft: alpha(0xcba6f7, 0.07),
         text_primary: solid(0xcdd6f4),
         text_secondary: solid(0xa6adc8),
@@ -355,6 +434,12 @@ fn catppuccin_mocha() -> Theme {
         scrim: alpha(0x11111b, 0.87),
         palette_group_label: solid(0x585b70),
         palette_group_separator: alpha(0xcba6f7, 0.06),
+        scrollbar_track: alpha(0xcba6f7, 0.05),
+        scrollbar_track_focus: alpha(0xcba6f7, 0.10),
+        scrollbar_thumb_idle: alpha(0xcba6f7, 0.42),
+        scrollbar_thumb_hover: alpha(0xcba6f7, 0.58),
+        scrollbar_thumb_drag: alpha(0xcba6f7, 0.74),
+        scrollbar_thumb_border: alpha(0xf0deff, 0.22),
     }
 }
 
@@ -383,6 +468,12 @@ fn rose_pine() -> Theme {
         shell_divider_glow: alpha(0xebbcba, 0.08),
         accent: solid(0xebbcba),
         accent_glow: alpha(0xebbcba, 0.14),
+        terminal_link: alpha(0xebbcba, 0.12),
+        terminal_link_underline: alpha(0xebbcba, 0.72),
+        terminal_link_hover_bg: alpha(0xebbcba, 0.20),
+        terminal_link_hover_underline: alpha(0xebbcba, 0.88),
+        terminal_link_modifier_bg: alpha(0xebbcba, 0.28),
+        terminal_link_modifier_underline: alpha(0xe0def4, 0.96),
         selection_soft: alpha(0xebbcba, 0.07),
         text_primary: solid(0xe0def4),
         text_secondary: solid(0x908caa),
@@ -394,6 +485,12 @@ fn rose_pine() -> Theme {
         scrim: alpha(0x13111c, 0.87),
         palette_group_label: solid(0x56526e),
         palette_group_separator: alpha(0xebbcba, 0.06),
+        scrollbar_track: alpha(0xebbcba, 0.05),
+        scrollbar_track_focus: alpha(0xebbcba, 0.09),
+        scrollbar_thumb_idle: alpha(0xebbcba, 0.42),
+        scrollbar_thumb_hover: alpha(0xebbcba, 0.58),
+        scrollbar_thumb_drag: alpha(0xebbcba, 0.74),
+        scrollbar_thumb_border: alpha(0xffffff, 0.22),
     }
 }
 
@@ -422,6 +519,12 @@ fn dracula() -> Theme {
         shell_divider_glow: alpha(0xff79c6, 0.08),
         accent: solid(0xff79c6),
         accent_glow: alpha(0xff79c6, 0.14),
+        terminal_link: alpha(0xff79c6, 0.12),
+        terminal_link_underline: alpha(0xff79c6, 0.72),
+        terminal_link_hover_bg: alpha(0xff79c6, 0.20),
+        terminal_link_hover_underline: alpha(0xff79c6, 0.88),
+        terminal_link_modifier_bg: alpha(0xff79c6, 0.28),
+        terminal_link_modifier_underline: alpha(0xf8f8f2, 0.96),
         selection_soft: alpha(0xff79c6, 0.07),
         text_primary: solid(0xf8f8f2),
         text_secondary: solid(0xbfbfb4),
@@ -433,6 +536,12 @@ fn dracula() -> Theme {
         scrim: alpha(0x1e1f29, 0.87),
         palette_group_label: solid(0x525880),
         palette_group_separator: alpha(0xff79c6, 0.06),
+        scrollbar_track: alpha(0xff79c6, 0.05),
+        scrollbar_track_focus: alpha(0xff79c6, 0.10),
+        scrollbar_thumb_idle: alpha(0xff79c6, 0.42),
+        scrollbar_thumb_hover: alpha(0xff79c6, 0.58),
+        scrollbar_thumb_drag: alpha(0xff79c6, 0.74),
+        scrollbar_thumb_border: alpha(0xffffff, 0.20),
     }
 }
 
@@ -461,6 +570,12 @@ fn nord() -> Theme {
         shell_divider_glow: alpha(0x88c0d0, 0.08),
         accent: solid(0x88c0d0),
         accent_glow: alpha(0x88c0d0, 0.14),
+        terminal_link: alpha(0x88c0d0, 0.12),
+        terminal_link_underline: alpha(0x88c0d0, 0.72),
+        terminal_link_hover_bg: alpha(0x88c0d0, 0.20),
+        terminal_link_hover_underline: alpha(0x88c0d0, 0.88),
+        terminal_link_modifier_bg: alpha(0x88c0d0, 0.28),
+        terminal_link_modifier_underline: alpha(0xeceff4, 0.96),
         selection_soft: alpha(0x88c0d0, 0.07),
         text_primary: solid(0xeceff4),
         text_secondary: solid(0xd8dee9),
@@ -472,6 +587,12 @@ fn nord() -> Theme {
         scrim: alpha(0x242933, 0.87),
         palette_group_label: solid(0x5a6678),
         palette_group_separator: alpha(0x88c0d0, 0.06),
+        scrollbar_track: alpha(0x88c0d0, 0.05),
+        scrollbar_track_focus: alpha(0x88c0d0, 0.10),
+        scrollbar_thumb_idle: alpha(0x88c0d0, 0.42),
+        scrollbar_thumb_hover: alpha(0x88c0d0, 0.58),
+        scrollbar_thumb_drag: alpha(0x88c0d0, 0.74),
+        scrollbar_thumb_border: alpha(0xeceff4, 0.22),
     }
 }
 
@@ -500,6 +621,12 @@ fn solarized_dark() -> Theme {
         shell_divider_glow: alpha(0x2aa198, 0.08),
         accent: solid(0x2aa198),
         accent_glow: alpha(0x2aa198, 0.14),
+        terminal_link: alpha(0x2aa198, 0.12),
+        terminal_link_underline: alpha(0x2aa198, 0.72),
+        terminal_link_hover_bg: alpha(0x2aa198, 0.20),
+        terminal_link_hover_underline: alpha(0x2aa198, 0.88),
+        terminal_link_modifier_bg: alpha(0x2aa198, 0.28),
+        terminal_link_modifier_underline: alpha(0x839496, 0.96),
         selection_soft: alpha(0x2aa198, 0.07),
         text_primary: solid(0x839496),
         text_secondary: solid(0x657b83),
@@ -511,5 +638,11 @@ fn solarized_dark() -> Theme {
         scrim: alpha(0x00212b, 0.87),
         palette_group_label: solid(0x4a5e65),
         palette_group_separator: alpha(0x2aa198, 0.06),
+        scrollbar_track: alpha(0x2aa198, 0.05),
+        scrollbar_track_focus: alpha(0x2aa198, 0.10),
+        scrollbar_thumb_idle: alpha(0x2aa198, 0.42),
+        scrollbar_thumb_hover: alpha(0x2aa198, 0.58),
+        scrollbar_thumb_drag: alpha(0x2aa198, 0.74),
+        scrollbar_thumb_border: alpha(0x93d6d1, 0.22),
     }
 }

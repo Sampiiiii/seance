@@ -22,17 +22,17 @@ const DEFAULT_FILTER: &str =
 static PANIC_SINK: OnceLock<Arc<PanicSink>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
-pub struct DiagnosticsHandle {
+pub(crate) struct DiagnosticsHandle {
     log_path: PathBuf,
     filter: String,
 }
 
 impl DiagnosticsHandle {
-    pub fn log_path(&self) -> &Path {
+    pub(crate) fn log_path(&self) -> &Path {
         &self.log_path
     }
 
-    pub fn filter(&self) -> &str {
+    pub(crate) fn filter(&self) -> &str {
         &self.filter
     }
 }
@@ -114,7 +114,7 @@ impl Write for TeeWriter {
     }
 }
 
-pub fn install_panic_hook() {
+pub(crate) fn install_panic_hook() {
     let sink = PANIC_SINK
         .get_or_init(|| Arc::new(PanicSink::default()))
         .clone();
@@ -126,7 +126,7 @@ pub fn install_panic_hook() {
     }));
 }
 
-pub fn initialize(paths: &AppPaths) -> Result<DiagnosticsHandle> {
+pub(crate) fn initialize(paths: &AppPaths) -> Result<DiagnosticsHandle> {
     let log_dir = resolve_log_dir(paths);
     fs::create_dir_all(&log_dir).with_context(|| {
         format!(

@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::kdf::KdfParams;
 
-pub const VAULT_SCHEMA_VERSION: u32 = 1;
-pub const RECORD_SCHEMA_VERSION: u32 = 1;
+pub(crate) const VAULT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const RECORD_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,13 +76,13 @@ pub struct DeviceEnrollment {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RecordSyncState {
+pub(crate) enum RecordSyncState {
     Pending,
     Synced,
 }
 
 impl RecordSyncState {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Synced => "synced",
@@ -103,19 +103,19 @@ impl std::str::FromStr for RecordSyncState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EncryptedRecord {
-    pub record_id: String,
-    pub kind: RecordKind,
-    pub version: u32,
-    pub logical_clock: u64,
-    pub modified_at: i64,
-    pub deleted_at: Option<i64>,
-    pub key_nonce: Vec<u8>,
-    pub wrapped_record_key: Vec<u8>,
-    pub payload_nonce: Vec<u8>,
-    pub payload_ciphertext: Vec<u8>,
-    pub last_synced_clock: Option<u64>,
-    pub sync_state: RecordSyncState,
+pub(crate) struct EncryptedRecord {
+    pub(crate) record_id: String,
+    pub(crate) kind: RecordKind,
+    pub(crate) version: u32,
+    pub(crate) logical_clock: u64,
+    pub(crate) modified_at: i64,
+    pub(crate) deleted_at: Option<i64>,
+    pub(crate) key_nonce: Vec<u8>,
+    pub(crate) wrapped_record_key: Vec<u8>,
+    pub(crate) payload_nonce: Vec<u8>,
+    pub(crate) payload_ciphertext: Vec<u8>,
+    pub(crate) last_synced_clock: Option<u64>,
+    pub(crate) sync_state: RecordSyncState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

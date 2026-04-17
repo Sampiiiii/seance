@@ -88,15 +88,13 @@ impl SeanceWorkspace {
                     value
                 },
                 selected,
+                selected.then_some(&self.secure_text_input),
                 &t,
             )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    this.secure.input_target = SecureInputTarget::CredentialDraft(field);
-                    if let Some(draft) = this.secure.credential_draft.as_mut() {
-                        draft.selected_field = field;
-                    }
+                    this.focus_secure_input_target(SecureInputTarget::CredentialDraft(field));
                     cx.notify();
                 }),
             )

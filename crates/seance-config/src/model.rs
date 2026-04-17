@@ -5,6 +5,7 @@ use crate::defaults::{
     default_terminal_font_family, default_terminal_font_size_px, default_terminal_line_height_px,
     default_theme, default_true,
 };
+use crate::keybindings::KeybindingsConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultRegistryEntry {
@@ -151,18 +152,6 @@ pub struct DebugConfig {
     pub perf_hud_default: PerfHudDefault,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KeybindingOverride {
-    pub chord: String,
-    pub action: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct KeybindingsConfig {
-    #[serde(default)]
-    pub overrides: Vec<KeybindingOverride>,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct AppConfig {
     #[serde(default)]
@@ -215,8 +204,17 @@ impl AppConfig {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
         for binding in &mut normalized.keybindings.overrides {
+            binding.id = binding.id.trim().to_string();
+            binding.chord = binding
+                .chord
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+        }
+        for binding in &mut normalized.keybindings.custom {
             binding.chord = binding.chord.trim().to_string();
-            binding.action = binding.action.trim().to_string();
+            binding.command = binding.command.trim().to_string();
         }
         normalized
     }

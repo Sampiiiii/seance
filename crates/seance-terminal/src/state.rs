@@ -12,7 +12,8 @@ use anyhow::Result;
 use tracing::trace;
 
 use crate::{
-    SessionSummary, TerminalGeometry, TerminalRow, TerminalScrollCommand, TerminalViewportSnapshot,
+    SessionSummary, TerminalGeometry, TerminalKeyEvent, TerminalMouseEvent, TerminalPaste,
+    TerminalRow, TerminalScrollCommand, TerminalTextEvent, TerminalViewportSnapshot,
 };
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -66,7 +67,17 @@ pub trait TerminalSession: Send + Sync {
     fn title(&self) -> &str;
     fn summary(&self) -> SessionSummary;
     fn viewport_snapshot(&self) -> TerminalViewportSnapshot;
+    /// Sends raw bytes to the backing PTY or SSH channel.
+    ///
+    /// This is a low-level escape hatch for programmatic input. Ordinary terminal typing from the
+    /// UI should use `send_text`, and non-text terminal keys should use `send_key`.
     fn send_input(&self, bytes: Vec<u8>) -> Result<()>;
+    /// Sends printable or composed text that should be written as terminal input bytes.
+    fn send_text(&self, event: TerminalTextEvent) -> Result<()>;
+    /// Sends non-text terminal keys and modifier-driven terminal control-key combinations.
+    fn send_key(&self, event: TerminalKeyEvent) -> Result<()>;
+    fn send_mouse(&self, event: TerminalMouseEvent) -> Result<()>;
+    fn paste(&self, paste: TerminalPaste) -> Result<()>;
     fn resize(&self, geometry: TerminalGeometry) -> Result<()>;
     fn scroll_viewport(&self, command: TerminalScrollCommand) -> Result<()>;
     fn scroll_to_bottom(&self) -> Result<()>;
@@ -129,6 +140,7 @@ impl SharedSessionState {
                 rows: Arc::from(vec![initial_row]),
                 row_revisions: Arc::from(vec![1_u64]),
                 cursor: None,
+                scrollbar: None,
                 revision: 1,
                 cols: geometry.size.cols,
                 rows_visible: geometry.size.rows,
@@ -274,6 +286,7 @@ impl SharedSessionState {
             rows: Arc::from(vec![row]),
             row_revisions: Arc::from(vec![1_u64]),
             cursor: None,
+            scrollbar: None,
             revision: 1,
             cols: geometry.size.cols,
             rows_visible: geometry.size.rows,

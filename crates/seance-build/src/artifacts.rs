@@ -13,7 +13,7 @@ const SPARKLE_ITEM: &str = "sparkle-item.json";
 const CHECKSUMS: &str = "SHA256SUMS.txt";
 const SUPPORTED_LINUX_ARCHES: [&str; 2] = ["x86_64", "aarch64"];
 
-pub fn artifact_name(kind: &str, arch: Option<&str>) -> Result<String> {
+pub(crate) fn artifact_name(kind: &str, arch: Option<&str>) -> Result<String> {
     match kind {
         "macos-app-zip" => Ok(MACOS_APP_ZIP.to_owned()),
         "macos-dmg" => Ok(MACOS_DMG.to_owned()),
@@ -31,7 +31,7 @@ pub fn artifact_name(kind: &str, arch: Option<&str>) -> Result<String> {
     }
 }
 
-pub fn linux_target_triple(arch: &str) -> Result<&'static str> {
+pub(crate) fn linux_target_triple(arch: &str) -> Result<&'static str> {
     match arch {
         "x86_64" => Ok("x86_64-unknown-linux-gnu"),
         "aarch64" => Ok("aarch64-unknown-linux-gnu"),
@@ -39,13 +39,13 @@ pub fn linux_target_triple(arch: &str) -> Result<&'static str> {
     }
 }
 
-pub fn linux_update_information(repo_slug: &str, arch: &str) -> Result<String> {
+pub(crate) fn linux_update_information(repo_slug: &str, arch: &str) -> Result<String> {
     let (owner, repo) = parse_repo_slug(repo_slug)?;
     let zsync = artifact_name("linux-zsync", Some(arch))?;
     Ok(format!("gh-releases-zsync|{owner}|{repo}|latest|{zsync}"))
 }
 
-pub fn release_artifacts(include_metadata: bool) -> Vec<String> {
+pub(crate) fn release_artifacts(include_metadata: bool) -> Vec<String> {
     let mut artifacts = vec![
         artifact_name("macos-dmg", None).expect("static macOS dmg artifact name"),
         artifact_name("macos-app-zip", None).expect("static macOS app zip artifact name"),
@@ -68,11 +68,11 @@ pub fn release_artifacts(include_metadata: bool) -> Vec<String> {
     artifacts
 }
 
-pub fn validate_release_dir(release_dir: &Path, include_metadata: bool) -> Result<()> {
+pub(crate) fn validate_release_dir(release_dir: &Path, include_metadata: bool) -> Result<()> {
     crate::sparkle::validate_artifacts(release_dir, &release_artifacts(include_metadata))
 }
 
-pub fn artifact_paths(group: &str, release_dir: &Path) -> Result<Vec<String>> {
+pub(crate) fn artifact_paths(group: &str, release_dir: &Path) -> Result<Vec<String>> {
     let names = match group {
         "macos-release" => vec![
             artifact_name("macos-dmg", None)?,
@@ -88,7 +88,7 @@ pub fn artifact_paths(group: &str, release_dir: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-pub fn write_checksums(release_dir: &Path, output_path: &Path) -> Result<()> {
+pub(crate) fn write_checksums(release_dir: &Path, output_path: &Path) -> Result<()> {
     let parent = output_path
         .parent()
         .ok_or_else(|| anyhow!("output path must have a parent directory"))?;

@@ -38,6 +38,8 @@ fi
 dylib_path="$(resolve_ghostty_dylib_path release)"
 
 cp packaging/macos/Info.plist "${app_bundle}/Contents/Info.plist"
+mkdir -p "${app_bundle}/Contents/Resources"
+cp -R packaging/macos/Resources/. "${app_bundle}/Contents/Resources/"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${bundle_id}" "${app_bundle}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${version}" "${app_bundle}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${version}" "${app_bundle}/Contents/Info.plist"

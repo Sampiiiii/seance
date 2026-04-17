@@ -2,7 +2,10 @@ use std::collections::HashSet;
 
 use thiserror::Error;
 
-use crate::{AppConfig, SUPPORTED_KEYBINDING_ACTIONS, SUPPORTED_THEME_KEYS};
+use crate::{
+    AppConfig, KeybindingOverride, SUPPORTED_THEME_KEYS, is_builtin_keybinding_id,
+    is_supported_keybinding_command, validate_chord_syntax,
+};
 
 const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 8.0..=32.0;
 const LINE_HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 10.0..=40.0;
@@ -49,10 +52,24 @@ pub enum ConfigError {
         min: u64,
         max: u64,
     },
-    #[error("unsupported keybinding action '{action}'")]
-    UnsupportedKeybindingAction { action: String },
-    #[error("duplicate keybinding override for chord '{chord}' and action '{action}'")]
-    DuplicateKeybindingOverride { chord: String, action: String },
+    #[error("unknown keybinding id '{id}'")]
+    UnknownKeybindingId { id: String },
+    #[error("unknown keybinding command '{command}'")]
+    UnknownKeybindingCommand { command: String },
+    #[error("invalid keybinding chord '{chord}'")]
+    InvalidKeybindingChord { chord: String },
+    #[error("invalid keybinding override '{id}'")]
+    InvalidKeybindingOverride { id: String },
+    #[error("duplicate keybinding override id '{id}'")]
+    DuplicateKeybindingOverrideId { id: String },
+    #[error(
+        "duplicate custom keybinding for chord '{chord}', command '{command}', and context '{context}'"
+    )]
+    DuplicateCustomKeybinding {
+        chord: String,
+        command: String,
+        context: String,
+    },
     #[error("duplicate vault id '{vault_id}'")]
     DuplicateVaultId { vault_id: String },
     #[error("duplicate vault name '{name}'")]
@@ -128,29 +145,57 @@ impl AppConfig {
             });
         }
 
-        let mut seen = HashSet::new();
+        let mut seen_override_ids = HashSet::new();
         for binding in &self.keybindings.overrides {
+            let id = binding.id.trim();
+            if id.is_empty() {
+                return Err(ConfigError::EmptyField {
+                    field: "keybindings.overrides.id",
+                });
+            }
+            if !is_builtin_keybinding_id(id) {
+                return Err(ConfigError::UnknownKeybindingId { id: id.to_string() });
+            }
+            validate_override(binding)?;
+            if !seen_override_ids.insert(id.to_string()) {
+                return Err(ConfigError::DuplicateKeybindingOverrideId { id: id.to_string() });
+            }
+        }
+
+        let mut seen_custom = HashSet::new();
+        for binding in &self.keybindings.custom {
             let chord = binding.chord.trim();
-            let action = binding.action.trim();
+            let command = binding.command.trim();
             if chord.is_empty() {
                 return Err(ConfigError::EmptyField {
-                    field: "keybindings.overrides.chord",
+                    field: "keybindings.custom.chord",
                 });
             }
-            if action.is_empty() {
+            if command.is_empty() {
                 return Err(ConfigError::EmptyField {
-                    field: "keybindings.overrides.action",
+                    field: "keybindings.custom.command",
                 });
             }
-            if !SUPPORTED_KEYBINDING_ACTIONS.contains(&action) {
-                return Err(ConfigError::UnsupportedKeybindingAction {
-                    action: action.to_string(),
-                });
-            }
-            if !seen.insert((chord.to_string(), action.to_string())) {
-                return Err(ConfigError::DuplicateKeybindingOverride {
+            if !validate_chord_syntax(chord) {
+                return Err(ConfigError::InvalidKeybindingChord {
                     chord: chord.to_string(),
-                    action: action.to_string(),
+                });
+            }
+            if !is_supported_keybinding_command(command) {
+                return Err(ConfigError::UnknownKeybindingCommand {
+                    command: command.to_string(),
+                });
+            }
+            let key = (
+                chord.to_string(),
+                command.to_string(),
+                format!("{:?}", binding.context),
+            );
+            if !seen_custom.insert(key.clone()) {
+                return Err(ConfigError::DuplicateCustomKeybinding {
+                    chord: key.0,
+                    command: key.1,
+                    context: key.2,
                 });
             }
         }
@@ -214,11 +259,33 @@ impl AppConfig {
     }
 }
 
+fn validate_override(binding: &KeybindingOverride) -> Result<(), ConfigError> {
+    match (binding.disabled, binding.chord.as_deref()) {
+        (true, Some(_)) => Err(ConfigError::InvalidKeybindingOverride {
+            id: binding.id.clone(),
+        }),
+        (true, None) => Ok(()),
+        (false, None) => Err(ConfigError::InvalidKeybindingOverride {
+            id: binding.id.clone(),
+        }),
+        (false, Some(chord)) => {
+            if !validate_chord_syntax(chord) {
+                Err(ConfigError::InvalidKeybindingChord {
+                    chord: chord.to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
-        AppConfig, ConfigError, KeybindingOverride, SUPPORTED_KEYBINDING_ACTIONS,
-        UpdateInstallMode, UpdateReleaseChannel, VaultRegistryEntry,
+        AppConfig, COMMAND_APP_OPEN_COMMAND_PALETTE, COMMAND_APP_OPEN_PREFERENCES, ConfigError,
+        CustomKeybinding, KeybindingContext, KeybindingOverride, UpdateInstallMode,
+        UpdateReleaseChannel, VaultRegistryEntry,
     };
 
     #[test]
@@ -295,33 +362,65 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_and_invalid_keybinding_overrides_are_rejected() {
+    fn invalid_keybinding_overrides_and_custom_entries_are_rejected() {
         let mut config = AppConfig::default();
-        let action = SUPPORTED_KEYBINDING_ACTIONS[0].to_string();
         config.keybindings.overrides = vec![
             KeybindingOverride {
-                chord: "cmd-k".into(),
-                action: action.clone(),
+                id: COMMAND_APP_OPEN_PREFERENCES.into(),
+                chord: Some("primary-,".into()),
+                disabled: false,
             },
             KeybindingOverride {
-                chord: "cmd-k".into(),
-                action,
+                id: COMMAND_APP_OPEN_PREFERENCES.into(),
+                chord: Some("cmd-,".into()),
+                disabled: false,
             },
         ];
         let duplicate_err = config.validate().unwrap_err();
         assert!(matches!(
             duplicate_err,
-            ConfigError::DuplicateKeybindingOverride { .. }
+            ConfigError::DuplicateKeybindingOverrideId { .. }
         ));
 
         config.keybindings.overrides = vec![KeybindingOverride {
-            chord: "cmd-k".into(),
-            action: "seance_ui_app::Unsupported".into(),
+            id: "unknown.binding".into(),
+            chord: Some("cmd-k".into()),
+            disabled: false,
         }];
         let invalid_err = config.validate().unwrap_err();
         assert!(matches!(
             invalid_err,
-            ConfigError::UnsupportedKeybindingAction { .. }
+            ConfigError::UnknownKeybindingId { .. }
+        ));
+
+        config.keybindings.overrides = vec![KeybindingOverride {
+            id: COMMAND_APP_OPEN_COMMAND_PALETTE.into(),
+            chord: None,
+            disabled: false,
+        }];
+        let state_err = config.validate().unwrap_err();
+        assert!(matches!(
+            state_err,
+            ConfigError::InvalidKeybindingOverride { .. }
+        ));
+
+        config.keybindings.overrides.clear();
+        config.keybindings.custom = vec![
+            CustomKeybinding {
+                chord: "primary-k".into(),
+                command: COMMAND_APP_OPEN_COMMAND_PALETTE.into(),
+                context: KeybindingContext::AppGlobal,
+            },
+            CustomKeybinding {
+                chord: "primary-k".into(),
+                command: COMMAND_APP_OPEN_COMMAND_PALETTE.into(),
+                context: KeybindingContext::AppGlobal,
+            },
+        ];
+        let custom_duplicate_err = config.validate().unwrap_err();
+        assert!(matches!(
+            custom_duplicate_err,
+            ConfigError::DuplicateCustomKeybinding { .. }
         ));
     }
 

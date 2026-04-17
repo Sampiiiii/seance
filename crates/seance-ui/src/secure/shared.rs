@@ -15,7 +15,13 @@ impl SeanceWorkspace {
         selected: bool,
     ) -> Div {
         let t = self.theme();
-        editor_field_card(label, value.to_string(), selected, &t)
+        editor_field_card(
+            label,
+            value.to_string(),
+            selected,
+            selected.then_some(&self.secure_text_input),
+            &t,
+        )
     }
 
     pub(crate) fn render_list_row(&self, title: &str, subtitle: &str, selected: bool) -> Div {

@@ -12,23 +12,6 @@ pub const SUPPORTED_THEME_KEYS: &[&str] = &[
     "solarized-dark",
 ];
 
-pub const SUPPORTED_KEYBINDING_ACTIONS: &[&str] = &[
-    "seance_ui_app::NewTerminal",
-    "seance_ui_app::CheckForUpdates",
-    "seance_ui_app::OpenCommandPalette",
-    "seance_ui_app::OpenPreferences",
-    "seance_ui_app::CloseActiveSession",
-    "seance_ui_app::OpenNewWindow",
-    "seance_ui_app::TogglePerfHud",
-    "seance_ui_app::QuitSeance",
-    "seance_ui_app::HideSeance",
-    "seance_ui_app::HideOtherApps",
-    "seance_ui_app::ShowAllApps",
-    "seance_ui::SwitchTheme",
-    "seance_ui::ConnectHost",
-    "seance_ui::SelectSession",
-];
-
 pub(crate) fn default_true() -> bool {
     true
 }

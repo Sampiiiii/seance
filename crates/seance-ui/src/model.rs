@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, ops::Range, sync::Arc, time::Instant};
 
 use gpui::{FocusHandle, ScrollHandle};
 use seance_config::AppConfig;
@@ -12,6 +12,8 @@ use seance_terminal::{TerminalGeometry, TerminalSession};
 pub(crate) const DEFAULT_SIDEBAR_WIDTH: f32 = 260.0;
 pub(crate) const MIN_SIDEBAR_WIDTH: f32 = 180.0;
 pub(crate) const MAX_SIDEBAR_WIDTH: f32 = 450.0;
+pub(crate) const SIDEBAR_DRAG_TARGET_PX: f32 = 6.0;
+pub(crate) const SIDEBAR_DIVIDER_VISUAL_PX: f32 = 1.0;
 
 use crate::{
     backend::UiBackend,
@@ -23,6 +25,7 @@ use crate::{
     perf::{PerfOverlayState, UiPerfMode},
     sftp::SftpBrowserState,
     surface::TerminalSurfaceState,
+    terminal_scrollbar::TerminalScrollbarDragState,
     theme::ThemeId,
 };
 
@@ -51,16 +54,28 @@ pub(crate) struct SeanceWorkspace {
     pub(crate) palette_query: String,
     pub(crate) palette_selected: usize,
     pub(crate) palette_scroll_handle: ScrollHandle,
+    pub(crate) palette_text_input: crate::TextEditState,
+    pub(crate) secure_text_input: crate::TextEditState,
+    pub(crate) secure_text_target: Option<crate::forms::SecureInputTarget>,
+    pub(crate) vault_modal_text_input: crate::TextEditState,
+    pub(crate) vault_modal_text_field: Option<usize>,
     pub(crate) terminal_metrics: Option<TerminalMetrics>,
     pub(crate) last_applied_geometry: Option<TerminalGeometry>,
     pub(crate) terminal_resize_epoch: u64,
     pub(crate) active_terminal_rows: usize,
     pub(crate) terminal_surface: TerminalSurfaceState,
+    pub(crate) terminal_ime: TerminalImeState,
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) perf_mode_env_override: Option<UiPerfMode>,
     pub(crate) perf_overlay: PerfOverlayState,
     pub(crate) sidebar_width: f32,
     pub(crate) sidebar_resizing: bool,
+    pub(crate) terminal_selection: Option<TerminalSelection>,
+    pub(crate) terminal_drag_anchor: Option<TerminalSelectionPoint>,
+    pub(crate) terminal_hovered_link: Option<TerminalHoveredLink>,
+    pub(crate) terminal_scroll_remainder_rows: f32,
+    pub(crate) terminal_scrollbar_hovered: bool,
+    pub(crate) terminal_scrollbar_drag: Option<TerminalScrollbarDragState>,
     pub(crate) toast: Option<ToastState>,
 }
 
@@ -70,12 +85,39 @@ pub(crate) struct ToastState {
     pub(crate) shown_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalSelectionPoint {
+    pub(crate) row: usize,
+    pub(crate) col: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalSelection {
+    pub(crate) anchor: TerminalSelectionPoint,
+    pub(crate) focus: TerminalSelectionPoint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalHoveredLink {
+    pub(crate) row: usize,
+    pub(crate) row_revision: u64,
+    pub(crate) col_range: Range<usize>,
+    pub(crate) url: String,
+    pub(crate) modifier_active: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TerminalMetrics {
     pub(crate) cell_width_px: f32,
     pub(crate) cell_height_px: f32,
     pub(crate) line_height_px: f32,
     pub(crate) font_size_px: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TerminalImeState {
+    pub(crate) marked_text: String,
+    pub(crate) marked_selected_range_utf16: Option<Range<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -89,6 +131,14 @@ pub(crate) struct TerminalRendererMetrics {
     pub(crate) wide_cells: usize,
     pub(crate) shape_hits: usize,
     pub(crate) shape_misses: usize,
+    pub(crate) width_mismatch_fragments: usize,
+    pub(crate) cell_aligned_fallback_fragments: usize,
+    pub(crate) max_width_error_milli_px: u32,
+    pub(crate) total_width_error_milli_px: u64,
+}
+
+pub(crate) fn sidebar_occupied_width_px(sidebar_width: f32) -> f32 {
+    sidebar_width + SIDEBAR_DRAG_TARGET_PX
 }
 
 pub(crate) fn local_session_display_number_for_ids(

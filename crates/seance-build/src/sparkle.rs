@@ -9,14 +9,14 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct SparkleItem {
+pub(crate) struct SparkleItem {
     pub version: String,
     pub signature: String,
     pub length: u64,
     pub pub_date: String,
 }
 
-pub fn write_sparkle_item(
+pub(crate) fn write_sparkle_item(
     version: &str,
     artifact_path: &Path,
     output_path: &Path,
@@ -42,14 +42,14 @@ pub fn write_sparkle_item(
     write_json(output_path, &payload)
 }
 
-pub fn read_sparkle_item(path: &Path) -> Result<SparkleItem> {
+pub(crate) fn read_sparkle_item(path: &Path) -> Result<SparkleItem> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read sparkle metadata at {}", path.display()))?;
     serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse sparkle metadata at {}", path.display()))
 }
 
-pub fn write_appcast(
+pub(crate) fn write_appcast(
     item_path: &Path,
     download_url: &str,
     release_notes_url: Option<&str>,
@@ -84,7 +84,7 @@ pub fn write_appcast(
     write_string(output_path, &xml)
 }
 
-pub fn validate_artifacts(release_dir: &Path, artifact_names: &[String]) -> Result<()> {
+pub(crate) fn validate_artifacts(release_dir: &Path, artifact_names: &[String]) -> Result<()> {
     let missing: Vec<PathBuf> = artifact_names
         .iter()
         .map(|artifact| release_dir.join(artifact))

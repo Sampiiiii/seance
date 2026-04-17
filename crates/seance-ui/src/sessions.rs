@@ -20,6 +20,7 @@ use crate::{
 
 impl SeanceWorkspace {
     fn refresh_active_terminal_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_scroll_remainder_rows = 0.0;
         self.take_terminal_refresh_request();
         self.invalidate_terminal_surface();
         cx.notify();
@@ -291,6 +292,7 @@ impl SeanceWorkspace {
                 );
                 if removed.was_foreground {
                     self.active_session_id = session.id();
+                    self.clear_terminal_ime();
                     self.surface = WorkspaceSurface::Terminal;
                     self.show_toast(format!("Connected: {}", removed.pending.host_label));
                     self.refresh_active_terminal_view(window, cx);
@@ -345,6 +347,7 @@ impl SeanceWorkspace {
                 let _ = session.resize(geometry);
             }
             self.active_session_id = session.id();
+            self.clear_terminal_ime();
             if let Some(notify_rx) = session.take_notify_rx() {
                 Self::schedule_session_watcher(window, cx, cx.entity(), notify_rx);
             }
@@ -357,6 +360,7 @@ impl SeanceWorkspace {
 
     pub(crate) fn select_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.active_session_id = id;
+        self.clear_terminal_ime();
         self.backend.touch_session(id);
         if let Some(geometry) = self.last_applied_geometry
             && let Some(session) = self.active_session()
@@ -366,6 +370,58 @@ impl SeanceWorkspace {
         }
         self.perf_overlay.mark_input(RedrawReason::Input);
         self.refresh_active_terminal_view(window, cx);
+    }
+
+    pub(crate) fn select_previous_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface != WorkspaceSurface::Terminal {
+            return;
+        }
+        let sessions = self.sessions();
+        if sessions.is_empty() {
+            return;
+        }
+        let current_index = sessions
+            .iter()
+            .position(|session| session.id() == self.active_session_id)
+            .unwrap_or(0);
+        let previous_index = if current_index == 0 {
+            sessions.len() - 1
+        } else {
+            current_index - 1
+        };
+        self.select_session(sessions[previous_index].id(), window, cx);
+    }
+
+    pub(crate) fn select_next_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface != WorkspaceSurface::Terminal {
+            return;
+        }
+        let sessions = self.sessions();
+        if sessions.is_empty() {
+            return;
+        }
+        let current_index = sessions
+            .iter()
+            .position(|session| session.id() == self.active_session_id)
+            .unwrap_or(0);
+        let next_index = (current_index + 1) % sessions.len();
+        self.select_session(sessions[next_index].id(), window, cx);
+    }
+
+    pub(crate) fn select_session_slot(
+        &mut self,
+        slot: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.surface != WorkspaceSurface::Terminal || slot == 0 {
+            return;
+        }
+        let sessions = self.sessions();
+        let slot_index = usize::from(slot.saturating_sub(1));
+        if let Some(session) = sessions.get(slot_index) {
+            self.select_session(session.id(), window, cx);
+        }
     }
 
     pub(crate) fn close_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -380,6 +436,7 @@ impl SeanceWorkspace {
         if self.active_session_id == id {
             self.active_session_id = self.backend.recent_session_id().unwrap_or(0);
         }
+        self.clear_terminal_ime();
         if self.active_session_id == 0 {
             self.last_applied_geometry = None;
             self.active_terminal_rows = TerminalGeometry::default().size.rows as usize;
