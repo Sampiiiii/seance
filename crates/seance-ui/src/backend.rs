@@ -3,14 +3,15 @@ use std::sync::{Arc, mpsc::Receiver};
 use anyhow::Result;
 use seance_config::{AppConfig, PerfHudDefault, TerminalConfig, WindowConfig};
 use seance_core::{
-    AppControllerHandle, ManagedVaultSummary, SessionId, SessionKind, SessionMetadataSummary,
-    SessionOrigin, UpdateState, VaultScopedCredentialSummary, VaultScopedHostSummary,
-    VaultScopedKeySummary, VaultScopedPortForwardSummary, VaultUiSnapshot,
+    AppControllerHandle, DiscoveredPrivateKeyCandidate, HostReferenceSummary,
+    ImportPrivateKeyFromPathRequest, ManagedVaultSummary, SessionId, SessionKind,
+    SessionMetadataSummary, SessionOrigin, UpdateState, VaultScopedCredentialSummary,
+    VaultScopedHostSummary, VaultScopedKeySummary, VaultScopedPortForwardSummary, VaultUiSnapshot,
 };
 use seance_ssh::{PortForwardRuntimeSnapshot, SftpEntry, SshConnectRequest, SshPortForwardRequest};
 use seance_terminal::TerminalSession;
 use seance_vault::{
-    GenerateKeyAlgorithm, GenerateKeyRequest, SecretString, VaultHostProfile,
+    GenerateKeyAlgorithm, GenerateKeyRequest, ImportKeyRequest, SecretString, VaultHostProfile,
     VaultPasswordCredential, VaultPortForwardProfile, VaultStatus,
 };
 
@@ -279,6 +280,51 @@ impl UiBackend {
         request: GenerateKeyRequest,
     ) -> Result<VaultScopedKeySummary> {
         self.controller.generate_private_key(vault_id, request)
+    }
+
+    pub(crate) fn import_private_key(
+        &self,
+        vault_id: &str,
+        request: ImportKeyRequest,
+    ) -> Result<VaultScopedKeySummary> {
+        self.controller.import_private_key(vault_id, request)
+    }
+
+    pub(crate) fn discover_private_key_candidates(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<DiscoveredPrivateKeyCandidate>> {
+        self.controller.discover_private_key_candidates(vault_id)
+    }
+
+    pub(crate) fn import_private_keys_from_paths(
+        &self,
+        vault_id: &str,
+        requests: Vec<ImportPrivateKeyFromPathRequest>,
+    ) -> Result<Vec<VaultScopedKeySummary>> {
+        self.controller
+            .import_private_keys_from_paths(vault_id, requests)
+    }
+
+    pub(crate) fn host_references_for_key(
+        &self,
+        vault_id: &str,
+        key_id: &str,
+    ) -> Result<Vec<HostReferenceSummary>> {
+        self.controller.host_references_for_key(vault_id, key_id)
+    }
+
+    pub(crate) fn host_references_for_credential(
+        &self,
+        vault_id: &str,
+        credential_id: &str,
+    ) -> Result<Vec<HostReferenceSummary>> {
+        self.controller
+            .host_references_for_credential(vault_id, credential_id)
+    }
+
+    pub(crate) fn load_public_key(&self, vault_id: &str, key_id: &str) -> Result<Option<String>> {
+        self.controller.load_public_key(vault_id, key_id)
     }
 
     pub(crate) fn generate_ed25519_key(

@@ -5,8 +5,8 @@ use std::time::Instant;
 use gpui::{Context, Window};
 
 use crate::{
-    SeanceWorkspace,
-    perf::{RedrawReason, UiPerfMode},
+    RepaintReasonSet, SeanceWorkspace,
+    perf::UiPerfMode,
 };
 
 impl SeanceWorkspace {
@@ -22,10 +22,7 @@ impl SeanceWorkspace {
             if next_mode.is_enabled() {
                 self.ensure_display_probe(window, cx);
             }
-            self.perf_overlay
-                .mark_ui_refresh_request(Instant::now(), RedrawReason::UiRefresh);
-            window.refresh();
-            cx.notify();
+            self.request_repaint(RepaintReasonSet::UI_STATE, window, cx);
             return;
         }
 
@@ -44,10 +41,7 @@ impl SeanceWorkspace {
             self.ensure_display_probe(window, cx);
         }
 
-        self.perf_overlay
-            .mark_ui_refresh_request(Instant::now(), RedrawReason::UiRefresh);
-        window.refresh();
-        cx.notify();
+        self.request_repaint(RepaintReasonSet::UI_STATE, window, cx);
     }
 
     pub(crate) fn ensure_display_probe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -81,6 +75,10 @@ impl SeanceWorkspace {
         }
 
         self.perf_overlay.record_display_probe(Instant::now());
+        let display_hz = self.perf_overlay.frame_stats.display_hz_1s;
+        if display_hz > 0.0 {
+            self.apply_display_hz_hint(display_hz);
+        }
         if self.perf_overlay.mode.is_enabled() {
             self.ensure_display_probe(window, cx);
         }

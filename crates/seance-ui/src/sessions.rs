@@ -20,11 +20,16 @@ use crate::{
 
 impl SeanceWorkspace {
     fn refresh_active_terminal_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.terminal_scroll_remainder_rows = 0.0;
+        self.terminal_scroll.accumulated_row_delta = 0.0;
+        self.terminal_scroll.pending_scroll_command = None;
+        self.terminal_scroll.flush_scheduled = false;
+        self.terminal_scroll.pending_flush_epoch =
+            self.terminal_scroll.pending_flush_epoch.wrapping_add(1);
+        self.terminal_scroll.last_scroll_dispatch_at = None;
+        self.terminal_scroll.idle_epoch = self.terminal_scroll.idle_epoch.wrapping_add(1);
         self.take_terminal_refresh_request();
         self.invalidate_terminal_surface();
-        cx.notify();
-        window.refresh();
+        self.request_repaint(crate::RepaintReasonSet::TERMINAL_UPDATE, window, cx);
     }
 
     fn session_kind(&self, id: u64) -> Option<SessionKind> {
@@ -104,10 +109,14 @@ impl SeanceWorkspace {
                     }
                     while notify_rx.lock().unwrap().try_recv().is_ok() {}
                     let _ = cx.update(|window, cx| {
-                        entity.update(cx, |this, _| {
+                        entity.update(cx, |this, cx| {
                             this.take_terminal_refresh_request();
+                            this.request_repaint(
+                                crate::RepaintReasonSet::TERMINAL_UPDATE,
+                                window,
+                                cx,
+                            );
                         });
-                        window.refresh();
                     });
                 }
             })

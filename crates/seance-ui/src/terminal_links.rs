@@ -1,10 +1,17 @@
 // Owns terminal link hit-testing and URL normalization for modifier-click browser opening.
 
-use std::ops::Range;
+use std::{ops::Range, sync::LazyLock};
 
 use linkify::{LinkFinder, LinkKind};
 use seance_terminal::TerminalRow;
 use url::Url;
+
+static TERMINAL_LINK_FINDER: LazyLock<LinkFinder> = LazyLock::new(|| {
+    let mut finder = LinkFinder::new();
+    finder.url_must_have_scheme(false);
+    finder.kinds(&[LinkKind::Url]);
+    finder
+});
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalDetectedLink {
@@ -39,12 +46,8 @@ pub(crate) fn terminal_links_for_row(
         return Vec::new();
     }
 
-    let mut finder = LinkFinder::new();
-    finder.url_must_have_scheme(false);
-    finder.kinds(&[LinkKind::Url]);
-
     let mut links = Vec::new();
-    for candidate in finder.links(&line) {
+    for candidate in TERMINAL_LINK_FINDER.links(&line) {
         let Some(adjusted) = trimmed_link_range(&line, candidate.start(), candidate.end()) else {
             continue;
         };

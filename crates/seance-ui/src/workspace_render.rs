@@ -4,6 +4,9 @@ use gpui::{
     Context, Div, ElementInputHandler, FontWeight, MouseButton, Window, canvas, div, prelude::*, px,
 };
 use seance_core::UpdateState;
+use seance_observability::{
+    RENDER_TRACE_TARGET, RenderDomain, RenderPath, RenderPhase, RenderTraceScope,
+};
 use std::time::Instant;
 use tracing::trace;
 
@@ -353,6 +356,13 @@ impl SeanceWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
+        let pane_trace = RenderTraceScope::new(
+            RenderDomain::Ui,
+            RenderPath::TerminalPane,
+            self.perf_overlay.pending_render_cause(),
+        );
+        let _compose_phase = pane_trace.phase(RenderPhase::Compose);
+
         div()
             .flex_1()
             .h_full()
@@ -425,8 +435,8 @@ impl SeanceWorkspace {
                 }),
             )
             .on_scroll_wheel(
-                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                    this.handle_terminal_scroll_wheel(event, cx);
+                cx.listener(|this, event: &gpui::ScrollWheelEvent, window, cx| {
+                    this.handle_terminal_scroll_wheel(event, window, cx);
                 }),
             )
             .on_key_down(cx.listener(Self::handle_key_down));
@@ -644,13 +654,22 @@ impl SeanceWorkspace {
         }
 
         trace!(
+            target: RENDER_TRACE_TARGET,
+            render_domain = RenderDomain::Ui.as_str(),
+            render_path = RenderPath::TerminalPane.as_str(),
+            render_cause = self.perf_overlay.pending_render_cause().as_str(),
+            render_phase = RenderPhase::Summary.as_str(),
             visible_line_count = self.perf_overlay.visible_line_count,
             visible_cell_count = self.terminal_surface.metrics.visible_cells,
             rebuilt_rows = self.terminal_surface.metrics.rebuilt_rows,
             fragments = self.terminal_surface.metrics.fragments,
             background_quads = self.terminal_surface.metrics.background_quads,
+            row_cache_hits = self.terminal_surface.metrics.row_cache_hits,
+            row_cache_misses = self.terminal_surface.metrics.row_cache_misses,
+            link_rows_deferred = self.terminal_surface.metrics.link_rows_deferred,
             special_glyph_cells = self.terminal_surface.metrics.special_glyph_cells,
             wide_cells = self.terminal_surface.metrics.wide_cells,
+            scroll_batches_dispatched = self.terminal_surface.metrics.scroll_batches_dispatched,
             palette_open = self.palette_open,
             "rendered terminal pane"
         );
@@ -1106,7 +1125,8 @@ impl SeanceWorkspace {
         )
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
+            cx.listener(|this, _, window, cx| {
+                window.focus(&this.focus_handle);
                 this.focus_vault_modal_field(0);
                 cx.notify();
             }),
@@ -1126,7 +1146,8 @@ impl SeanceWorkspace {
         )
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
+            cx.listener(move |this, _, window, cx| {
+                window.focus(&this.focus_handle);
                 this.focus_vault_modal_field(if create_mode { 1 } else { 0 });
                 cx.notify();
             }),
@@ -1143,6 +1164,12 @@ impl SeanceWorkspace {
             .flex()
             .flex_col()
             .gap_3()
+            .on_mouse_down(MouseButton::Left, {
+                let focus_handle = self.focus_handle.clone();
+                move |_: &gpui::MouseDownEvent, window: &mut Window, _cx: &mut gpui::App| {
+                    window.focus(&focus_handle);
+                }
+            })
             .child(
                 div()
                     .flex()
@@ -1191,7 +1218,8 @@ impl SeanceWorkspace {
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
+                                cx.listener(|this, _, window, cx| {
+                                    window.focus(&this.focus_handle);
                                     this.vault_modal.unlock_method =
                                         seance_vault::UnlockMethod::Passphrase;
                                     this.focus_vault_modal_field(0);
@@ -1225,7 +1253,8 @@ impl SeanceWorkspace {
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
+                                cx.listener(move |this, _, window, cx| {
+                                    window.focus(&this.focus_handle);
                                     if device_available {
                                         this.vault_modal.unlock_method =
                                             seance_vault::UnlockMethod::Device;
@@ -1262,7 +1291,8 @@ impl SeanceWorkspace {
                 )
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
+                    cx.listener(|this, _, window, cx| {
+                        window.focus(&this.focus_handle);
                         this.focus_vault_modal_field(2);
                         cx.notify();
                     }),
@@ -1321,7 +1351,8 @@ impl SeanceWorkspace {
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
+                                    cx.listener(|this, _, window, cx| {
+                                        window.focus(&this.focus_handle);
                                         this.vault_modal.reveal_secret =
                                             !this.vault_modal.reveal_secret;
                                         cx.notify();
@@ -1332,7 +1363,8 @@ impl SeanceWorkspace {
                         .when(self.vault_modal.can_close(), |row| {
                             row.child(settings_action_chip("cancel", &t).on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
+                                cx.listener(|this, _, window, cx| {
+                                    window.focus(&this.focus_handle);
                                     this.vault_modal.close();
                                     cx.notify();
                                 }),
@@ -1353,7 +1385,8 @@ impl SeanceWorkspace {
                                 .cursor_pointer()
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
+                                    cx.listener(|this, _, window, cx| {
+                                        window.focus(&this.focus_handle);
                                         this.submit_vault_modal(cx);
                                     }),
                                 )
@@ -1376,6 +1409,13 @@ impl SeanceWorkspace {
             .bg(t.scrim)
             .track_focus(&self.focus_handle)
             .key_context("VaultModal")
+            .on_mouse_down(MouseButton::Left, {
+                let focus_handle = self.focus_handle.clone();
+                move |_: &gpui::MouseDownEvent, window: &mut Window, _cx: &mut gpui::App| {
+                    window.focus(&focus_handle);
+                }
+            })
+            .on_key_down(cx.listener(Self::handle_key_down))
             .flex()
             .items_center()
             .justify_center()
@@ -1390,7 +1430,7 @@ impl SeanceWorkspace {
         let mode_label = perf_mode_label(self.perf_overlay.mode);
         let compact_rows = compact_perf_strings(&self.perf_overlay);
         let expanded_rows =
-            expanded_perf_strings(&self.perf_overlay, self.terminal_surface.metrics);
+            expanded_perf_strings(&self.perf_overlay, self.terminal_surface.metrics, &self.frame_pacer);
 
         let mut panel = div()
             .absolute()

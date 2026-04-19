@@ -1,13 +1,13 @@
 use std::{collections::HashMap, ops::Range, sync::Arc, time::Instant};
 
-use gpui::{FocusHandle, ScrollHandle};
+use gpui::{FocusHandle, ScrollHandle, UniformListScrollHandle};
 use seance_config::AppConfig;
 use seance_core::{
     ManagedVaultSummary, SessionKind, UpdateState, VaultScopedCredentialSummary,
     VaultScopedHostSummary, VaultScopedKeySummary, VaultScopedPortForwardSummary,
 };
 use seance_ssh::PortForwardRuntimeSnapshot;
-use seance_terminal::{TerminalGeometry, TerminalSession};
+use seance_terminal::{TerminalGeometry, TerminalScrollCommand, TerminalSession};
 
 pub(crate) const DEFAULT_SIDEBAR_WIDTH: f32 = 260.0;
 pub(crate) const MIN_SIDEBAR_WIDTH: f32 = 180.0;
@@ -22,6 +22,7 @@ use crate::{
         ConfirmDialogState, SecureWorkspaceState, SettingsPanelState, VaultModalState,
         WorkspaceSurface,
     },
+    frame_pacer::FramePacer,
     perf::{PerfOverlayState, UiPerfMode},
     sftp::SftpBrowserState,
     surface::TerminalSurfaceState,
@@ -54,6 +55,16 @@ pub(crate) struct SeanceWorkspace {
     pub(crate) palette_query: String,
     pub(crate) palette_selected: usize,
     pub(crate) palette_scroll_handle: ScrollHandle,
+    pub(crate) secure_host_list_scroll_handle: UniformListScrollHandle,
+    pub(crate) secure_credential_list_scroll_handle: UniformListScrollHandle,
+    pub(crate) secure_key_list_scroll_handle: UniformListScrollHandle,
+    pub(crate) secure_auth_available_scroll_handle: UniformListScrollHandle,
+    pub(crate) secure_filtered_host_indices: Vec<usize>,
+    pub(crate) secure_filtered_credential_indices: Vec<usize>,
+    pub(crate) secure_filtered_key_indices: Vec<usize>,
+    pub(crate) secure_host_search_blobs: Vec<String>,
+    pub(crate) secure_credential_search_blobs: Vec<String>,
+    pub(crate) secure_key_search_blobs: Vec<String>,
     pub(crate) palette_text_input: crate::TextEditState,
     pub(crate) secure_text_input: crate::TextEditState,
     pub(crate) secure_text_target: Option<crate::forms::SecureInputTarget>,
@@ -73,10 +84,36 @@ pub(crate) struct SeanceWorkspace {
     pub(crate) terminal_selection: Option<TerminalSelection>,
     pub(crate) terminal_drag_anchor: Option<TerminalSelectionPoint>,
     pub(crate) terminal_hovered_link: Option<TerminalHoveredLink>,
-    pub(crate) terminal_scroll_remainder_rows: f32,
+    pub(crate) terminal_scroll: ScrollFrameAccumulator,
     pub(crate) terminal_scrollbar_hovered: bool,
     pub(crate) terminal_scrollbar_drag: Option<TerminalScrollbarDragState>,
+    pub(crate) frame_pacer: FramePacer,
     pub(crate) toast: Option<ToastState>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScrollFrameAccumulator {
+    pub(crate) accumulated_row_delta: f32,
+    pub(crate) pending_scroll_command: Option<TerminalScrollCommand>,
+    pub(crate) pending_flush_epoch: u64,
+    pub(crate) flush_scheduled: bool,
+    pub(crate) last_scroll_dispatch_at: Option<Instant>,
+    pub(crate) idle_epoch: u64,
+    pub(crate) scroll_batches_dispatched: usize,
+}
+
+impl Default for ScrollFrameAccumulator {
+    fn default() -> Self {
+        Self {
+            accumulated_row_delta: 0.0,
+            pending_scroll_command: None,
+            pending_flush_epoch: 0,
+            flush_scheduled: false,
+            last_scroll_dispatch_at: None,
+            idle_epoch: 0,
+            scroll_batches_dispatched: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +168,10 @@ pub(crate) struct TerminalRendererMetrics {
     pub(crate) wide_cells: usize,
     pub(crate) shape_hits: usize,
     pub(crate) shape_misses: usize,
+    pub(crate) row_cache_hits: usize,
+    pub(crate) row_cache_misses: usize,
+    pub(crate) link_rows_deferred: usize,
+    pub(crate) scroll_batches_dispatched: usize,
     pub(crate) width_mismatch_fragments: usize,
     pub(crate) cell_aligned_fallback_fragments: usize,
     pub(crate) max_width_error_milli_px: u32,

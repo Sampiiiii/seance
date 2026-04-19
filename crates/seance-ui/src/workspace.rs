@@ -1,10 +1,13 @@
 // Owns non-render workspace coordination, input handling, config/update snapshots, and terminal state.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use gpui::{
     App, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ScrollDelta, ScrollWheelEvent, Window, point, px,
+    MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, Window, point, px,
 };
 use seance_config::AppConfig;
 use seance_core::{UpdateState, VaultUiSnapshot};
@@ -15,12 +18,11 @@ use seance_terminal::{
 use seance_vault::{SecretString, UnlockMethod};
 
 use crate::{
-    TERMINAL_SCROLLBAR_GUTTER_WIDTH_PX, TerminalScrollbarDragState, TerminalScrollbarHit,
-    TerminalScrollbarLayout,
+    TERMINAL_SCROLLBAR_GUTTER_WIDTH_PX, TerminalScrollbarDragState, TerminalScrollbarLayout,
     app::{InitialWorkspaceAction, refresh_app_menus},
     forms::{
-        CredentialDraftField, HostDraftField, SecureInputTarget, SecureSection, SettingsSection,
-        TunnelDraftField, UnlockMode, VaultModalOrigin, WorkspaceSurface,
+        CredentialDraftField, HostDraftField, KeyImportTab, SecureInputTarget, SecureSection,
+        SettingsSection, TunnelDraftField, UnlockMode, VaultModalOrigin, WorkspaceSurface,
     },
     model::{
         SeanceWorkspace, TerminalHoveredLink, TerminalSelectionPoint, sidebar_occupied_width_px,
@@ -51,6 +53,78 @@ pub(crate) fn split_scope_key(scope_key: &str) -> Option<(&str, &str)> {
 }
 
 impl SeanceWorkspace {
+    pub(crate) fn rebuild_secure_search_cache(&mut self) {
+        self.secure_host_search_blobs = self
+            .saved_hosts
+            .iter()
+            .map(|host| {
+                format!(
+                    "{} {} {} {}",
+                    host.host.label, host.host.hostname, host.host.username, host.vault_name
+                )
+                .to_lowercase()
+            })
+            .collect();
+        self.secure_credential_search_blobs = self
+            .cached_credentials
+            .iter()
+            .map(|credential| {
+                format!(
+                    "{} {} {}",
+                    credential.credential.label,
+                    credential
+                        .credential
+                        .username_hint
+                        .as_deref()
+                        .unwrap_or_default(),
+                    credential.vault_name
+                )
+                .to_lowercase()
+            })
+            .collect();
+        self.secure_key_search_blobs = self
+            .cached_keys
+            .iter()
+            .map(|key| format!("{} {}", key.key.label, key.vault_name).to_lowercase())
+            .collect();
+        self.recompute_secure_filtered_indices();
+    }
+
+    pub(crate) fn recompute_secure_filtered_indices(&mut self) {
+        let host_query = self.secure.host_search.trim().to_lowercase();
+        self.secure_filtered_host_indices = if host_query.is_empty() {
+            (0..self.saved_hosts.len()).collect()
+        } else {
+            self.secure_host_search_blobs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, blob)| blob.contains(&host_query).then_some(index))
+                .collect()
+        };
+
+        let credential_query = self.secure.credential_search.trim().to_lowercase();
+        self.secure_filtered_credential_indices = if credential_query.is_empty() {
+            (0..self.cached_credentials.len()).collect()
+        } else {
+            self.secure_credential_search_blobs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, blob)| blob.contains(&credential_query).then_some(index))
+                .collect()
+        };
+
+        let key_query = self.secure.key_search.trim().to_lowercase();
+        self.secure_filtered_key_indices = if key_query.is_empty() {
+            (0..self.cached_keys.len()).collect()
+        } else {
+            self.secure_key_search_blobs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, blob)| blob.contains(&key_query).then_some(index))
+                .collect()
+        };
+    }
+
     fn set_terminal_hovered_link(&mut self, next: Option<TerminalHoveredLink>) -> bool {
         if self.terminal_hovered_link == next {
             return false;
@@ -60,15 +134,22 @@ impl SeanceWorkspace {
         true
     }
 
-    fn clear_terminal_hovered_link(&mut self) -> bool {
+    pub(crate) fn clear_terminal_hovered_link(&mut self) -> bool {
         self.set_terminal_hovered_link(None)
     }
 
-    fn update_terminal_hovered_link(
+    pub(crate) fn update_terminal_hovered_link(
         &mut self,
         position: gpui::Point<gpui::Pixels>,
         modifiers: gpui::Modifiers,
     ) -> bool {
+        if matches!(
+            self.terminal_link_paint_mode(Instant::now()),
+            crate::LinkPaintMode::Deferred
+        ) {
+            return self.clear_terminal_hovered_link();
+        }
+
         let next = self.active_session().and_then(|session| {
             let summary = session.summary();
             let point = self.terminal_selection_point(position)?;
@@ -355,70 +436,10 @@ impl SeanceWorkspace {
     pub(crate) fn handle_terminal_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(session) = self.active_session() else {
-            return;
-        };
-        let summary = session.summary();
-        let line_height = self
-            .terminal_metrics
-            .map(|metrics| metrics.line_height_px)
-            .unwrap_or_else(|| self.terminal_line_height_px())
-            .max(1.0);
-        let delta_rows_f = match event.delta {
-            ScrollDelta::Pixels(delta) => -(f32::from(delta.y) / line_height),
-            ScrollDelta::Lines(delta) => -delta.y,
-        };
-        if delta_rows_f.abs() < f32::EPSILON {
-            return;
-        }
-        if self.terminal_scroll_remainder_rows.signum() != 0.0
-            && delta_rows_f.signum() != 0.0
-            && self.terminal_scroll_remainder_rows.signum() != delta_rows_f.signum()
-        {
-            self.terminal_scroll_remainder_rows = 0.0;
-        }
-        let pending_rows = self.terminal_scroll_remainder_rows + delta_rows_f;
-        let delta_rows = pending_rows.trunc() as isize;
-        self.terminal_scroll_remainder_rows = pending_rows - delta_rows as f32;
-
-        if summary.mouse_tracking {
-            if delta_rows == 0 {
-                return;
-            }
-            let button = if delta_rows > 0 {
-                TerminalMouseButton::WheelUp
-            } else {
-                TerminalMouseButton::WheelDown
-            };
-            if let Some(mouse_event) = self.terminal_mouse_event(
-                event.position,
-                TerminalMouseEventKind::Press,
-                Some(button),
-                event.modifiers,
-            ) {
-                for _ in 0..delta_rows.unsigned_abs() {
-                    let _ = session.send_mouse(mouse_event.clone());
-                }
-                self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
-                cx.notify();
-            }
-            return;
-        }
-
-        if matches!(summary.active_screen, TerminalScreenKind::Alternate) {
-            self.terminal_scroll_remainder_rows = 0.0;
-            return;
-        }
-
-        if delta_rows == 0 {
-            return;
-        }
-
-        let _ = session.scroll_viewport(TerminalScrollCommand::DeltaRows(delta_rows));
-        self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
-        cx.notify();
+        crate::workspace_scroll::handle_terminal_scroll_wheel(self, event, window, cx);
     }
 
     pub(crate) fn handle_terminal_mouse_down(
@@ -427,248 +448,34 @@ impl SeanceWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
-
-        let Some(session) = self.active_session() else {
-            return;
-        };
-        let summary = session.summary();
-        let scrollbar_interactive =
-            terminal_scrollbar_is_interactive(summary.active_screen, summary.mouse_tracking);
-        if event.button == MouseButton::Left
-            && scrollbar_interactive
-            && let Some((layout, local_x, local_y)) =
-                self.terminal_scrollbar_local_position(event.position)
-            && let Some(outcome) = terminal_scrollbar_mouse_down_outcome(layout, local_x, local_y)
-        {
-            self.terminal_scrollbar_hovered = true;
-            self.terminal_scrollbar_drag = Some(outcome.drag_state);
-            if let Some(command) = outcome.command {
-                let _ = session.scroll_viewport(command);
-                self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
-            } else {
-                self.perf_overlay.mark_input(RedrawReason::Input);
-            }
-            cx.notify();
-            return;
-        }
-
-        if summary.mouse_tracking {
-            self.clear_terminal_hovered_link();
-            self.terminal_scrollbar_hovered = false;
-            self.terminal_scrollbar_drag = None;
-            if let Some(mouse_event) = self.terminal_mouse_event(
-                event.position,
-                TerminalMouseEventKind::Press,
-                terminal_mouse_button(event.button),
-                event.modifiers,
-            ) {
-                let _ = session.send_mouse(mouse_event);
-            }
-            self.clear_terminal_selection();
-        } else if self.try_open_terminal_link(event, summary.active_screen) {
-            self.terminal_drag_anchor = None;
-            self.clear_terminal_hovered_link();
-            self.perf_overlay.mark_input(RedrawReason::Input);
-            cx.notify();
-            return;
-        } else if event.button == MouseButton::Left
-            && let Some(point) = self.terminal_selection_point(event.position)
-        {
-            self.clear_terminal_hovered_link();
-            self.terminal_selection = Some(crate::model::TerminalSelection {
-                anchor: point,
-                focus: point,
-            });
-            self.terminal_drag_anchor = Some(point);
-        }
-
-        self.perf_overlay.mark_input(RedrawReason::Input);
-        cx.notify();
+        crate::workspace_scroll::handle_terminal_mouse_down(self, event, window, cx);
     }
 
     pub(crate) fn handle_terminal_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(session) = self.active_session() else {
-            if self.clear_terminal_hovered_link() {
-                self.perf_overlay.mark_input(RedrawReason::Input);
-                cx.notify();
-            }
-            return;
-        };
-        let summary = session.summary();
-        let scrollbar_interactive =
-            terminal_scrollbar_is_interactive(summary.active_screen, summary.mouse_tracking);
-        if let Some(drag_state) = self.terminal_scrollbar_drag {
-            let mut state_changed = self.clear_terminal_hovered_link();
-            if scrollbar_interactive && let Some(local_y) = self.terminal_local_y(event.position) {
-                let _ =
-                    session.scroll_viewport(terminal_scrollbar_drag_command(drag_state, local_y));
-                self.terminal_scrollbar_hovered = true;
-                self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
-                cx.notify();
-            } else {
-                self.terminal_scrollbar_drag = None;
-                if self.terminal_scrollbar_hovered {
-                    self.terminal_scrollbar_hovered = false;
-                    state_changed = true;
-                }
-                if state_changed {
-                    self.perf_overlay.mark_input(RedrawReason::Input);
-                    cx.notify();
-                }
-            }
-            return;
-        }
-
-        if summary.mouse_tracking {
-            let mut state_changed = self.clear_terminal_hovered_link();
-            if self.terminal_scrollbar_hovered {
-                self.terminal_scrollbar_hovered = false;
-                state_changed = true;
-            }
-            if let Some(mouse_event) = self.terminal_mouse_event(
-                event.position,
-                TerminalMouseEventKind::Move,
-                event.pressed_button.and_then(terminal_mouse_button),
-                event.modifiers,
-            ) {
-                let _ = session.send_mouse(mouse_event);
-                self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
-                cx.notify();
-            } else if state_changed {
-                self.perf_overlay.mark_input(RedrawReason::Input);
-                cx.notify();
-            }
-            return;
-        }
-
-        let scrollbar_hovered = scrollbar_interactive
-            && self
-                .terminal_scrollbar_local_position(event.position)
-                .is_some_and(|(layout, local_x, local_y)| {
-                    layout.hit_test(local_x, local_y).is_some()
-                });
-        let mut state_changed = false;
-        if scrollbar_hovered != self.terminal_scrollbar_hovered {
-            self.terminal_scrollbar_hovered = scrollbar_hovered;
-            state_changed = true;
-        }
-
-        if event.dragging() {
-            state_changed |= self.clear_terminal_hovered_link();
-        } else {
-            state_changed |= self.update_terminal_hovered_link(event.position, event.modifiers);
-        }
-
-        if state_changed {
-            self.perf_overlay.mark_input(RedrawReason::Input);
-            cx.notify();
-        }
-
-        if !event.dragging() {
-            return;
-        }
-
-        let Some(anchor) = self.terminal_drag_anchor else {
-            return;
-        };
-        let Some(focus) = self.terminal_selection_point(event.position) else {
-            return;
-        };
-        self.terminal_selection = Some(crate::model::TerminalSelection { anchor, focus });
-        self.perf_overlay.mark_input(RedrawReason::Input);
-        cx.notify();
+        crate::workspace_scroll::handle_terminal_mouse_move(self, event, window, cx);
     }
 
     pub(crate) fn handle_terminal_mouse_up(
         &mut self,
         event: &MouseUpEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(session) = self.active_session() else {
-            self.terminal_drag_anchor = None;
-            self.terminal_hovered_link = None;
-            self.terminal_scrollbar_hovered = false;
-            self.terminal_scrollbar_drag = None;
-            return;
-        };
-
-        let summary = session.summary();
-        let scrollbar_interactive =
-            terminal_scrollbar_is_interactive(summary.active_screen, summary.mouse_tracking);
-        if self.terminal_scrollbar_drag.take().is_some() {
-            self.terminal_drag_anchor = None;
-            self.terminal_scrollbar_hovered = scrollbar_interactive
-                && self
-                    .terminal_scrollbar_local_position(event.position)
-                    .is_some_and(|(layout, local_x, local_y)| {
-                        layout.hit_test(local_x, local_y).is_some()
-                    });
-            self.perf_overlay.mark_input(RedrawReason::Input);
-            cx.notify();
-            return;
-        }
-
-        if summary.mouse_tracking {
-            if let Some(mouse_event) = self.terminal_mouse_event(
-                event.position,
-                TerminalMouseEventKind::Release,
-                terminal_mouse_button(event.button),
-                event.modifiers,
-            ) {
-                let _ = session.send_mouse(mouse_event);
-            }
-        }
-
-        self.terminal_drag_anchor = None;
-        self.perf_overlay.mark_input(RedrawReason::Input);
-        cx.notify();
+        crate::workspace_scroll::handle_terminal_mouse_up(self, event, window, cx);
     }
 
     fn handle_terminal_scrollback_key(
         &mut self,
         event: &KeyDownEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(session) = self.active_session() else {
-            return false;
-        };
-        let summary = session.summary();
-        if matches!(summary.active_screen, TerminalScreenKind::Alternate) {
-            return false;
-        }
-
-        let modifiers = event.keystroke.modifiers;
-        if !modifiers.shift {
-            return false;
-        }
-
-        let command = match event.keystroke.key.as_str() {
-            "pageup" => Some(TerminalScrollCommand::PageUp),
-            "pagedown" => Some(TerminalScrollCommand::PageDown),
-            "home" => Some(TerminalScrollCommand::Top),
-            "end" => Some(TerminalScrollCommand::Bottom),
-            _ => None,
-        };
-        let Some(command) = command else {
-            return false;
-        };
-
-        let result = match command {
-            TerminalScrollCommand::Bottom => session.scroll_to_bottom(),
-            _ => session.scroll_viewport(command),
-        };
-        if result.is_ok() {
-            self.perf_overlay.mark_input(RedrawReason::TerminalUpdate);
-            cx.notify();
-        }
-        true
+        crate::workspace_scroll::handle_terminal_scrollback_key(self, event, window, cx)
     }
 
     pub(crate) fn apply_initial_action(
@@ -733,6 +540,7 @@ impl SeanceWorkspace {
         {
             self.terminal_metrics = None;
             self.terminal_surface.shape_cache = ShapeCache::default();
+            self.terminal_surface.row_template_cache = crate::RowPaintCache::default();
             self.invalidate_terminal_surface();
             self.apply_active_terminal_geometry(window);
         }
@@ -793,6 +601,7 @@ impl SeanceWorkspace {
         self.cached_credentials = snapshot.cached_credentials;
         self.cached_keys = snapshot.cached_keys;
         self.cached_port_forwards = snapshot.cached_port_forwards;
+        self.rebuild_secure_search_cache();
 
         self.reconcile_saved_selection_state();
         self.reconcile_host_draft_after_vault_snapshot();
@@ -830,8 +639,12 @@ impl SeanceWorkspace {
                     let _ = cx.update(move |window, cx| {
                         entity.update(cx, |this, cx| {
                             this.apply_config_snapshot(next_config, window, cx);
+                            this.request_repaint(
+                                crate::RepaintReasonSet::UI_STATE,
+                                window,
+                                cx,
+                            );
                         });
-                        window.refresh();
                     });
                 }
             })
@@ -864,8 +677,12 @@ impl SeanceWorkspace {
                     let _ = cx.update(move |window, cx| {
                         entity.update(cx, |this, cx| {
                             this.apply_vault_snapshot(next_snapshot, cx);
+                            this.request_repaint(
+                                crate::RepaintReasonSet::UI_STATE,
+                                window,
+                                cx,
+                            );
                         });
-                        window.refresh();
                     });
                 }
             })
@@ -898,8 +715,12 @@ impl SeanceWorkspace {
                     let _ = cx.update(move |window, cx| {
                         entity.update(cx, |this, cx| {
                             this.apply_update_state_snapshot(next_state, cx);
+                            this.request_repaint(
+                                crate::RepaintReasonSet::UI_STATE,
+                                window,
+                                cx,
+                            );
                         });
-                        window.refresh();
                     });
                 }
             })
@@ -1309,6 +1130,9 @@ impl SeanceWorkspace {
             PaletteAction::AddSavedHost => {
                 self.begin_add_host(cx);
             }
+            PaletteAction::OpenNewHostWizard => {
+                self.begin_new_host_wizard(cx);
+            }
             PaletteAction::OpenVaultPanel => {
                 self.open_vault_panel(cx);
             }
@@ -1344,6 +1168,18 @@ impl SeanceWorkspace {
             PaletteAction::GenerateRsaKey => {
                 self.open_secure_workspace(SecureSection::Keys, cx);
                 self.generate_rsa_key_for_secure(cx);
+            }
+            PaletteAction::ImportPrivateKeyFiles => {
+                self.open_secure_workspace(SecureSection::Keys, cx);
+                self.open_key_import_modal(KeyImportTab::Files, cx);
+            }
+            PaletteAction::DiscoverPrivateKeys => {
+                self.open_secure_workspace(SecureSection::Keys, cx);
+                self.open_key_import_modal(KeyImportTab::Discover, cx);
+            }
+            PaletteAction::PastePrivateKey => {
+                self.open_secure_workspace(SecureSection::Keys, cx);
+                self.open_key_import_modal(KeyImportTab::Paste, cx);
             }
             PaletteAction::DeletePrivateKey { vault_id, key_id } => {
                 self.attempt_delete_private_key(&item_scope_key(&vault_id, &key_id), cx);
@@ -1437,7 +1273,7 @@ impl SeanceWorkspace {
             return;
         }
 
-        if self.handle_terminal_scrollback_key(event, cx) {
+        if self.handle_terminal_scrollback_key(event, window, cx) {
             return;
         }
 
@@ -1556,6 +1392,21 @@ impl SeanceWorkspace {
     fn handle_secure_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
+
+        if self.secure.key_import_modal.open {
+            match key {
+                "escape" => self.close_key_import_modal(cx),
+                "enter" => match self.secure.key_import_modal.tab {
+                    KeyImportTab::Discover => {}
+                    KeyImportTab::Files => self.import_selected_path_keys(cx),
+                    KeyImportTab::Paste => self.import_pasted_key(cx),
+                },
+                _ => {}
+            }
+            self.perf_overlay.mark_input(RedrawReason::Input);
+            cx.notify();
+            return;
+        }
 
         if text_primary_modifier(modifiers) && key == "s" {
             if self.secure.host_draft.is_some() {
@@ -2023,6 +1874,16 @@ impl SeanceWorkspace {
         };
 
         apply_text_input_outcome(&outcome, cx);
+        if outcome.changed
+            && matches!(
+                target,
+                SecureInputTarget::HostSearch
+                    | SecureInputTarget::CredentialSearch
+                    | SecureInputTarget::KeySearch
+            )
+        {
+            self.recompute_secure_filtered_indices();
+        }
         outcome.consumed
     }
 
@@ -2038,7 +1899,7 @@ impl SeanceWorkspace {
         outcome.consumed
     }
 
-    fn clear_terminal_selection(&mut self) {
+    pub(crate) fn clear_terminal_selection(&mut self) {
         self.terminal_selection = None;
         self.terminal_drag_anchor = None;
     }
@@ -2049,7 +1910,7 @@ impl SeanceWorkspace {
         TerminalScrollbarLayout::new(scrollbar, geometry)
     }
 
-    fn terminal_local_y(&self, position: gpui::Point<gpui::Pixels>) -> Option<f32> {
+    pub(crate) fn terminal_local_y(&self, position: gpui::Point<gpui::Pixels>) -> Option<f32> {
         let geometry = self.terminal_surface.geometry?;
         let local_y = f32::from(position.y) - TERMINAL_PANE_PADDING_PX;
         (0.0..=f32::from(geometry.pixel_size.height_px))
@@ -2057,7 +1918,7 @@ impl SeanceWorkspace {
             .then_some(local_y)
     }
 
-    fn terminal_scrollbar_local_position(
+    pub(crate) fn terminal_scrollbar_local_position(
         &self,
         position: gpui::Point<gpui::Pixels>,
     ) -> Option<(TerminalScrollbarLayout, f32, f32)> {
@@ -2079,7 +1940,7 @@ impl SeanceWorkspace {
         Some((layout, local_x, local_y))
     }
 
-    fn terminal_selection_point(
+    pub(crate) fn terminal_selection_point(
         &self,
         position: gpui::Point<gpui::Pixels>,
     ) -> Option<crate::model::TerminalSelectionPoint> {
@@ -2093,7 +1954,7 @@ impl SeanceWorkspace {
         )
     }
 
-    fn terminal_mouse_event(
+    pub(crate) fn terminal_mouse_event(
         &self,
         position: gpui::Point<gpui::Pixels>,
         kind: TerminalMouseEventKind,
@@ -2143,45 +2004,34 @@ impl SeanceWorkspace {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct TerminalScrollbarMouseDownOutcome {
-    command: Option<TerminalScrollCommand>,
-    drag_state: TerminalScrollbarDragState,
+pub(crate) struct TerminalScrollbarMouseDownOutcome {
+    pub(crate) command: Option<TerminalScrollCommand>,
+    pub(crate) drag_state: TerminalScrollbarDragState,
 }
 
+#[cfg(test)]
 fn terminal_scrollbar_is_interactive(
     active_screen: TerminalScreenKind,
     mouse_tracking: bool,
 ) -> bool {
-    !mouse_tracking && matches!(active_screen, TerminalScreenKind::Primary)
+    crate::workspace_scroll::terminal_scrollbar_is_interactive(active_screen, mouse_tracking)
 }
 
+#[cfg(test)]
 fn terminal_scrollbar_mouse_down_outcome(
     layout: TerminalScrollbarLayout,
     local_x: f32,
     local_y: f32,
 ) -> Option<TerminalScrollbarMouseDownOutcome> {
-    match layout.hit_test(local_x, local_y)? {
-        TerminalScrollbarHit::Thumb => Some(TerminalScrollbarMouseDownOutcome {
-            command: None,
-            drag_state: layout.drag_state(local_y - layout.thumb_top_px),
-        }),
-        TerminalScrollbarHit::Track => {
-            let drag_state = layout.drag_state(layout.center_grab_offset_y_px());
-            Some(TerminalScrollbarMouseDownOutcome {
-                command: Some(TerminalScrollCommand::SetOffsetRows(
-                    drag_state.offset_for_pointer_y(local_y),
-                )),
-                drag_state,
-            })
-        }
-    }
+    crate::workspace_scroll::terminal_scrollbar_mouse_down_outcome(layout, local_x, local_y)
 }
 
+#[cfg(test)]
 fn terminal_scrollbar_drag_command(
     drag_state: TerminalScrollbarDragState,
     local_y: f32,
 ) -> TerminalScrollCommand {
-    TerminalScrollCommand::SetOffsetRows(drag_state.offset_for_pointer_y(local_y))
+    crate::workspace_scroll::terminal_scrollbar_drag_command(drag_state, local_y)
 }
 
 fn terminal_local_point(
@@ -2230,7 +2080,7 @@ impl Focusable for SeanceWorkspace {
 }
 
 impl SeanceWorkspace {
-    fn try_open_terminal_link(
+    pub(crate) fn try_open_terminal_link(
         &mut self,
         event: &MouseDownEvent,
         active_screen: TerminalScreenKind,
@@ -2264,6 +2114,17 @@ impl SeanceWorkspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(
+            self.terminal_link_paint_mode(Instant::now()),
+            crate::LinkPaintMode::Deferred
+        ) {
+            if self.clear_terminal_hovered_link() {
+                self.perf_overlay.mark_input(RedrawReason::Input);
+                cx.notify();
+            }
+            return;
+        }
+
         let Some(hovered_link) = self.terminal_hovered_link.as_mut() else {
             return;
         };
@@ -2509,15 +2370,6 @@ fn filter_secure_input_text(target: SecureInputTarget, text: &str) -> String {
             .filter(|value| value.is_ascii_digit())
             .collect(),
         _ => text.to_string(),
-    }
-}
-
-fn terminal_mouse_button(button: MouseButton) -> Option<TerminalMouseButton> {
-    match button {
-        MouseButton::Left => Some(TerminalMouseButton::Left),
-        MouseButton::Right => Some(TerminalMouseButton::Right),
-        MouseButton::Middle => Some(TerminalMouseButton::Middle),
-        _ => None,
     }
 }
 

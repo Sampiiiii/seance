@@ -30,10 +30,11 @@ pub use device_store::{DeviceSecretError, DeviceSecretStore};
 use kdf::KdfParams;
 pub use model::{
     ApplyDeltaReport, CredentialSummary, DeviceEnrollment, GenerateKeyAlgorithm,
-    GenerateKeyRequest, HostAuthRef, HostSummary, ImportKeyRequest, KeySummary, PortForwardMode,
-    PortForwardSummary, PrivateKeyAlgorithm, PrivateKeySource, RecordKind, RecoveryBundle,
-    SyncCursor, UnlockMethod, VaultDelta, VaultDeltaRecord, VaultHeader, VaultHostProfile,
-    VaultPasswordCredential, VaultPortForwardProfile, VaultPrivateKey, VaultSnapshot, VaultStatus,
+    GenerateKeyRequest, HostAuthRef, HostAuthSummary, HostSummary, ImportKeyRequest, KeySummary,
+    PortForwardMode, PortForwardSummary, PrivateKeyAlgorithm, PrivateKeySource, RecordKind,
+    RecoveryBundle, SyncCursor, UnlockMethod, VaultDelta, VaultDeltaRecord, VaultHeader,
+    VaultHostProfile, VaultPasswordCredential, VaultPortForwardProfile, VaultPrivateKey,
+    VaultSnapshot, VaultStatus,
 };
 
 use model::{EncryptedRecord, RECORD_SCHEMA_VERSION, RecordSyncState, VAULT_SCHEMA_VERSION};
@@ -45,6 +46,13 @@ const DEVICE_UNLOCK_BUILD_MESSAGE: &str = "Touch ID device unlock is unavailable
 const DEVICE_UNLOCK_ENROLLMENT_FAILED_MESSAGE: &str = "Vault unlocked, but Touch ID enrollment failed. Launch a signed Seance.app bundle and unlock again with your passphrase to re-enroll this device.";
 const DEVICE_UNLOCK_REENROLL_MESSAGE: &str = "Touch ID device unlock needs to be re-enrolled. Unlock the vault with your passphrase once to repair it.";
 const DEFAULT_RSA_BITS: u32 = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateKeyInspection {
+    pub algorithm: PrivateKeyAlgorithm,
+    pub public_key_openssh: String,
+    pub encrypted_at_rest: bool,
+}
 
 #[derive(Default)]
 struct SystemRng;
@@ -73,6 +81,15 @@ impl TryRng for SystemRng {
 impl TryCryptoRng for SystemRng {}
 
 pub type VaultResult<T> = Result<T, VaultError>;
+
+pub fn inspect_private_key_pem(private_key_pem: &str) -> VaultResult<PrivateKeyInspection> {
+    let private_key = SshPrivateKey::from_openssh(private_key_pem)?;
+    Ok(PrivateKeyInspection {
+        algorithm: private_key_algorithm(private_key.public_key())?,
+        public_key_openssh: private_key.public_key().to_openssh()?,
+        encrypted_at_rest: private_key.is_encrypted(),
+    })
+}
 
 #[derive(Debug, Error)]
 pub enum VaultError {
@@ -566,6 +583,18 @@ impl VaultStore {
             .map(|record| {
                 let host: VaultHostProfile = self.decrypt_record(&record)?;
                 Ok(host.summary(record.modified_at))
+            })
+            .collect()
+    }
+
+    /// Returns each host with its auth references in one vault scan.
+    pub fn list_host_auth_summaries(&self) -> VaultResult<Vec<HostAuthSummary>> {
+        let records = storage::list_records_by_kind(&self.conn, RecordKind::Host)?;
+        records
+            .into_iter()
+            .map(|record| {
+                let host: VaultHostProfile = self.decrypt_record(&record)?;
+                Ok(host.auth_summary())
             })
             .collect()
     }

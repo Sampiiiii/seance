@@ -5,6 +5,9 @@ use std::{
 };
 
 use seance_config::{AppConfig, PerfHudDefault};
+use seance_observability::{
+    RENDER_TRACE_TARGET, RenderCause, RenderDomain, RenderPath, RenderPhase,
+};
 use seance_terminal::SessionPerfSnapshot;
 use tracing::trace;
 
@@ -63,6 +66,19 @@ impl RedrawReason {
             Self::Palette => "palette",
             Self::UiRefresh => "ui",
             Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<RedrawReason> for RenderCause {
+    fn from(value: RedrawReason) -> Self {
+        match value {
+            RedrawReason::DisplayProbe => Self::DisplayProbe,
+            RedrawReason::Input => Self::Input,
+            RedrawReason::TerminalUpdate => Self::TerminalUpdate,
+            RedrawReason::Palette => Self::Palette,
+            RedrawReason::UiRefresh => Self::UiRefresh,
+            RedrawReason::Unknown => Self::Unknown,
         }
     }
 }
@@ -253,6 +269,25 @@ impl PerfOverlayState {
             redraw_reason = self.frame_stats.redraw_reason.label(),
             "perf render sampled"
         );
+
+        trace!(
+            target: RENDER_TRACE_TARGET,
+            render_domain = RenderDomain::Ui.as_str(),
+            render_path = RenderPath::Frame.as_str(),
+            render_cause = RenderCause::from(self.frame_stats.redraw_reason).as_str(),
+            render_phase = RenderPhase::Summary.as_str(),
+            frame_count_total = self.frame_stats.frame_count_total,
+            presented_fps_1s = self.frame_stats.presented_fps_1s,
+            display_hz_1s = self.frame_stats.display_hz_1s,
+            frame_time_last_ms = self.frame_stats.frame_time_last_ms,
+            frame_time_avg_ms = self.frame_stats.frame_time_avg_ms,
+            frame_time_p95_ms = self.frame_stats.frame_time_p95_ms,
+            "frame render summary"
+        );
+    }
+
+    pub(crate) fn pending_render_cause(&self) -> RenderCause {
+        self.pending_redraw_reason.into()
     }
 
     pub(crate) fn ui_refreshes_last_second(&self) -> usize {

@@ -9,9 +9,14 @@ fn main() {
     {
         println!("cargo:rerun-if-changed=src/sparkle_bridge.m");
         println!("cargo:rerun-if-changed=src/dock_icon_bridge.m");
+        println!("cargo:rerun-if-changed=src/promotion_bridge.m");
 
         let objects = cc::Build::new()
-            .files(["src/sparkle_bridge.m", "src/dock_icon_bridge.m"])
+            .files([
+                "src/sparkle_bridge.m",
+                "src/dock_icon_bridge.m",
+                "src/promotion_bridge.m",
+            ])
             .flag("-fblocks")
             .flag("-std=gnu11")
             .flag("-Wall")
@@ -61,5 +66,6 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=ImageIO");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
     }
 }

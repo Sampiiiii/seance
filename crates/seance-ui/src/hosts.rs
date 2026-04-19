@@ -25,6 +25,7 @@ impl SeanceWorkspace {
                 .first()
                 .map(|host| host_scope_key(&host.vault_id, &host.host.id));
         }
+        self.rebuild_secure_search_cache();
     }
 
     fn render_host_row(
@@ -174,21 +175,42 @@ impl SeanceWorkspace {
             }
 
             section = section.child(
-                div().px(px(14.0)).pt(px(2.0)).child(
-                    div()
-                        .font_family(SIDEBAR_FONT_MONO)
-                        .text_size(px(SIDEBAR_MONO_SIZE_PX))
-                        .text_color(theme.text_ghost)
-                        .cursor_pointer()
-                        .hover(|style| style.text_color(theme.text_secondary))
-                        .child("+ add host")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.begin_add_host(cx);
-                            }),
-                        ),
-                ),
+                div()
+                    .px(px(14.0))
+                    .pt(px(2.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .font_family(SIDEBAR_FONT_MONO)
+                            .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                            .text_color(theme.text_ghost)
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(theme.text_secondary))
+                            .child("+ add host")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.begin_add_host(cx);
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font_family(SIDEBAR_FONT_MONO)
+                            .text_size(px(SIDEBAR_MONO_SIZE_PX))
+                            .text_color(theme.text_ghost)
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(theme.text_secondary))
+                            .child("+ host wizard")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.begin_new_host_wizard(cx);
+                                }),
+                            ),
+                    ),
             );
         } else {
             section = section.child(

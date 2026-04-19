@@ -1,13 +1,15 @@
 // Owns the secure workspace surface, host/credential drafts, key details, and confirm dialogs.
 
 mod credentials;
+mod host_wizard;
 mod hosts;
+mod import_keys;
 mod keys;
 mod shared;
 
 use gpui::{App, Context, Div, FontWeight, MouseButton, Window, div, prelude::*, px};
-use seance_core::{VaultScopedCredentialSummary, VaultScopedHostSummary, VaultScopedKeySummary};
-use seance_vault::{HostAuthRef, VaultHostProfile, VaultPasswordCredential};
+use seance_core::{HostReferenceSummary, VaultScopedKeySummary};
+use seance_vault::{HostAuthRef, ImportKeyRequest, VaultHostProfile, VaultPasswordCredential};
 
 use crate::{
     SeanceWorkspace,
@@ -21,14 +23,6 @@ use crate::{
     ui_components::{danger_button, primary_button, settings_action_chip},
     workspace::{item_scope_key, split_scope_key},
 };
-
-// ── Referential-integrity helper ──────────────────────────────────────────
-
-#[derive(Clone, Debug)]
-pub(crate) struct HostReference {
-    pub id: String,
-    pub label: String,
-}
 
 // ── Business logic ───────────────────────────────────────────────────────
 
@@ -85,6 +79,9 @@ impl SeanceWorkspace {
                 self.secure.host_draft = None;
                 self.secure.tunnel_draft = None;
                 self.secure.credential_draft = None;
+                self.secure.key_import_modal.open = false;
+                self.secure.host_wizard.open = false;
+                self.secure.pending_passphrase_auth_index = None;
                 self.secure.message = None;
             }
             PendingAction::SwitchSecureSection(section) => {
@@ -92,6 +89,8 @@ impl SeanceWorkspace {
                 self.secure.host_draft = None;
                 self.secure.tunnel_draft = None;
                 self.secure.credential_draft = None;
+                self.secure.host_wizard.open = false;
+                self.secure.pending_passphrase_auth_index = None;
                 self.secure.message = None;
                 self.focus_secure_input_target(match section {
                     SecureSection::Hosts => SecureInputTarget::HostSearch,
@@ -151,6 +150,10 @@ impl SeanceWorkspace {
     }
 
     pub(crate) fn activate_host_draft(&mut self, host_id: Option<&str>, cx: &mut Context<Self>) {
+        if host_id.is_some() {
+            self.secure.host_wizard.open = false;
+            self.secure.host_wizard.message = None;
+        }
         self.surface = WorkspaceSurface::Secure;
         self.secure.section = SecureSection::Hosts;
         self.refresh_vault_cache();
@@ -202,6 +205,9 @@ impl SeanceWorkspace {
         origin: CredentialDraftOrigin,
         cx: &mut Context<Self>,
     ) {
+        if origin == CredentialDraftOrigin::Standalone {
+            self.secure.pending_passphrase_auth_index = None;
+        }
         self.surface = WorkspaceSurface::Secure;
         self.secure.section = SecureSection::Credentials;
         self.refresh_vault_cache();
@@ -360,6 +366,134 @@ impl SeanceWorkspace {
         cx.notify();
     }
 
+    fn ensure_host_draft_for_vault(&mut self, vault_id: &str, cx: &mut Context<Self>) -> bool {
+        if self
+            .secure
+            .host_draft
+            .as_ref()
+            .is_some_and(|draft| draft.vault_id.as_deref() == Some(vault_id))
+        {
+            return true;
+        }
+
+        if let Some(scope_key) = self
+            .saved_hosts
+            .iter()
+            .find(|host| host.vault_id == vault_id)
+            .map(|host| item_scope_key(&host.vault_id, &host.host.id))
+        {
+            self.activate_host_draft(Some(&scope_key), cx);
+            return self
+                .secure
+                .host_draft
+                .as_ref()
+                .is_some_and(|draft| draft.vault_id.as_deref() == Some(vault_id));
+        }
+
+        self.show_toast("No host exists in this vault yet. Create one first.");
+        false
+    }
+
+    pub(crate) fn attach_key_to_host(
+        &mut self,
+        vault_id: &str,
+        key_id: &str,
+        encrypted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.ensure_host_draft_for_vault(vault_id, cx) {
+            cx.notify();
+            return;
+        }
+        let Some(host_draft) = self.secure.host_draft.as_mut() else {
+            cx.notify();
+            return;
+        };
+        host_draft.auth_items.push(HostAuthRef::PrivateKey {
+            key_id: key_id.to_string(),
+            passphrase_credential_id: None,
+        });
+        let auth_index = host_draft.auth_items.len().saturating_sub(1);
+        host_draft.selected_auth = Some(auth_index);
+        host_draft.dirty = true;
+        self.secure.section = SecureSection::Hosts;
+
+        if encrypted {
+            self.secure.pending_passphrase_auth_index = Some(auth_index);
+            self.activate_credential_draft(None, CredentialDraftOrigin::HostAuth, cx);
+            self.show_toast("Key attached. Add/select a passphrase credential.");
+        } else {
+            self.show_toast("Key attached to host auth order.");
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn attach_credential_to_host_password(
+        &mut self,
+        vault_id: &str,
+        credential_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.ensure_host_draft_for_vault(vault_id, cx) {
+            cx.notify();
+            return;
+        }
+        self.add_auth_password(credential_id, cx);
+        self.secure.section = SecureSection::Hosts;
+        self.show_toast("Credential attached as password auth.");
+        cx.notify();
+    }
+
+    pub(crate) fn attach_credential_to_host_passphrase(
+        &mut self,
+        vault_id: &str,
+        credential_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.ensure_host_draft_for_vault(vault_id, cx) {
+            cx.notify();
+            return;
+        }
+        let Some(host_draft) = self.secure.host_draft.as_mut() else {
+            cx.notify();
+            return;
+        };
+
+        let target_index = host_draft
+            .selected_auth
+            .filter(|index| {
+                matches!(
+                    host_draft.auth_items.get(*index),
+                    Some(HostAuthRef::PrivateKey { .. })
+                )
+            })
+            .or_else(|| {
+                host_draft
+                    .auth_items
+                    .iter()
+                    .position(|auth| matches!(auth, HostAuthRef::PrivateKey { .. }))
+            });
+
+        let Some(target_index) = target_index else {
+            self.show_toast("Add a private key auth method first, then set passphrase.");
+            cx.notify();
+            return;
+        };
+
+        if let Some(HostAuthRef::PrivateKey {
+            passphrase_credential_id,
+            ..
+        }) = host_draft.auth_items.get_mut(target_index)
+        {
+            *passphrase_credential_id = Some(credential_id.to_string());
+            host_draft.selected_auth = Some(target_index);
+            host_draft.dirty = true;
+            self.secure.section = SecureSection::Hosts;
+            self.show_toast("Credential attached as key passphrase.");
+            cx.notify();
+        }
+    }
+
     pub(crate) fn remove_auth_item(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(draft) = self.secure.host_draft.as_mut() else {
             return;
@@ -424,6 +558,7 @@ impl SeanceWorkspace {
     }
 
     pub(crate) fn open_quick_create_credential(&mut self, cx: &mut Context<Self>) {
+        self.secure.pending_passphrase_auth_index = None;
         self.request_pending_action(
             PendingAction::OpenCredentialDraft(None, CredentialDraftOrigin::HostAuth),
             cx,
@@ -487,11 +622,28 @@ impl SeanceWorkspace {
                                 cx.notify();
                                 return;
                             }
-                            host_draft.auth_items.push(HostAuthRef::Password {
-                                credential_id: summary.credential.id.clone(),
-                            });
-                            host_draft.selected_auth =
-                                Some(host_draft.auth_items.len().saturating_sub(1));
+                            if let Some(index) = self.secure.pending_passphrase_auth_index.take() {
+                                if let Some(HostAuthRef::PrivateKey {
+                                    passphrase_credential_id,
+                                    ..
+                                }) = host_draft.auth_items.get_mut(index)
+                                {
+                                    *passphrase_credential_id = Some(summary.credential.id.clone());
+                                    host_draft.selected_auth = Some(index);
+                                } else {
+                                    host_draft.auth_items.push(HostAuthRef::Password {
+                                        credential_id: summary.credential.id.clone(),
+                                    });
+                                    host_draft.selected_auth =
+                                        Some(host_draft.auth_items.len().saturating_sub(1));
+                                }
+                            } else {
+                                host_draft.auth_items.push(HostAuthRef::Password {
+                                    credential_id: summary.credential.id.clone(),
+                                });
+                                host_draft.selected_auth =
+                                    Some(host_draft.auth_items.len().saturating_sub(1));
+                            }
                             host_draft.dirty = true;
                         }
                         let target = self
@@ -531,12 +683,7 @@ impl SeanceWorkspace {
             .backend
             .generate_ed25519_key(&vault_id, format!("ed25519-{}", crate::now_ui_suffix()))
         {
-            Ok(summary) => {
-                self.refresh_vault_ui(cx);
-                self.secure.selected_key_id =
-                    Some(item_scope_key(&summary.vault_id, &summary.key.id));
-                self.show_toast(format!("Generated key '{}'.", summary.key.label));
-            }
+            Ok(summary) => self.on_private_key_created(summary, "Generated", cx),
             Err(err) => self.show_toast(err.to_string()),
         }
         cx.notify();
@@ -558,15 +705,77 @@ impl SeanceWorkspace {
             .backend
             .generate_rsa_key(&vault_id, format!("rsa-{}", crate::now_ui_suffix()))
         {
-            Ok(summary) => {
-                self.refresh_vault_ui(cx);
-                self.secure.selected_key_id =
-                    Some(item_scope_key(&summary.vault_id, &summary.key.id));
-                self.show_toast(format!("Generated key '{}'.", summary.key.label));
-            }
+            Ok(summary) => self.on_private_key_created(summary, "Generated", cx),
             Err(err) => self.show_toast(err.to_string()),
         }
         cx.notify();
+    }
+
+    pub(crate) fn import_private_key_for_secure(
+        &mut self,
+        vault_id: &str,
+        request: ImportKeyRequest,
+        cx: &mut Context<Self>,
+    ) {
+        match self.backend.import_private_key(vault_id, request) {
+            Ok(summary) => {
+                self.on_private_key_created(summary, "Imported", cx);
+                cx.notify();
+            }
+            Err(err) => {
+                self.show_toast(err.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_private_key_created(
+        &mut self,
+        summary: VaultScopedKeySummary,
+        verb: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_vault_ui(cx);
+        self.secure.selected_key_id = Some(item_scope_key(&summary.vault_id, &summary.key.id));
+        let mut attached_index = None;
+        if let Some(host_draft) = self.secure.host_draft.as_mut()
+            && host_draft.vault_id.as_deref() == Some(summary.vault_id.as_str())
+        {
+            host_draft.auth_items.push(HostAuthRef::PrivateKey {
+                key_id: summary.key.id.clone(),
+                passphrase_credential_id: None,
+            });
+            let index = host_draft.auth_items.len().saturating_sub(1);
+            host_draft.selected_auth = Some(index);
+            host_draft.dirty = true;
+            attached_index = Some(index);
+            self.secure.section = SecureSection::Hosts;
+        }
+
+        if summary.key.encrypted_at_rest {
+            if let Some(auth_index) = attached_index {
+                self.secure.pending_passphrase_auth_index = Some(auth_index);
+                self.activate_credential_draft(None, CredentialDraftOrigin::HostAuth, cx);
+                self.show_toast(
+                    "Encrypted key attached. Create or select a credential for the passphrase.",
+                );
+            } else {
+                self.show_toast(format!(
+                    "{verb} encrypted key '{}'. Attach it to a host and set a passphrase credential.",
+                    summary.key.label
+                ));
+            }
+            return;
+        }
+
+        if attached_index.is_some() {
+            self.show_toast(format!(
+                "{verb} key '{}' and attached it to this host.",
+                summary.key.label
+            ));
+        } else {
+            self.show_toast(format!("{verb} key '{}'.", summary.key.label));
+        }
     }
 
     pub(crate) fn attempt_delete_credential(
@@ -585,10 +794,11 @@ impl SeanceWorkspace {
                 "credential",
                 &refs
                     .iter()
-                    .map(|item| item.label.clone())
+                    .map(|item| format!("{} [{}]", item.host_label, item.vault_name))
                     .collect::<Vec<_>>(),
                 SecureSection::Hosts,
-                refs.first().map(|item| item.id.clone()),
+                refs.first()
+                    .map(|item| item_scope_key(&item.vault_id, &item.host_id)),
             ));
             cx.notify();
             return;
@@ -620,10 +830,11 @@ impl SeanceWorkspace {
                 "key",
                 &refs
                     .iter()
-                    .map(|item| item.label.clone())
+                    .map(|item| format!("{} [{}]", item.host_label, item.vault_name))
                     .collect::<Vec<_>>(),
                 SecureSection::Hosts,
-                refs.first().map(|item| item.id.clone()),
+                refs.first()
+                    .map(|item| item_scope_key(&item.vault_id, &item.host_id)),
             ));
             cx.notify();
             return;
@@ -644,85 +855,20 @@ impl SeanceWorkspace {
         &self,
         vault_id: &str,
         credential_id: &str,
-    ) -> Vec<HostReference> {
-        self.saved_hosts
-            .iter()
-            .filter(|summary| summary.vault_id == vault_id)
-            .filter_map(|summary| {
-                let Ok(Some(host)) = self.backend.load_host(&summary.vault_id, &summary.host.id)
-                else {
-                    return None;
-                };
-                let referenced = host.auth_order.iter().any(|auth| match auth {
-                    HostAuthRef::Password { credential_id: id } => id == credential_id,
-                    HostAuthRef::PrivateKey {
-                        passphrase_credential_id,
-                        ..
-                    } => passphrase_credential_id.as_deref() == Some(credential_id),
-                });
-                referenced.then(|| HostReference {
-                    id: item_scope_key(&summary.vault_id, &summary.host.id),
-                    label: format!("{} [{}]", summary.host.label, summary.vault_name),
-                })
-            })
-            .collect()
+    ) -> Vec<HostReferenceSummary> {
+        self.backend
+            .host_references_for_credential(vault_id, credential_id)
+            .unwrap_or_default()
     }
 
     pub(crate) fn host_references_for_key(
         &self,
         vault_id: &str,
         key_id: &str,
-    ) -> Vec<HostReference> {
-        self.saved_hosts
-            .iter()
-            .filter(|summary| summary.vault_id == vault_id)
-            .filter_map(|summary| {
-                let Ok(Some(host)) = self.backend.load_host(&summary.vault_id, &summary.host.id)
-                else {
-                    return None;
-                };
-                host.auth_order
-                    .iter()
-                    .any(|auth| matches!(auth, HostAuthRef::PrivateKey { key_id: id, .. } if id == key_id))
-                    .then(|| HostReference {
-                        id: item_scope_key(&summary.vault_id, &summary.host.id),
-                        label: format!("{} [{}]", summary.host.label, summary.vault_name),
-                    })
-            })
-            .collect()
-    }
-
-    pub(crate) fn host_matches_query(&self, host: &VaultScopedHostSummary) -> bool {
-        let query = self.secure.host_search.trim().to_lowercase();
-        query.is_empty()
-            || host.host.label.to_lowercase().contains(&query)
-            || host.host.hostname.to_lowercase().contains(&query)
-            || host.host.username.to_lowercase().contains(&query)
-            || host.vault_name.to_lowercase().contains(&query)
-    }
-
-    pub(crate) fn credential_matches_query(
-        &self,
-        credential: &VaultScopedCredentialSummary,
-    ) -> bool {
-        let query = self.secure.credential_search.trim().to_lowercase();
-        query.is_empty()
-            || credential.credential.label.to_lowercase().contains(&query)
-            || credential
-                .credential
-                .username_hint
-                .as_deref()
-                .unwrap_or_default()
-                .to_lowercase()
-                .contains(&query)
-            || credential.vault_name.to_lowercase().contains(&query)
-    }
-
-    pub(crate) fn key_matches_query(&self, key: &VaultScopedKeySummary) -> bool {
-        let query = self.secure.key_search.trim().to_lowercase();
-        query.is_empty()
-            || key.key.label.to_lowercase().contains(&query)
-            || key.vault_name.to_lowercase().contains(&query)
+    ) -> Vec<HostReferenceSummary> {
+        self.backend
+            .host_references_for_key(vault_id, key_id)
+            .unwrap_or_default()
     }
 }
 
@@ -731,7 +877,7 @@ impl SeanceWorkspace {
 impl SeanceWorkspace {
     pub(crate) fn render_secure_workspace(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme();
@@ -763,6 +909,7 @@ impl SeanceWorkspace {
                     .child(self.render_secure_list_panel(cx))
                     .child(self.render_secure_detail_panel(cx)),
             )
+            .child(self.render_key_import_modal(window, cx))
     }
 
     fn render_secure_header(&self, cx: &mut Context<Self>) -> Div {
@@ -881,20 +1028,34 @@ impl SeanceWorkspace {
                             }),
                         ),
                     )
-                    .child(settings_action_chip("+ new host", &t).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.request_pending_action(PendingAction::OpenHostDraft(None), cx);
-                        }),
-                    ))
                     .child(
                         div()
-                            .id("host-list-scroll")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .child(self.render_host_list_content(cx)),
+                            .flex()
+                            .gap(px(6.0))
+                            .child(settings_action_chip("+ new host", &t).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.request_pending_action(
+                                        PendingAction::OpenHostDraft(None),
+                                        cx,
+                                    );
+                                }),
+                            ))
+                            .child(settings_action_chip("+ host wizard", &t).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.begin_new_host_wizard(cx);
+                                }),
+                            )),
                     );
+                panel = panel.child(
+                    div()
+                        .id("host-list-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(self.render_host_list_content(cx)),
+                );
             }
             SecureSection::Tunnels => {
                 panel = self.render_tunnel_list_panel(cx);
@@ -932,7 +1093,7 @@ impl SeanceWorkspace {
                             .id("credential-list-scroll")
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
+                            .overflow_hidden()
                             .child(self.render_credential_list_content(cx)),
                     );
             }
@@ -955,6 +1116,7 @@ impl SeanceWorkspace {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap(px(6.0))
                             .child(settings_action_chip("+ ed25519", &t).on_mouse_down(
                                 MouseButton::Left,
@@ -967,6 +1129,33 @@ impl SeanceWorkspace {
                                 cx.listener(|this, _, _, cx| {
                                     this.generate_rsa_key_for_secure(cx);
                                 }),
+                            ))
+                            .child(settings_action_chip("+ import key", &t).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_key_import_modal(
+                                        crate::forms::KeyImportTab::Files,
+                                        cx,
+                                    );
+                                }),
+                            ))
+                            .child(settings_action_chip("+ discover ~/.ssh", &t).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_key_import_modal(
+                                        crate::forms::KeyImportTab::Discover,
+                                        cx,
+                                    );
+                                }),
+                            ))
+                            .child(settings_action_chip("+ paste pem", &t).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_key_import_modal(
+                                        crate::forms::KeyImportTab::Paste,
+                                        cx,
+                                    );
+                                }),
                             )),
                     )
                     .child(
@@ -974,7 +1163,7 @@ impl SeanceWorkspace {
                             .id("key-list-scroll")
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
+                            .overflow_hidden()
                             .child(self.render_key_list_content(cx)),
                     );
             }
@@ -1006,6 +1195,13 @@ impl SeanceWorkspace {
             .bg(t.scrim)
             .track_focus(&self.focus_handle)
             .key_context("ConfirmDialog")
+            .on_mouse_down(MouseButton::Left, {
+                let focus_handle = self.focus_handle.clone();
+                move |_: &gpui::MouseDownEvent, window: &mut Window, _cx: &mut App| {
+                    window.focus(&focus_handle);
+                }
+            })
+            .on_key_down(cx.listener(Self::handle_key_down))
             .flex()
             .items_center()
             .justify_center()
@@ -1020,6 +1216,12 @@ impl SeanceWorkspace {
                     .flex()
                     .flex_col()
                     .gap_4()
+                    .on_mouse_down(MouseButton::Left, {
+                        let focus_handle = self.focus_handle.clone();
+                        move |_: &gpui::MouseDownEvent, window: &mut Window, _cx: &mut App| {
+                            window.focus(&focus_handle);
+                        }
+                    })
                     .child(
                         div()
                             .text_lg()
@@ -1042,7 +1244,8 @@ impl SeanceWorkspace {
                                 settings_action_chip(dialog.cancel_label.clone(), &t)
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
+                                        cx.listener(|this, _, window, cx| {
+                                            window.focus(&this.focus_handle);
                                             this.cancel_confirm_dialog(cx);
                                         }),
                                     ),
@@ -1050,7 +1253,8 @@ impl SeanceWorkspace {
                             .child(if is_destructive {
                                 danger_button(dialog.confirm_label.clone(), &t).on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
+                                    cx.listener(|this, _, window, cx| {
+                                        window.focus(&this.focus_handle);
                                         this.confirm_dialog_primary(cx);
                                     }),
                                 )
@@ -1058,7 +1262,8 @@ impl SeanceWorkspace {
                                 primary_button(dialog.confirm_label.clone(), true, &t)
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
+                                        cx.listener(|this, _, window, cx| {
+                                            window.focus(&this.focus_handle);
                                             this.confirm_dialog_primary(cx);
                                         }),
                                     )

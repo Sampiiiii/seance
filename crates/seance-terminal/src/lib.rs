@@ -5,6 +5,7 @@ mod history;
 mod input;
 mod local;
 mod model;
+pub mod publish_budget;
 mod render;
 mod state;
 mod viewport;

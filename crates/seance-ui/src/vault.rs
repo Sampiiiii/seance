@@ -24,6 +24,7 @@ impl SeanceWorkspace {
         self.cached_credentials = self.backend.list_password_credentials().unwrap_or_default();
         self.cached_keys = self.backend.list_private_keys().unwrap_or_default();
         self.cached_port_forwards = self.backend.list_port_forwards().unwrap_or_default();
+        self.rebuild_secure_search_cache();
     }
 
     pub(crate) fn default_target_vault_id(&self) -> Option<String> {

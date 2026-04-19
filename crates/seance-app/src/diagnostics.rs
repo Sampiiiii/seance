@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use seance_core::AppPaths;
+use seance_observability::RENDER_TRACE_TARGET;
 use time::OffsetDateTime;
 use tracing_subscriber::EnvFilter;
 
@@ -150,6 +151,7 @@ pub(crate) fn initialize(paths: &AppPaths) -> Result<DiagnosticsHandle> {
     let filter = select_filter(
         env::var("RUST_LOG").ok().as_deref(),
         env::var("SEANCE_TRACE").ok().as_deref(),
+        env::var("SEANCE_RENDER_TRACE").ok().as_deref(),
     );
     let writer = SharedWriter::new(file);
     tracing_subscriber::fmt()
@@ -221,18 +223,38 @@ fn resolve_log_dir_with_override(default_dir: &Path, override_dir: Option<&OsStr
         .unwrap_or_else(|| default_dir.to_path_buf())
 }
 
-fn select_filter(rust_log: Option<&str>, seance_trace: Option<&str>) -> String {
-    rust_log
+fn select_filter(
+    rust_log: Option<&str>,
+    seance_trace: Option<&str>,
+    seance_render_trace: Option<&str>,
+) -> String {
+    if let Some(filter) = rust_log
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            let enabled = seance_trace
-                .map(str::trim)
-                .is_some_and(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES"));
-            enabled.then(|| TRACE_FILTER.to_string())
-        })
-        .unwrap_or_else(|| DEFAULT_FILTER.to_string())
+    {
+        return filter;
+    }
+
+    let mut filter = if env_flag_enabled(seance_trace) {
+        TRACE_FILTER.to_string()
+    } else {
+        DEFAULT_FILTER.to_string()
+    };
+
+    if env_flag_enabled(seance_render_trace) {
+        filter.push(',');
+        filter.push_str(RENDER_TRACE_TARGET);
+        filter.push_str("=trace");
+    }
+
+    filter
+}
+
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 #[cfg(test)]
@@ -240,6 +262,7 @@ mod tests {
     use std::path::Path;
 
     use super::{DEFAULT_FILTER, TRACE_FILTER, resolve_log_dir_with_override, select_filter};
+    use seance_observability::RENDER_TRACE_TARGET;
 
     #[test]
     fn log_dir_defaults_to_app_paths_directory() {
@@ -265,18 +288,26 @@ mod tests {
     #[test]
     fn rust_log_takes_precedence_over_seance_trace() {
         assert_eq!(
-            select_filter(Some("seance_app=debug"), Some("1")),
+            select_filter(Some("seance_app=debug"), Some("1"), Some("1")),
             "seance_app=debug"
         );
     }
 
     #[test]
     fn seance_trace_enables_trace_defaults() {
-        assert_eq!(select_filter(None, Some("1")), TRACE_FILTER);
+        assert_eq!(select_filter(None, Some("1"), None), TRACE_FILTER);
+    }
+
+    #[test]
+    fn render_trace_appends_dedicated_target() {
+        assert_eq!(
+            select_filter(None, None, Some("1")),
+            format!("{DEFAULT_FILTER},{RENDER_TRACE_TARGET}=trace")
+        );
     }
 
     #[test]
     fn missing_env_uses_info_defaults() {
-        assert_eq!(select_filter(None, None), DEFAULT_FILTER);
+        assert_eq!(select_filter(None, None, None), DEFAULT_FILTER);
     }
 }

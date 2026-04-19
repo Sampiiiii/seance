@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::{Duration, SystemTime},
+    time::{Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -14,7 +14,7 @@ use crate::{
     SessionPerfSnapshot, SessionSummary, SharedSessionState, TerminalEmulator, TerminalGeometry,
     TerminalKeyEvent, TerminalMouseEvent, TerminalPaste, TerminalScrollCommand, TerminalSession,
     TerminalTextEvent, TerminalTranscriptSink, TerminalViewportSnapshot, TranscriptEvent,
-    TranscriptStream, next_session_id,
+    TranscriptStream, next_session_id, publish_budget::DEFAULT_PUBLISH_BUDGET,
 };
 
 pub struct LocalSessionHandle {
@@ -138,6 +138,7 @@ impl LocalSessionFactory {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum SessionCommand {
     Input(Vec<u8>),
     Text(TerminalTextEvent),
@@ -238,10 +239,13 @@ fn run_local_session(
 
     let mut terminal = TerminalEmulator::new(current_geometry, "Launching local shell...")?;
     terminal.refresh(&state, None, true, transcript_sink.dropped_events());
+    let mut pending_command: Option<SessionCommand> = None;
 
     loop {
         let mut changed = false;
+        let mut batch_count: usize = 0;
 
+        let deadline = Instant::now() + DEFAULT_PUBLISH_BUDGET;
         while let Ok(bytes) = output_rx.try_recv() {
             transcript_sink.record(TranscriptEvent {
                 timestamp: SystemTime::now(),
@@ -250,9 +254,19 @@ fn run_local_session(
             });
             terminal.write(&bytes);
             changed = true;
+            batch_count += 1;
+
+            if Instant::now() >= deadline {
+                break;
+            }
         }
 
-        match command_rx.recv_timeout(Duration::from_millis(16)) {
+        let next_command = pending_command
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| command_rx.recv_timeout(DEFAULT_PUBLISH_BUDGET));
+
+        match next_command {
             Ok(SessionCommand::Input(bytes)) => {
                 write_input_bytes(&mut writer, &transcript_sink, &bytes)?;
             }
@@ -295,20 +309,49 @@ fn run_local_session(
                 current_geometry = new_geometry;
                 terminal.refresh(&state, None, true, transcript_sink.dropped_events());
             }
-            Ok(SessionCommand::ScrollViewport(command)) => {
-                terminal.scroll_viewport(command);
+            Ok(command @ (SessionCommand::ScrollViewport(_) | SessionCommand::ScrollToBottom)) => {
+                let (compacted_batch, deferred_command, disconnected, drained_count) =
+                    drain_scroll_command_batch(command, &command_rx);
+                pending_command = deferred_command;
+                let compacted_count = compacted_batch.len();
+                for batch_command in compacted_batch {
+                    match batch_command {
+                        SessionCommand::ScrollViewport(scroll_command) => {
+                            terminal.scroll_viewport(scroll_command);
+                        }
+                        SessionCommand::ScrollToBottom => {
+                            terminal.scroll_viewport(TerminalScrollCommand::Bottom);
+                        }
+                        _ => {}
+                    }
+                }
                 terminal.refresh(&state, None, false, transcript_sink.dropped_events());
-            }
-            Ok(SessionCommand::ScrollToBottom) => {
-                terminal.scroll_viewport(TerminalScrollCommand::Bottom);
-                terminal.refresh(&state, None, false, transcript_sink.dropped_events());
+                trace!(
+                    drained_count,
+                    compacted_count, disconnected, "published coalesced local scroll refresh"
+                );
+                if disconnected {
+                    break;
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
+        while let Ok(bytes) = output_rx.try_recv() {
+            transcript_sink.record(TranscriptEvent {
+                timestamp: SystemTime::now(),
+                stream: TranscriptStream::Output,
+                bytes: Arc::from(bytes.as_slice()),
+            });
+            terminal.write(&bytes);
+            changed = true;
+            batch_count += 1;
+        }
+
         if changed {
             terminal.refresh(&state, None, false, transcript_sink.dropped_events());
+            trace!(batch_count, "published coalesced local output refresh");
         }
 
         if let Some(status) = child.try_wait().context("failed to poll shell process")? {
@@ -332,6 +375,76 @@ fn run_local_session(
     }
 
     Ok(())
+}
+
+fn is_scroll_session_command(command: &SessionCommand) -> bool {
+    matches!(
+        command,
+        SessionCommand::ScrollViewport(_) | SessionCommand::ScrollToBottom
+    )
+}
+
+fn compact_scroll_command_burst(commands: Vec<SessionCommand>) -> Vec<SessionCommand> {
+    let mut compacted = Vec::with_capacity(commands.len());
+    let mut pending_delta: Option<isize> = None;
+
+    for command in commands {
+        match command {
+            SessionCommand::ScrollViewport(TerminalScrollCommand::DeltaRows(delta_rows)) => {
+                pending_delta = Some(pending_delta.unwrap_or_default().saturating_add(delta_rows));
+            }
+            other => {
+                if let Some(delta_rows) = pending_delta.take() {
+                    compacted.push(SessionCommand::ScrollViewport(
+                        TerminalScrollCommand::DeltaRows(delta_rows),
+                    ));
+                }
+                compacted.push(other);
+            }
+        }
+    }
+
+    if let Some(delta_rows) = pending_delta.take() {
+        compacted.push(SessionCommand::ScrollViewport(
+            TerminalScrollCommand::DeltaRows(delta_rows),
+        ));
+    }
+
+    compacted
+}
+
+fn drain_scroll_command_batch(
+    first: SessionCommand,
+    command_rx: &mpsc::Receiver<SessionCommand>,
+) -> (Vec<SessionCommand>, Option<SessionCommand>, bool, usize) {
+    let mut drained = vec![first];
+    let mut deferred_command = None;
+    let mut disconnected = false;
+
+    loop {
+        match command_rx.try_recv() {
+            Ok(command) if is_scroll_session_command(&command) => {
+                drained.push(command);
+            }
+            Ok(command) => {
+                deferred_command = Some(command);
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+
+    let drained_count = drained.len();
+    (
+        compact_scroll_command_burst(drained),
+        deferred_command,
+        disconnected,
+        drained_count,
+    )
 }
 
 fn write_input_bytes(
@@ -473,6 +586,108 @@ mod tests {
         let error = anyhow::anyhow!(std::io::Error::from_raw_os_error(22));
 
         assert!(should_retry_without_pixels(&error));
+    }
+
+    #[test]
+    fn contiguous_delta_rows_are_compacted_with_saturating_add() {
+        let compacted = compact_scroll_command_burst(vec![
+            SessionCommand::ScrollViewport(TerminalScrollCommand::DeltaRows(isize::MAX)),
+            SessionCommand::ScrollViewport(TerminalScrollCommand::DeltaRows(1)),
+            SessionCommand::ScrollViewport(TerminalScrollCommand::PageDown),
+            SessionCommand::ScrollViewport(TerminalScrollCommand::DeltaRows(-2)),
+            SessionCommand::ScrollViewport(TerminalScrollCommand::DeltaRows(-3)),
+        ]);
+
+        let mut iter = compacted.into_iter();
+        assert!(matches!(
+            iter.next(),
+            Some(SessionCommand::ScrollViewport(
+                TerminalScrollCommand::DeltaRows(delta)
+            )) if delta == isize::MAX
+        ));
+        assert!(matches!(
+            iter.next(),
+            Some(SessionCommand::ScrollViewport(
+                TerminalScrollCommand::PageDown
+            ))
+        ));
+        assert!(matches!(
+            iter.next(),
+            Some(SessionCommand::ScrollViewport(
+                TerminalScrollCommand::DeltaRows(delta)
+            )) if delta == -5
+        ));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn mixed_commands_preserve_order_while_compacting_delta_runs() {
+        let compacted = compact_scroll_command_burst(vec![
+            SessionCommand::ScrollViewport(TerminalScrollCommand::DeltaRows(4)),
+            SessionCommand::Input(vec![0x1b]),
+            SessionCommand::ScrollViewport(TerminalScrollCommand::DeltaRows(-1)),
+            SessionCommand::ScrollViewport(TerminalScrollCommand::DeltaRows(-2)),
+            SessionCommand::ScrollToBottom,
+            SessionCommand::ScrollViewport(TerminalScrollCommand::DeltaRows(3)),
+        ]);
+
+        let mut iter = compacted.into_iter();
+        assert!(matches!(
+            iter.next(),
+            Some(SessionCommand::ScrollViewport(
+                TerminalScrollCommand::DeltaRows(delta)
+            )) if delta == 4
+        ));
+        assert!(matches!(
+            iter.next(),
+            Some(SessionCommand::Input(bytes)) if bytes == vec![0x1b]
+        ));
+        assert!(matches!(
+            iter.next(),
+            Some(SessionCommand::ScrollViewport(
+                TerminalScrollCommand::DeltaRows(delta)
+            )) if delta == -3
+        ));
+        assert!(matches!(iter.next(), Some(SessionCommand::ScrollToBottom)));
+        assert!(matches!(
+            iter.next(),
+            Some(SessionCommand::ScrollViewport(
+                TerminalScrollCommand::DeltaRows(delta)
+            )) if delta == 3
+        ));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn drain_scroll_batch_stops_at_non_scroll_boundary() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(SessionCommand::ScrollViewport(
+            TerminalScrollCommand::DeltaRows(2),
+        ))
+        .expect("send first scroll");
+        tx.send(SessionCommand::ScrollViewport(
+            TerminalScrollCommand::DeltaRows(5),
+        ))
+        .expect("send second scroll");
+        tx.send(SessionCommand::Input(vec![0x2a]))
+            .expect("send non-scroll");
+
+        let first = rx.recv().expect("receive first scroll");
+        let (compacted, deferred, disconnected, drained_count) =
+            drain_scroll_command_batch(first, &rx);
+
+        assert_eq!(drained_count, 2);
+        assert!(!disconnected);
+        assert!(matches!(
+            compacted.as_slice(),
+            [SessionCommand::ScrollViewport(
+                TerminalScrollCommand::DeltaRows(7)
+            )]
+        ));
+        assert!(matches!(
+            deferred,
+            Some(SessionCommand::Input(bytes)) if bytes == vec![0x2a]
+        ));
     }
 
     #[cfg(unix)]

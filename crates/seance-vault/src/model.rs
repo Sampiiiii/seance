@@ -261,6 +261,13 @@ pub struct ImportKeyRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostAuthSummary {
+    pub host_id: String,
+    pub host_label: String,
+    pub auth_order: Vec<HostAuthRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostSummary {
     pub id: String,
     pub label: String,
@@ -310,6 +317,14 @@ impl VaultHostProfile {
             port: self.port,
             username: self.username.clone(),
             modified_at,
+        }
+    }
+
+    pub fn auth_summary(&self) -> HostAuthSummary {
+        HostAuthSummary {
+            host_id: self.id.clone(),
+            host_label: self.label.clone(),
+            auth_order: self.auth_order.clone(),
         }
     }
 }

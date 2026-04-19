@@ -47,6 +47,7 @@ pub(crate) enum PaletteAction {
     LockVault,
     OpenVaultPanel,
     AddSavedHost,
+    OpenNewHostWizard,
     AddPasswordCredential,
     EditPasswordCredential {
         vault_id: String,
@@ -58,6 +59,9 @@ pub(crate) enum PaletteAction {
     },
     GenerateEd25519Key,
     GenerateRsaKey,
+    ImportPrivateKeyFiles,
+    DiscoverPrivateKeys,
+    PastePrivateKey,
     DeletePrivateKey {
         vault_id: String,
         key_id: String,
@@ -288,6 +292,15 @@ pub(crate) fn build_items(
             shortcut_command: None,
             match_indices: Vec::new(),
         });
+        items.push(PaletteItem {
+            glyph: "☰",
+            label: "New Host Wizard".into(),
+            hint: "Guided host setup with auth and review".into(),
+            action: PaletteAction::OpenNewHostWizard,
+            group: PaletteGroup::Hosts,
+            shortcut_command: None,
+            match_indices: Vec::new(),
+        });
 
         for host in saved_hosts {
             let scope_key = crate::workspace::host_scope_key(&host.vault_id, &host.host.id);
@@ -476,6 +489,33 @@ pub(crate) fn build_items(
             label: "Generate RSA Key".into(),
             hint: "Create a new vault-backed RSA key".into(),
             action: PaletteAction::GenerateRsaKey,
+            group: PaletteGroup::Vault,
+            shortcut_command: None,
+            match_indices: Vec::new(),
+        });
+        items.push(PaletteItem {
+            glyph: "⤓",
+            label: "Import Key Files".into(),
+            hint: "Choose one or more private key files".into(),
+            action: PaletteAction::ImportPrivateKeyFiles,
+            group: PaletteGroup::Vault,
+            shortcut_command: None,
+            match_indices: Vec::new(),
+        });
+        items.push(PaletteItem {
+            glyph: "⌂",
+            label: "Discover ~/.ssh Keys".into(),
+            hint: "Scan ~/.ssh and import available private keys".into(),
+            action: PaletteAction::DiscoverPrivateKeys,
+            group: PaletteGroup::Vault,
+            shortcut_command: None,
+            match_indices: Vec::new(),
+        });
+        items.push(PaletteItem {
+            glyph: "¶",
+            label: "Paste Private Key".into(),
+            hint: "Import a PEM key from clipboard text".into(),
+            action: PaletteAction::PastePrivateKey,
             group: PaletteGroup::Vault,
             shortcut_command: None,
             match_indices: Vec::new(),

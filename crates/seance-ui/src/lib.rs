@@ -12,6 +12,7 @@ mod app;
 mod backend;
 mod connect;
 mod forms;
+mod frame_pacer;
 mod hosts;
 mod keybindings;
 mod model;
@@ -35,10 +36,12 @@ mod ui_components;
 mod vault;
 mod workspace;
 mod workspace_render;
+mod workspace_scroll;
 
 use std::time::Instant;
 
 use gpui::{Context, MouseButton, Render, Window, deferred, div, prelude::*, px};
+use seance_observability::{RenderDomain, RenderPath, RenderPhase, RenderTraceScope};
 
 pub use actions::{
     CheckForUpdates, CloseActiveSession, ConnectHost, ConnectHostInNewWindow, HideOtherApps,
@@ -49,6 +52,7 @@ pub use actions::{
 pub(crate) use app::refresh_app_menus;
 pub use app::{UiCommand, UiIntegration, UiRuntime, run};
 use forms::{SettingsSection, WorkspaceSurface};
+pub(crate) use frame_pacer::{FramePacer, RepaintReasonSet};
 use model::{
     MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, SIDEBAR_DIVIDER_VISUAL_PX, SIDEBAR_DRAG_TARGET_PX,
 };
@@ -57,7 +61,8 @@ pub(crate) use model::{
     local_session_display_number_for_ids, session_kind_map_from_sessions,
 };
 pub(crate) use surface::{
-    CachedShapeLine, HslaKey, PreparedTerminalSurface, ShapeCache, ShapeCacheKey,
+    CachedRowPaintTemplate, CachedShapeLine, HslaKey, LinkPaintMode, PreparedTerminalSurface,
+    RowPaintCache, RowPaintCacheKey, RowPaintTemplate, ShapeCache, ShapeCacheKey,
     TerminalFragmentPlan, TerminalGlyphPolicy, TerminalPaintFragment, TerminalPaintQuad,
     TerminalPaintRow,
 };
@@ -73,6 +78,11 @@ const SIDEBAR_MONO_SIZE_PX: f32 = 11.0;
 
 impl Render for SeanceWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let frame_trace = RenderTraceScope::new(
+            RenderDomain::Ui,
+            RenderPath::Frame,
+            self.perf_overlay.pending_render_cause(),
+        );
         let perf_enabled = self.perf_overlay.mode.is_enabled();
         let render_started_at = perf_enabled.then(Instant::now);
 
@@ -89,11 +99,14 @@ impl Render for SeanceWorkspace {
 
         let t = self.theme();
 
-        let main_content = match self.surface {
-            WorkspaceSurface::Terminal => self.render_terminal_shell(window, cx),
-            WorkspaceSurface::Settings => self.render_settings_panel(window, cx),
-            WorkspaceSurface::Sftp => self.render_sftp_panel(window, cx),
-            WorkspaceSurface::Secure => self.render_secure_workspace(window, cx),
+        let main_content = {
+            let _compose_phase = frame_trace.phase(RenderPhase::Compose);
+            match self.surface {
+                WorkspaceSurface::Terminal => self.render_terminal_shell(window, cx),
+                WorkspaceSurface::Settings => self.render_settings_panel(window, cx),
+                WorkspaceSurface::Sftp => self.render_sftp_panel(window, cx),
+                WorkspaceSurface::Secure => self.render_secure_workspace(window, cx),
+            }
         };
 
         let sidebar_resizing = self.sidebar_resizing;

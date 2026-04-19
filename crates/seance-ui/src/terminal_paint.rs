@@ -1,13 +1,23 @@
 use gpui::{App, Bounds, Pixels, SharedString, TextRun, Window, fill, font, point, px, size};
+use seance_observability::{
+    RENDER_TRACE_TARGET, RenderCause, RenderDomain, RenderPath, RenderPhase, RenderTraceScope,
+};
 use seance_terminal::{
     TerminalCell, TerminalCellStyle, TerminalColor, TerminalCursorState, TerminalCursorVisualStyle,
     TerminalRow,
 };
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
+use tracing::trace;
 
 use crate::{
-    CachedShapeLine, HslaKey, PreparedTerminalSurface, ShapeCache, ShapeCacheKey,
+    CachedRowPaintTemplate, CachedShapeLine, HslaKey, LinkPaintMode, PreparedTerminalSurface,
+    RowPaintCache, RowPaintCacheKey, RowPaintTemplate, ShapeCache, ShapeCacheKey,
     TerminalFragmentPlan, TerminalGlyphPolicy, TerminalMetrics, TerminalPaintFragment,
-    TerminalPaintQuad, TerminalPaintRow, TerminalRendererMetrics, ThemeId,
+    TerminalPaintQuad, TerminalRendererMetrics, ThemeId,
     model::{TerminalHoveredLink, TerminalSelection, TerminalSelectionPoint},
     terminal_links::terminal_links_for_row,
     theme::Theme,
@@ -23,70 +33,97 @@ pub(crate) struct ShapedTerminalFragment {
     pub(crate) width_error_px: f32,
 }
 
-pub(crate) fn build_terminal_paint_row(
+pub(crate) fn build_row_paint_template(
     row: &TerminalRow,
-    row_index: usize,
     visible_cols: usize,
     metrics: TerminalMetrics,
     theme_id: ThemeId,
     theme: &Theme,
     font_family: &str,
     shape_cache: &mut ShapeCache,
+    link_paint_mode: LinkPaintMode,
+    render_cause: RenderCause,
     window: &mut Window,
     renderer_metrics: &mut TerminalRendererMetrics,
-) -> TerminalPaintRow {
-    let fragment_plans = terminal_fragment_plans(row, visible_cols, theme, renderer_metrics);
+) -> RowPaintTemplate {
+    let row_trace = RenderTraceScope::new(
+        RenderDomain::Terminal,
+        RenderPath::TerminalRowPaintTemplate,
+        render_cause,
+    );
+    let fragment_plans = {
+        let _build_phase = row_trace.phase(RenderPhase::Build);
+        terminal_fragment_plans(row, visible_cols, theme, renderer_metrics, render_cause)
+    };
     let backgrounds = terminal_background_quads(row, visible_cols, metrics, theme);
-    let link_paint = terminal_link_paint(row, visible_cols, metrics, theme);
+    let link_paint = if matches!(link_paint_mode, LinkPaintMode::Deferred) {
+        renderer_metrics.link_rows_deferred = renderer_metrics.link_rows_deferred.saturating_add(1);
+        // Still record link ranges in deferred mode so the idle-restore pass can
+        // target just the rows that carry links rather than every row on screen.
+        let ranges = terminal_links_for_row(row, visible_cols)
+            .into_iter()
+            .map(|link| link.col_range)
+            .collect::<Vec<_>>();
+        TerminalLinkPaint {
+            ranges,
+            highlights: Vec::new(),
+            underlines: Vec::new(),
+        }
+    } else {
+        terminal_link_paint(row, visible_cols, metrics, theme)
+    };
     let underlines = terminal_underline_quads(row, visible_cols, metrics, theme);
     let mut fragments = Vec::with_capacity(fragment_plans.len());
 
-    for plan in fragment_plans {
-        if plan.text.is_empty() {
-            continue;
-        }
-        let shaped = shape_terminal_fragment(
-            &plan,
-            metrics,
-            theme_id,
-            theme,
-            font_family,
-            shape_cache,
-            window,
-            renderer_metrics,
-        );
-        if should_cell_align_fragment(&plan, shaped.width_error_px) {
-            renderer_metrics.cell_aligned_fallback_fragments = renderer_metrics
-                .cell_aligned_fallback_fragments
-                .saturating_add(1);
-            for (text, x) in cell_aligned_ascii_cells(&plan, metrics.cell_width_px) {
-                let cell_plan = TerminalFragmentPlan {
-                    text,
-                    style: plan.style,
-                    glyph_policy: plan.glyph_policy,
-                    start_col: plan.start_col,
-                    cell_count: 1,
-                };
-                let aligned = shape_terminal_fragment(
-                    &cell_plan,
-                    metrics,
-                    theme_id,
-                    theme,
-                    font_family,
-                    shape_cache,
-                    window,
-                    renderer_metrics,
-                );
+    {
+        let _shape_phase = row_trace.phase(RenderPhase::Shape);
+        for plan in fragment_plans {
+            if plan.text.is_empty() {
+                continue;
+            }
+            let shaped = shape_terminal_fragment(
+                &plan,
+                metrics,
+                theme_id,
+                theme,
+                font_family,
+                shape_cache,
+                window,
+                renderer_metrics,
+            );
+            if should_cell_align_fragment(&plan, shaped.width_error_px) {
+                renderer_metrics.cell_aligned_fallback_fragments = renderer_metrics
+                    .cell_aligned_fallback_fragments
+                    .saturating_add(1);
+                for (text, x) in cell_aligned_ascii_cells(&plan, metrics.cell_width_px) {
+                    let cell_plan = TerminalFragmentPlan {
+                        text,
+                        style: plan.style,
+                        glyph_policy: plan.glyph_policy,
+                        start_col: plan.start_col,
+                        cell_count: 1,
+                    };
+                    let aligned = shape_terminal_fragment(
+                        &cell_plan,
+                        metrics,
+                        theme_id,
+                        theme,
+                        font_family,
+                        shape_cache,
+                        window,
+                        renderer_metrics,
+                    );
+                    fragments.push(TerminalPaintFragment {
+                        x,
+                        line: aligned.line,
+                    });
+                }
+            } else {
                 fragments.push(TerminalPaintFragment {
-                    x,
-                    line: aligned.line,
+                    x: px(plan.start_col as f32 * metrics.cell_width_px),
+                    line: shaped.line,
                 });
             }
-        } else {
-            fragments.push(TerminalPaintFragment {
-                x: px(plan.start_col as f32 * metrics.cell_width_px),
-                line: shaped.line,
-            });
         }
     }
 
@@ -96,14 +133,29 @@ pub(crate) fn build_terminal_paint_row(
         + underlines.len()
         + link_paint.underlines.len();
 
-    TerminalPaintRow {
-        y: px(row_index as f32 * metrics.line_height_px),
-        backgrounds,
-        link_highlights: link_paint.highlights,
-        underlines,
-        link_underlines: link_paint.underlines,
-        link_ranges: link_paint.ranges,
-        fragments,
+    trace!(
+        target: RENDER_TRACE_TARGET,
+        render_domain = RenderDomain::Terminal.as_str(),
+        render_path = RenderPath::TerminalRowPaintTemplate.as_str(),
+        render_cause = render_cause.as_str(),
+        render_phase = RenderPhase::Summary.as_str(),
+        fragment_count = fragments.len(),
+        background_quad_count = backgrounds.len(),
+        underline_quad_count = underlines.len(),
+        link_highlight_count = link_paint.highlights.len(),
+        link_underline_count = link_paint.underlines.len(),
+        shape_hits = renderer_metrics.shape_hits,
+        shape_misses = renderer_metrics.shape_misses,
+        "terminal row paint template summary"
+    );
+
+    RowPaintTemplate {
+        backgrounds: Arc::from(backgrounds),
+        link_highlights: Arc::from(link_paint.highlights),
+        underlines: Arc::from(underlines),
+        link_underlines: Arc::from(link_paint.underlines),
+        link_ranges: Arc::from(link_paint.ranges),
+        fragments: Arc::from(fragments),
     }
 }
 
@@ -112,7 +164,13 @@ pub(crate) fn terminal_fragment_plans(
     visible_cols: usize,
     theme: &Theme,
     renderer_metrics: &mut TerminalRendererMetrics,
+    render_cause: RenderCause,
 ) -> Vec<TerminalFragmentPlan> {
+    let _plan_trace = RenderTraceScope::new(
+        RenderDomain::Terminal,
+        RenderPath::TerminalFragmentPlan,
+        render_cause,
+    );
     let mut plans = Vec::new();
     let mut current_col = 0;
     let mut current: Option<TerminalFragmentPlan> = None;
@@ -176,6 +234,18 @@ pub(crate) fn terminal_fragment_plans(
     }
 
     let _ = theme;
+    trace!(
+        target: RENDER_TRACE_TARGET,
+        render_domain = RenderDomain::Terminal.as_str(),
+        render_path = RenderPath::TerminalFragmentPlan.as_str(),
+        render_cause = render_cause.as_str(),
+        render_phase = RenderPhase::Summary.as_str(),
+        plan_count = plans.len(),
+        visible_cols,
+        special_glyph_cells = renderer_metrics.special_glyph_cells,
+        wide_cells = renderer_metrics.wide_cells,
+        "terminal fragment planning summary"
+    );
     plans
 }
 
@@ -287,7 +357,7 @@ pub(crate) fn terminal_underline_quads(
     quads
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct TerminalLinkPaint {
     ranges: Vec<std::ops::Range<usize>>,
     highlights: Vec<TerminalPaintQuad>,
@@ -349,17 +419,15 @@ pub(crate) fn shape_terminal_fragment(
 ) -> ShapedTerminalFragment {
     let color = resolve_terminal_foreground(plan.style, theme);
     let key = ShapeCacheKey {
-        text: plan.text.clone(),
-        font_family: font_family.to_string(),
+        text: Arc::<str>::from(plan.text.as_str()),
+        font_family: Arc::<str>::from(font_family),
         font_size_bits: metrics.font_size_px.to_bits(),
         bold: plan.style.bold,
         italic: plan.style.italic,
         color: hsla_key(color),
     };
 
-    if let Some(entry) = shape_cache.entries.get_mut(&key) {
-        shape_cache.generation = shape_cache.generation.saturating_add(1);
-        entry.last_used = shape_cache.generation;
+    if let Some(entry) = shape_cache.entries.get(&key) {
         renderer_metrics.shape_hits += 1;
         return shaped_fragment_with_metrics(entry.line.clone(), plan, metrics, renderer_metrics);
     }
@@ -387,15 +455,12 @@ pub(crate) fn shape_terminal_fragment(
         None,
     );
 
-    shape_cache.generation = shape_cache.generation.saturating_add(1);
-    shape_cache.entries.insert(
+    shape_cache.entries.put(
         key,
         CachedShapeLine {
             line: line.clone(),
-            last_used: shape_cache.generation,
         },
     );
-    evict_shape_cache(shape_cache, 2_048);
     let _ = theme_id;
     shaped_fragment_with_metrics(line, plan, metrics, renderer_metrics)
 }
@@ -462,19 +527,84 @@ fn cell_aligned_ascii_cells(
         .collect()
 }
 
-pub(crate) fn evict_shape_cache(shape_cache: &mut ShapeCache, limit: usize) {
-    if shape_cache.entries.len() <= limit {
-        return;
+pub(crate) fn row_paint_cache_key(
+    row: &TerminalRow,
+    visible_cols: usize,
+    metrics: TerminalMetrics,
+    theme_id: ThemeId,
+    font_family: &str,
+    link_paint_mode: LinkPaintMode,
+) -> RowPaintCacheKey {
+    RowPaintCacheKey {
+        content_style_hash: row_content_style_hash(row, visible_cols),
+        visible_cols,
+        font_family: Arc::<str>::from(font_family),
+        font_size_bits: metrics.font_size_px.to_bits(),
+        cell_width_bits: metrics.cell_width_px.to_bits(),
+        line_height_bits: metrics.line_height_px.to_bits(),
+        cell_height_bits: metrics.cell_height_px.to_bits(),
+        theme_id,
+        link_paint_mode,
+    }
+}
+
+pub(crate) fn row_content_style_hash(row: &TerminalRow, visible_cols: usize) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut current_col = 0usize;
+
+    for cell in &row.cells {
+        if current_col >= visible_cols {
+            break;
+        }
+
+        let cell_width = usize::from(cell.width.max(1));
+        if current_col + cell_width > visible_cols {
+            break;
+        }
+
+        cell_width.hash(&mut hasher);
+        cell.text.hash(&mut hasher);
+        hash_terminal_cell_style(cell.style, &mut hasher);
+        current_col += cell_width;
     }
 
-    if let Some((oldest_key, _)) = shape_cache
-        .entries
-        .iter()
-        .min_by_key(|(_, entry)| entry.last_used)
-        .map(|(key, entry)| (key.clone(), entry.last_used))
-    {
-        shape_cache.entries.remove(&oldest_key);
+    current_col.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_terminal_cell_style(style: TerminalCellStyle, hasher: &mut impl Hasher) {
+    hash_optional_terminal_color(style.foreground, hasher);
+    hash_optional_terminal_color(style.background, hasher);
+    style.bold.hash(hasher);
+    style.italic.hash(hasher);
+    style.faint.hash(hasher);
+    style.underline.hash(hasher);
+    style.inverse.hash(hasher);
+    style.invisible.hash(hasher);
+}
+
+fn hash_optional_terminal_color(color: Option<TerminalColor>, hasher: &mut impl Hasher) {
+    color.is_some().hash(hasher);
+    if let Some(color) = color {
+        color.r.hash(hasher);
+        color.g.hash(hasher);
+        color.b.hash(hasher);
     }
+}
+
+pub(crate) fn row_paint_cache_get(
+    cache: &mut RowPaintCache,
+    key: &RowPaintCacheKey,
+) -> Option<RowPaintTemplate> {
+    cache.entries.get(key).map(|entry| entry.template.clone())
+}
+
+pub(crate) fn row_paint_cache_insert(
+    cache: &mut RowPaintCache,
+    key: RowPaintCacheKey,
+    template: RowPaintTemplate,
+) {
+    cache.entries.put(key, CachedRowPaintTemplate { template });
 }
 
 pub(crate) fn hsla_key(color: gpui::Hsla) -> HslaKey {
@@ -517,7 +647,7 @@ pub(crate) fn paint_terminal_surface(
             }
         }
 
-        for background in &row.backgrounds {
+        for background in row.backgrounds.iter() {
             window.paint_quad(fill(
                 Bounds::new(
                     point(row_origin.x + background.x, row_origin.y),
@@ -527,7 +657,7 @@ pub(crate) fn paint_terminal_surface(
             ));
         }
 
-        for highlight in &row.link_highlights {
+        for highlight in row.link_highlights.iter() {
             paint_terminal_link_background_quad(row_origin, line_height, *highlight, window);
         }
 
@@ -544,7 +674,7 @@ pub(crate) fn paint_terminal_surface(
             paint_hovered_terminal_link(row_origin, hovered_link, line_height, &surface, window);
         }
 
-        for fragment in &row.fragments {
+        for fragment in row.fragments.iter() {
             let _ = fragment.line.paint(
                 point(row_origin.x + fragment.x, row_origin.y),
                 line_height,
@@ -553,7 +683,7 @@ pub(crate) fn paint_terminal_surface(
             );
         }
 
-        for underline in &row.underlines {
+        for underline in row.underlines.iter() {
             window.paint_quad(fill(
                 Bounds::new(
                     point(
@@ -566,7 +696,7 @@ pub(crate) fn paint_terminal_surface(
             ));
         }
 
-        for underline in &row.link_underlines {
+        for underline in row.link_underlines.iter() {
             paint_terminal_underline_quad(row_origin, line_height, *underline, px(1.0), window);
         }
     }
@@ -887,8 +1017,13 @@ mod tests {
         };
 
         let mut metrics = TerminalRendererMetrics::default();
-        let segments =
-            terminal_fragment_plans(&row, 6, &ThemeId::ObsidianSmoke.theme(), &mut metrics);
+        let segments = terminal_fragment_plans(
+            &row,
+            6,
+            &ThemeId::ObsidianSmoke.theme(),
+            &mut metrics,
+            RenderCause::Unknown,
+        );
 
         assert_eq!(
             segments
@@ -958,8 +1093,13 @@ mod tests {
         };
 
         let mut metrics = TerminalRendererMetrics::default();
-        let segments =
-            terminal_fragment_plans(&row, 2, &ThemeId::ObsidianSmoke.theme(), &mut metrics);
+        let segments = terminal_fragment_plans(
+            &row,
+            2,
+            &ThemeId::ObsidianSmoke.theme(),
+            &mut metrics,
+            RenderCause::Unknown,
+        );
 
         assert_eq!(
             segments
@@ -1134,6 +1274,135 @@ mod tests {
         assert_eq!(trimmed_width, px(0.0));
         assert!(trimmed_width >= px(0.0));
         assert_eq!(bounds.size.width, px(0.0));
+    }
+
+    #[test]
+    fn row_cache_key_is_stable_for_identical_row_content_across_index_shifts() {
+        let row = TerminalRow {
+            cells: "abc"
+                .chars()
+                .map(|ch| TerminalCell {
+                    text: ch.to_string(),
+                    style: TerminalCellStyle::default(),
+                    width: 1,
+                })
+                .collect(),
+        };
+        let key_a = row_paint_cache_key(
+            &row,
+            row.terminal_width(),
+            metrics(),
+            ThemeId::ObsidianSmoke,
+            "JetBrains Mono",
+            LinkPaintMode::Normal,
+        );
+        let key_b = row_paint_cache_key(
+            &row,
+            row.terminal_width(),
+            metrics(),
+            ThemeId::ObsidianSmoke,
+            "JetBrains Mono",
+            LinkPaintMode::Normal,
+        );
+
+        assert_eq!(key_a, key_b);
+        assert_eq!(
+            row_content_style_hash(&row, row.terminal_width()),
+            row_content_style_hash(&row, row.terminal_width())
+        );
+    }
+
+    #[test]
+    fn row_cache_key_changes_for_theme_font_and_link_mode_changes() {
+        let row = TerminalRow {
+            cells: "abc"
+                .chars()
+                .map(|ch| TerminalCell {
+                    text: ch.to_string(),
+                    style: TerminalCellStyle::default(),
+                    width: 1,
+                })
+                .collect(),
+        };
+        let base = row_paint_cache_key(
+            &row,
+            row.terminal_width(),
+            metrics(),
+            ThemeId::ObsidianSmoke,
+            "JetBrains Mono",
+            LinkPaintMode::Normal,
+        );
+        let theme_changed = row_paint_cache_key(
+            &row,
+            row.terminal_width(),
+            metrics(),
+            ThemeId::Bone,
+            "JetBrains Mono",
+            LinkPaintMode::Normal,
+        );
+        let font_changed = row_paint_cache_key(
+            &row,
+            row.terminal_width(),
+            metrics(),
+            ThemeId::ObsidianSmoke,
+            "Fira Code",
+            LinkPaintMode::Normal,
+        );
+        let mode_changed = row_paint_cache_key(
+            &row,
+            row.terminal_width(),
+            metrics(),
+            ThemeId::ObsidianSmoke,
+            "JetBrains Mono",
+            LinkPaintMode::Deferred,
+        );
+
+        assert_ne!(base, theme_changed);
+        assert_ne!(base, font_changed);
+        assert_ne!(base, mode_changed);
+    }
+
+    #[test]
+    fn row_cache_lru_eviction_drops_oldest_entry_at_limit() {
+        use std::num::NonZeroUsize;
+        let mut cache = RowPaintCache {
+            entries: lru::LruCache::new(NonZeroUsize::new(2).expect("non-zero")),
+        };
+        let rows = ["row-a", "row-b", "row-c"]
+            .iter()
+            .map(|text| TerminalRow {
+                cells: text
+                    .chars()
+                    .map(|ch| TerminalCell {
+                        text: ch.to_string(),
+                        style: TerminalCellStyle::default(),
+                        width: 1,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let keys = rows
+            .iter()
+            .map(|row| {
+                row_paint_cache_key(
+                    row,
+                    row.terminal_width(),
+                    metrics(),
+                    ThemeId::ObsidianSmoke,
+                    "JetBrains Mono",
+                    LinkPaintMode::Normal,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for key in &keys {
+            row_paint_cache_insert(&mut cache, key.clone(), RowPaintTemplate::default());
+        }
+
+        assert_eq!(cache.entries.len(), 2);
+        assert!(!cache.entries.contains(&keys[0]));
+        assert!(cache.entries.contains(&keys[1]));
+        assert!(cache.entries.contains(&keys[2]));
     }
 
     #[test]

@@ -1,8 +1,10 @@
 // Owns GUI workflow state for secure surfaces, drafts, settings, and vault gating.
 
+use std::path::PathBuf;
+
 use seance_vault::{
-    HostAuthRef, PortForwardMode, UnlockMethod, VaultHostProfile, VaultPasswordCredential,
-    VaultPortForwardProfile,
+    HostAuthRef, PortForwardMode, PrivateKeyAlgorithm, UnlockMethod, VaultHostProfile,
+    VaultPasswordCredential, VaultPortForwardProfile,
 };
 use zeroize::Zeroizing;
 
@@ -532,6 +534,80 @@ impl CredentialDraftState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyImportTab {
+    Discover,
+    Files,
+    Paste,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeyImportCandidateState {
+    pub(crate) path: PathBuf,
+    pub(crate) label: String,
+    pub(crate) algorithm: PrivateKeyAlgorithm,
+    pub(crate) encrypted_at_rest: bool,
+    pub(crate) duplicate_public_key: bool,
+    pub(crate) skip_duplicate: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct KeyImportModalState {
+    pub(crate) open: bool,
+    pub(crate) tab: KeyImportTab,
+    pub(crate) target_vault_id: Option<String>,
+    pub(crate) discover_loading: bool,
+    pub(crate) discover_candidates: Vec<KeyImportCandidateState>,
+    pub(crate) selected_paths: Vec<PathBuf>,
+    pub(crate) paste_label: String,
+    pub(crate) paste_private_key_pem: String,
+    pub(crate) message: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
+impl Default for KeyImportModalState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            tab: KeyImportTab::Discover,
+            target_vault_id: None,
+            discover_loading: false,
+            discover_candidates: Vec::new(),
+            selected_paths: Vec::new(),
+            paste_label: String::new(),
+            paste_private_key_pem: String::new(),
+            message: None,
+            error: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostWizardStep {
+    ConnectionIdentity,
+    AuthenticationSetup,
+    Review,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HostWizardState {
+    pub(crate) open: bool,
+    pub(crate) step: HostWizardStep,
+    pub(crate) save_and_connect_requested: bool,
+    pub(crate) message: Option<String>,
+}
+
+impl Default for HostWizardState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            step: HostWizardStep::ConnectionIdentity,
+            save_and_connect_requested: false,
+            message: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SecureWorkspaceState {
     pub(crate) section: SecureSection,
@@ -546,6 +622,9 @@ pub(crate) struct SecureWorkspaceState {
     pub(crate) host_draft: Option<HostDraftState>,
     pub(crate) tunnel_draft: Option<TunnelDraftState>,
     pub(crate) credential_draft: Option<CredentialDraftState>,
+    pub(crate) key_import_modal: KeyImportModalState,
+    pub(crate) host_wizard: HostWizardState,
+    pub(crate) pending_passphrase_auth_index: Option<usize>,
     pub(crate) message: Option<String>,
     pub(crate) input_target: SecureInputTarget,
 }
@@ -565,6 +644,9 @@ impl Default for SecureWorkspaceState {
             host_draft: None,
             tunnel_draft: None,
             credential_draft: None,
+            key_import_modal: KeyImportModalState::default(),
+            host_wizard: HostWizardState::default(),
+            pending_passphrase_auth_index: None,
             message: None,
             input_target: SecureInputTarget::HostSearch,
         }

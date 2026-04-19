@@ -8,6 +8,7 @@ use seance_terminal::TerminalRow;
 use crate::{
     TERMINAL_SCROLLBAR_GUTTER_WIDTH_PX, TerminalMetrics, TerminalRendererMetrics, TextEditState,
     forms::SettingsSection,
+    frame_pacer::FramePacer,
     model::sidebar_occupied_width_px,
     perf::{PerfOverlayState, UiPerfMode},
     theme::{Theme, ThemeId},
@@ -111,6 +112,7 @@ pub(crate) fn compact_perf_strings(state: &PerfOverlayState) -> Vec<(&'static st
 pub(crate) fn expanded_perf_strings(
     state: &PerfOverlayState,
     renderer: TerminalRendererMetrics,
+    pacer: &FramePacer,
 ) -> Vec<(&'static str, String)> {
     let terminal = state
         .active_session_perf_snapshot
@@ -272,8 +274,15 @@ pub(crate) fn expanded_perf_strings(
         ("rebuilt", renderer.rebuilt_rows.to_string()),
         ("fragments", renderer.fragments.to_string()),
         ("bg quads", renderer.background_quads.to_string()),
+        ("row cache hits", renderer.row_cache_hits.to_string()),
+        ("row cache misses", renderer.row_cache_misses.to_string()),
+        ("link deferred", renderer.link_rows_deferred.to_string()),
         ("shape hits", renderer.shape_hits.to_string()),
         ("shape misses", renderer.shape_misses.to_string()),
+        (
+            "scroll batches",
+            renderer.scroll_batches_dispatched.to_string(),
+        ),
         (
             "width mismatch",
             renderer.width_mismatch_fragments.to_string(),
@@ -295,6 +304,26 @@ pub(crate) fn expanded_perf_strings(
             terminal
                 .map(|metrics| metrics.transcript_dropped_events.to_string())
                 .unwrap_or_else(|| "0".into()),
+        ),
+        (
+            "pacer req/s",
+            format!("{:.0}", pacer.requests_per_second_window()),
+        ),
+        (
+            "pacer flush/s",
+            format!("{:.0}", pacer.flushes_per_second_window()),
+        ),
+        (
+            "pacer defer/s",
+            format!("{:.0}", pacer.defers_per_second_window()),
+        ),
+        (
+            "pacer coalesced",
+            pacer.coalesced_total.to_string(),
+        ),
+        (
+            "pacer target",
+            format!("{:.1} ms", pacer.target_interval.as_secs_f32() * 1_000.0),
         ),
     ]
 }
@@ -1123,7 +1152,8 @@ mod tests {
         state.pending_redraw_reason = RedrawReason::Palette;
         state.frame_stats.redraw_reason = RedrawReason::Palette;
 
-        let rows = expanded_perf_strings(&state, TerminalRendererMetrics::default());
+        let pacer = FramePacer::default();
+        let rows = expanded_perf_strings(&state, TerminalRendererMetrics::default(), &pacer);
         let labels = rows.into_iter().map(|(label, _)| label).collect::<Vec<_>>();
 
         assert!(labels.contains(&"display hz"));
@@ -1140,6 +1170,11 @@ mod tests {
         assert!(labels.contains(&"cells"));
         assert!(labels.contains(&"reason"));
         assert!(labels.contains(&"fragments"));
+        assert!(labels.contains(&"pacer req/s"));
+        assert!(labels.contains(&"pacer flush/s"));
+        assert!(labels.contains(&"pacer defer/s"));
+        assert!(labels.contains(&"pacer coalesced"));
+        assert!(labels.contains(&"pacer target"));
     }
 
     #[test]
@@ -1154,7 +1189,8 @@ mod tests {
             now + Duration::from_millis(20),
         );
 
-        let rows = expanded_perf_strings(&state, TerminalRendererMetrics::default());
+        let pacer = FramePacer::default();
+        let rows = expanded_perf_strings(&state, TerminalRendererMetrics::default(), &pacer);
         let ui_redraw_req = rows
             .into_iter()
             .find(|(label, _)| *label == "ui redraw req")

@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender},
@@ -21,8 +21,10 @@ use seance_terminal::{LocalSessionFactory, TerminalSession};
 use seance_updater::UpdateManager;
 pub use seance_updater::{InstallMode, ReleaseChannel, UpdateInfo, UpdateSettings, UpdateState};
 use seance_vault::{
-    CredentialSummary, GenerateKeyRequest, HostSummary, KeySummary, SecretString, VaultHostProfile,
+    CredentialSummary, GenerateKeyRequest, HostAuthRef, HostAuthSummary, HostSummary,
+    ImportKeyRequest, KeySummary, PrivateKeyAlgorithm, SecretString, VaultHostProfile,
     VaultPasswordCredential, VaultPortForwardProfile, VaultStatus, VaultStore,
+    inspect_private_key_pem,
 };
 use session_logs::SessionLogManager;
 pub use tunnels::VaultScopedPortForwardSummary;
@@ -211,6 +213,44 @@ pub struct VaultScopedKeySummary {
     pub key: KeySummary,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredPrivateKeyCandidate {
+    pub path: PathBuf,
+    pub label: String,
+    pub algorithm: PrivateKeyAlgorithm,
+    pub encrypted_at_rest: bool,
+    pub duplicate_public_key: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportPrivateKeyFromPathRequest {
+    pub path: PathBuf,
+    pub label: Option<String>,
+    pub skip_duplicate: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostReferenceSummary {
+    pub vault_id: String,
+    pub vault_name: String,
+    pub host_id: String,
+    pub host_label: String,
+}
+
+#[derive(Default)]
+struct AuthReferenceIndex {
+    hosts_by_scope: HashMap<(String, String), IndexedHostAuthReferences>,
+    hosts_for_keys: HashMap<(String, String), Vec<HostReferenceSummary>>,
+    hosts_for_credentials: HashMap<(String, String), Vec<HostReferenceSummary>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexedHostAuthReferences {
+    host_reference: HostReferenceSummary,
+    key_ids: Vec<String>,
+    credential_ids: Vec<String>,
+}
+
 struct ManagedVaultState {
     entry: VaultRegistryEntry,
     store: Option<VaultStore>,
@@ -331,6 +371,7 @@ pub struct AppController {
     context: AppContext,
     sessions: SessionRegistry,
     windows: WindowRegistry,
+    auth_reference_index: AuthReferenceIndex,
     lifecycle_policy: LifecyclePolicy,
     config_subscribers: Vec<Sender<AppConfig>>,
     vault_subscribers: Vec<Sender<VaultUiSnapshot>>,
@@ -348,6 +389,7 @@ impl AppControllerHandle {
             context,
             sessions: SessionRegistry::default(),
             windows: WindowRegistry::default(),
+            auth_reference_index: AuthReferenceIndex::default(),
             lifecycle_policy,
             config_subscribers: Vec::new(),
             vault_subscribers: Vec::new(),
@@ -774,6 +816,63 @@ impl AppControllerHandle {
         })
     }
 
+    pub fn import_private_key(
+        &self,
+        vault_id: &str,
+        request: ImportKeyRequest,
+    ) -> Result<VaultScopedKeySummary> {
+        self.with_lock(|controller| {
+            let result = controller.import_private_key(vault_id, request);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
+    }
+
+    pub fn discover_private_key_candidates(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<DiscoveredPrivateKeyCandidate>> {
+        self.with_lock(|controller| controller.discover_private_key_candidates(vault_id))
+    }
+
+    pub fn import_private_keys_from_paths(
+        &self,
+        vault_id: &str,
+        requests: Vec<ImportPrivateKeyFromPathRequest>,
+    ) -> Result<Vec<VaultScopedKeySummary>> {
+        self.with_lock(|controller| {
+            let result = controller.import_private_keys_from_paths(vault_id, requests);
+            if result.is_ok() {
+                controller.publish_vault_update();
+            }
+            result
+        })
+    }
+
+    pub fn host_references_for_key(
+        &self,
+        vault_id: &str,
+        key_id: &str,
+    ) -> Result<Vec<HostReferenceSummary>> {
+        self.with_lock(|controller| controller.host_references_for_key(vault_id, key_id))
+    }
+
+    pub fn host_references_for_credential(
+        &self,
+        vault_id: &str,
+        credential_id: &str,
+    ) -> Result<Vec<HostReferenceSummary>> {
+        self.with_lock(|controller| {
+            controller.host_references_for_credential(vault_id, credential_id)
+        })
+    }
+
+    pub fn load_public_key(&self, vault_id: &str, key_id: &str) -> Result<Option<String>> {
+        self.with_lock(|controller| controller.load_public_key(vault_id, key_id))
+    }
+
     pub fn delete_private_key(&self, vault_id: &str, id: &str) -> Result<bool> {
         self.with_lock(|controller| {
             let result = controller.delete_private_key(vault_id, id);
@@ -895,6 +994,7 @@ impl AppController {
                 self.device_unlock_attempted = true;
             }
         }
+        self.rebuild_all_auth_reference_indexes()?;
         if self.sessions.is_empty() {
             tracing::info!("spawning initial local session during bootstrap");
             let _ = self.spawn_local_session()?;
@@ -1135,6 +1235,7 @@ impl AppController {
                 availability_error: None,
             },
         );
+        self.rebuild_vault_auth_reference_index(&vault_id)?;
         Ok(self
             .context
             .vaults
@@ -1213,6 +1314,7 @@ impl AppController {
             .get_mut(vault_id)
             .ok_or_else(|| anyhow!("vault not found"))?;
         state.store = None;
+        self.remove_vault_auth_reference_index(vault_id);
         self.update_config(|config| {
             config.vaults.open_vault_ids.retain(|id| id != vault_id);
         })?;
@@ -1231,6 +1333,7 @@ impl AppController {
             .unlock_with_passphrase(passphrase, device_name)
             .context("failed to unlock vault")?;
         self.device_unlock_attempted = true;
+        self.rebuild_vault_auth_reference_index(vault_id)?;
         Ok(())
     }
 
@@ -1238,12 +1341,17 @@ impl AppController {
         self.open_vault(vault_id)?;
         self.device_unlock_attempted = true;
         let store = self.store_mut(vault_id)?;
-        Ok(store.try_unlock_with_device()?)
+        let unlocked = store.try_unlock_with_device()?;
+        if unlocked {
+            self.rebuild_vault_auth_reference_index(vault_id)?;
+        }
+        Ok(unlocked)
     }
 
     fn lock_vault(&mut self, vault_id: &str) -> Result<()> {
         let store = self.store_mut(vault_id)?;
         store.lock();
+        self.remove_vault_auth_reference_index(vault_id);
         Ok(())
     }
 
@@ -1262,6 +1370,7 @@ impl AppController {
         }
         let path = vault_db_path(&self.context.paths, &state.entry);
         self.context.vaults.remove(vault_id);
+        self.remove_vault_auth_reference_index(vault_id);
         self.update_config(|config| {
             config.vaults.entries.retain(|entry| entry.id != vault_id);
             config.vaults.open_vault_ids.retain(|id| id != vault_id);
@@ -1328,6 +1437,9 @@ impl AppController {
     ) -> Result<VaultScopedHostSummary> {
         let summary = self.store_mut(vault_id)?.store_host_profile(host)?;
         let vault_name = self.vault_entry(vault_id)?.name.clone();
+        if let Some(saved_host) = self.store(vault_id)?.load_host_profile(&summary.id)? {
+            self.upsert_host_auth_reference(vault_id, &vault_name, saved_host);
+        }
         Ok(VaultScopedHostSummary {
             vault_id: vault_id.to_string(),
             vault_name,
@@ -1336,7 +1448,11 @@ impl AppController {
     }
 
     fn delete_host(&mut self, vault_id: &str, id: &str) -> Result<bool> {
-        Ok(self.store_mut(vault_id)?.delete_host_profile(id)?)
+        let deleted = self.store_mut(vault_id)?.delete_host_profile(id)?;
+        if deleted {
+            self.remove_host_auth_reference(vault_id, id);
+        }
+        Ok(deleted)
     }
 
     fn list_port_forwards(&self) -> Result<Vec<VaultScopedPortForwardSummary>> {
@@ -1525,6 +1641,141 @@ impl AppController {
         })
     }
 
+    fn import_private_key(
+        &mut self,
+        vault_id: &str,
+        request: ImportKeyRequest,
+    ) -> Result<VaultScopedKeySummary> {
+        let summary = self.store_mut(vault_id)?.import_private_key(request)?;
+        let vault_name = self.vault_entry(vault_id)?.name.clone();
+        Ok(VaultScopedKeySummary {
+            vault_id: vault_id.to_string(),
+            vault_name,
+            key: summary,
+        })
+    }
+
+    fn discover_private_key_candidates(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<DiscoveredPrivateKeyCandidate>> {
+        let discovered = discover_private_key_paths()?;
+        self.discover_private_key_candidates_from_paths(vault_id, discovered)
+    }
+
+    fn discover_private_key_candidates_from_paths(
+        &self,
+        vault_id: &str,
+        discovered: Vec<PathBuf>,
+    ) -> Result<Vec<DiscoveredPrivateKeyCandidate>> {
+        let store = self.store(vault_id)?;
+        let known_public_keys = store
+            .list_private_keys()?
+            .into_iter()
+            .filter_map(|key| store.load_private_key(&key.id).ok().flatten())
+            .map(|key| key.public_key_openssh)
+            .collect::<HashSet<_>>();
+
+        let mut candidates = Vec::new();
+        for path in discovered {
+            let Ok(private_key_pem) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(inspection) = inspect_private_key_pem(&private_key_pem) else {
+                continue;
+            };
+            candidates.push(DiscoveredPrivateKeyCandidate {
+                label: key_label_from_path(&path),
+                algorithm: inspection.algorithm,
+                encrypted_at_rest: inspection.encrypted_at_rest,
+                duplicate_public_key: known_public_keys.contains(&inspection.public_key_openssh),
+                path,
+            });
+        }
+        candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(candidates)
+    }
+
+    fn import_private_keys_from_paths(
+        &mut self,
+        vault_id: &str,
+        requests: Vec<ImportPrivateKeyFromPathRequest>,
+    ) -> Result<Vec<VaultScopedKeySummary>> {
+        let vault_name = self.vault_entry(vault_id)?.name.clone();
+        let store = self.store_mut(vault_id)?;
+        let mut known_public_keys = store
+            .list_private_keys()?
+            .into_iter()
+            .filter_map(|key| store.load_private_key(&key.id).ok().flatten())
+            .map(|key| key.public_key_openssh)
+            .collect::<HashSet<_>>();
+        let mut imported = Vec::new();
+
+        for request in requests {
+            let private_key_pem = fs::read_to_string(&request.path).with_context(|| {
+                format!(
+                    "failed reading private key from path '{}'",
+                    request.path.display()
+                )
+            })?;
+            let inspection = inspect_private_key_pem(&private_key_pem)?;
+            let is_duplicate = known_public_keys.contains(&inspection.public_key_openssh);
+            if is_duplicate && request.skip_duplicate {
+                continue;
+            }
+            let label = request
+                .label
+                .unwrap_or_else(|| key_label_from_path(&request.path));
+            let summary = store.import_private_key(ImportKeyRequest {
+                label,
+                private_key_pem,
+            })?;
+            known_public_keys.insert(inspection.public_key_openssh);
+            imported.push(VaultScopedKeySummary {
+                vault_id: vault_id.to_string(),
+                vault_name: vault_name.clone(),
+                key: summary,
+            });
+        }
+
+        Ok(imported)
+    }
+
+    fn host_references_for_key(
+        &self,
+        vault_id: &str,
+        key_id: &str,
+    ) -> Result<Vec<HostReferenceSummary>> {
+        self.ensure_vault_exists(vault_id)?;
+        Ok(self
+            .auth_reference_index
+            .hosts_for_keys
+            .get(&(vault_id.to_string(), key_id.to_string()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn host_references_for_credential(
+        &self,
+        vault_id: &str,
+        credential_id: &str,
+    ) -> Result<Vec<HostReferenceSummary>> {
+        self.ensure_vault_exists(vault_id)?;
+        Ok(self
+            .auth_reference_index
+            .hosts_for_credentials
+            .get(&(vault_id.to_string(), credential_id.to_string()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn load_public_key(&self, vault_id: &str, key_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .store(vault_id)?
+            .load_private_key(key_id)?
+            .map(|key| key.public_key_openssh))
+    }
+
     fn delete_private_key(&mut self, vault_id: &str, id: &str) -> Result<bool> {
         Ok(self.store_mut(vault_id)?.delete_private_key(id)?)
     }
@@ -1539,6 +1790,149 @@ impl AppController {
             .load_port_forward(port_forward_id)?
             .ok_or_else(|| anyhow!("saved port forward not found"))?;
         tunnels::build_port_forward_request(vault, vault_id, port_forward)
+    }
+
+    fn ensure_vault_exists(&self, vault_id: &str) -> Result<()> {
+        if self.context.vaults.contains_key(vault_id) {
+            Ok(())
+        } else {
+            Err(anyhow!("vault not found"))
+        }
+    }
+
+    fn rebuild_all_auth_reference_indexes(&mut self) -> Result<()> {
+        self.auth_reference_index = AuthReferenceIndex::default();
+        let vault_ids = self.context.vaults.keys().cloned().collect::<Vec<_>>();
+        for vault_id in vault_ids {
+            self.rebuild_vault_auth_reference_index(&vault_id)?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_vault_auth_reference_index(&mut self, vault_id: &str) -> Result<()> {
+        self.remove_vault_auth_reference_index(vault_id);
+        let Some(state) = self.context.vaults.get(vault_id) else {
+            return Ok(());
+        };
+        let Some(store) = state.store.as_ref() else {
+            return Ok(());
+        };
+        if !store.status().unlocked {
+            return Ok(());
+        }
+
+        let vault_name = state.entry.name.clone();
+        for host in store.list_host_auth_summaries()? {
+            self.upsert_host_auth_reference_summary(vault_id, &vault_name, host);
+        }
+        Ok(())
+    }
+
+    fn remove_vault_auth_reference_index(&mut self, vault_id: &str) {
+        let host_scopes = self
+            .auth_reference_index
+            .hosts_by_scope
+            .keys()
+            .filter(|(scope_vault_id, _)| scope_vault_id == vault_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for scope in host_scopes {
+            self.remove_host_auth_reference_by_scope(&scope);
+        }
+    }
+
+    fn upsert_host_auth_reference(
+        &mut self,
+        vault_id: &str,
+        vault_name: &str,
+        host: VaultHostProfile,
+    ) {
+        self.upsert_host_auth_reference_summary(vault_id, vault_name, host.auth_summary());
+    }
+
+    fn upsert_host_auth_reference_summary(
+        &mut self,
+        vault_id: &str,
+        vault_name: &str,
+        host: HostAuthSummary,
+    ) {
+        let scope = (vault_id.to_string(), host.host_id.clone());
+        self.remove_host_auth_reference_by_scope(&scope);
+
+        let (key_ids, credential_ids) = collect_host_auth_reference_ids(&host.auth_order);
+        let host_reference = HostReferenceSummary {
+            vault_id: vault_id.to_string(),
+            vault_name: vault_name.to_string(),
+            host_id: host.host_id.clone(),
+            host_label: host.host_label,
+        };
+        let index_entry = IndexedHostAuthReferences {
+            host_reference: host_reference.clone(),
+            key_ids,
+            credential_ids,
+        };
+
+        for key_id in &index_entry.key_ids {
+            let key = (vault_id.to_string(), key_id.clone());
+            let refs = self
+                .auth_reference_index
+                .hosts_for_keys
+                .entry(key)
+                .or_default();
+            refs.push(host_reference.clone());
+            sort_host_references(refs);
+        }
+
+        for credential_id in &index_entry.credential_ids {
+            let key = (vault_id.to_string(), credential_id.clone());
+            let refs = self
+                .auth_reference_index
+                .hosts_for_credentials
+                .entry(key)
+                .or_default();
+            refs.push(host_reference.clone());
+            sort_host_references(refs);
+        }
+
+        self.auth_reference_index
+            .hosts_by_scope
+            .insert(scope, index_entry);
+    }
+
+    fn remove_host_auth_reference(&mut self, vault_id: &str, host_id: &str) {
+        self.remove_host_auth_reference_by_scope(&(vault_id.to_string(), host_id.to_string()));
+    }
+
+    fn remove_host_auth_reference_by_scope(&mut self, scope: &(String, String)) {
+        let Some(index_entry) = self.auth_reference_index.hosts_by_scope.remove(scope) else {
+            return;
+        };
+
+        for key_id in index_entry.key_ids {
+            let key_scope = (scope.0.clone(), key_id);
+            if let Some(hosts) = self.auth_reference_index.hosts_for_keys.get_mut(&key_scope) {
+                hosts.retain(|host| host.host_id != scope.1);
+                if hosts.is_empty() {
+                    self.auth_reference_index.hosts_for_keys.remove(&key_scope);
+                }
+            }
+        }
+
+        for credential_id in index_entry.credential_ids {
+            let credential_scope = (scope.0.clone(), credential_id);
+            if let Some(hosts) = self
+                .auth_reference_index
+                .hosts_for_credentials
+                .get_mut(&credential_scope)
+            {
+                hosts.retain(|host| host.host_id != scope.1);
+                if hosts.is_empty() {
+                    self.auth_reference_index
+                        .hosts_for_credentials
+                        .remove(&credential_scope);
+                }
+            }
+        }
     }
 
     fn default_target_vault_id_for_actions(&self) -> Option<String> {
@@ -1594,6 +1988,90 @@ impl AppController {
             .and_then(|state| state.store.as_mut())
             .ok_or_else(|| anyhow!("vault is not open"))
     }
+}
+
+fn sort_host_references(hosts: &mut [HostReferenceSummary]) {
+    hosts.sort_by(|left, right| {
+        left.host_label
+            .to_lowercase()
+            .cmp(&right.host_label.to_lowercase())
+            .then_with(|| left.host_id.cmp(&right.host_id))
+    });
+}
+
+fn collect_host_auth_reference_ids(auth_order: &[HostAuthRef]) -> (Vec<String>, Vec<String>) {
+    let mut key_ids = HashSet::new();
+    let mut credential_ids = HashSet::new();
+    for auth in auth_order {
+        match auth {
+            HostAuthRef::Password { credential_id } => {
+                credential_ids.insert(credential_id.clone());
+            }
+            HostAuthRef::PrivateKey {
+                key_id,
+                passphrase_credential_id,
+            } => {
+                key_ids.insert(key_id.clone());
+                if let Some(credential_id) = passphrase_credential_id.as_ref() {
+                    credential_ids.insert(credential_id.clone());
+                }
+            }
+        }
+    }
+    let mut key_ids = key_ids.into_iter().collect::<Vec<_>>();
+    key_ids.sort();
+    let mut credential_ids = credential_ids.into_iter().collect::<Vec<_>>();
+    credential_ids.sort();
+    (key_ids, credential_ids)
+}
+
+fn key_label_from_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or("imported-key")
+        .to_string()
+}
+
+fn discover_private_key_paths() -> Result<Vec<PathBuf>> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(Vec::new());
+    };
+    let ssh_dir = home.join(".ssh");
+    discover_private_key_paths_in_dir(&ssh_dir)
+}
+
+fn discover_private_key_paths_in_dir(ssh_dir: &Path) -> Result<Vec<PathBuf>> {
+    if !ssh_dir.exists() || !ssh_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = Vec::new();
+    for entry in
+        fs::read_dir(&ssh_dir).with_context(|| format!("failed reading '{}'", ssh_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let file_name_lower = file_name.to_lowercase();
+        if file_name_lower.ends_with(".pub")
+            || matches!(
+                file_name_lower.as_str(),
+                "known_hosts" | "known_hosts.old" | "config" | "authorized_keys"
+            )
+        {
+            continue;
+        }
+        paths.push(path);
+    }
+
+    paths.sort();
+    Ok(paths)
 }
 
 impl ManagedVaultState {
@@ -1710,6 +2188,7 @@ fn update_settings_from_config(config: &AppConfig) -> UpdateSettings {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         sync::{Arc, mpsc},
         thread,
         time::{Duration, Instant},
@@ -1719,11 +2198,12 @@ mod tests {
     use seance_terminal::{
         SessionPerfSnapshot, SessionSummary, TerminalGeometry, TerminalKeyEvent,
         TerminalMouseEvent, TerminalPaste, TerminalScrollCommand, TerminalSession,
-        TerminalViewportSnapshot,
+        TerminalTextEvent, TerminalViewportSnapshot,
     };
     use seance_vault::{
-        GenerateKeyAlgorithm, GenerateKeyRequest, HostAuthRef, PortForwardMode, SecretString,
-        VaultHostProfile, VaultPasswordCredential, VaultPortForwardProfile,
+        GenerateKeyAlgorithm, GenerateKeyRequest, HostAuthRef, ImportKeyRequest, PortForwardMode,
+        SecretString, VaultHostProfile, VaultPasswordCredential, VaultPortForwardProfile,
+        VaultStore,
     };
     use tempfile::tempdir;
 
@@ -1748,6 +2228,9 @@ mod tests {
             TerminalViewportSnapshot::default()
         }
         fn send_input(&self, _bytes: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+        fn send_text(&self, _event: TerminalTextEvent) -> Result<()> {
             Ok(())
         }
         fn send_key(&self, _event: TerminalKeyEvent) -> Result<()> {

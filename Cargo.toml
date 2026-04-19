@@ -4,6 +4,7 @@ members = [
     "crates/seance-build",
     "crates/seance-core",
     "crates/seance-config",
+    "crates/seance-observability",
     "crates/seance-platform",
     "crates/seance-platform-linux",
     "crates/seance-platform-macos",

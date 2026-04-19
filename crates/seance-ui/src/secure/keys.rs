@@ -1,26 +1,20 @@
 // SSH key list + detail rendering for the secure workspace.
 
-use gpui::{Context, Div, FontWeight, MouseButton, div, prelude::*, px};
+use gpui::{Context, Div, FontWeight, MouseButton, div, prelude::*, px, uniform_list};
 
 use seance_vault::{PrivateKeyAlgorithm, PrivateKeySource};
 
 use crate::{
     SeanceWorkspace,
     forms::SecureInputTarget,
-    ui_components::{danger_button, empty_state, status_badge},
+    ui_components::{danger_button, empty_state, settings_action_chip, status_badge},
     workspace::{item_scope_key, split_scope_key},
 };
 
 impl SeanceWorkspace {
     pub(crate) fn render_key_list_content(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
-        let keys: Vec<_> = self
-            .cached_keys
-            .iter()
-            .filter(|key| self.key_matches_query(key))
-            .collect();
-
-        if keys.is_empty() {
+        if self.secure_filtered_key_indices.is_empty() {
             return empty_state(
                 "⚿",
                 "No SSH keys yet",
@@ -29,31 +23,50 @@ impl SeanceWorkspace {
             );
         }
 
-        let mut rows = div().flex().flex_col().gap(px(6.0));
-        for key in keys {
-            let key_scope_key = item_scope_key(&key.vault_id, &key.key.id);
-            let selected = self.secure.selected_key_id.as_deref() == Some(key_scope_key.as_str());
-            let algo_label = match key.key.algorithm {
-                PrivateKeyAlgorithm::Ed25519 => "ed25519",
-                PrivateKeyAlgorithm::Rsa { .. } => "rsa",
-            };
-            rows = rows.child(
-                self.render_list_row(
-                    &key.key.label,
-                    &format!("{}  [{}]", algo_label, key.vault_name),
-                    selected,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.secure.selected_key_id = Some(key_scope_key.clone());
-                        this.focus_secure_input_target(SecureInputTarget::KeySearch);
-                        cx.notify();
-                    }),
-                ),
-            );
-        }
-        rows
+        div().relative().size_full().child(
+            uniform_list(
+                "secure-key-list",
+                self.secure_filtered_key_indices.len(),
+                cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                    let mut rows: Vec<Div> =
+                        Vec::with_capacity(range.end.saturating_sub(range.start));
+                    for visible_index in range {
+                        let Some(key_index) = this.secure_filtered_key_indices.get(visible_index)
+                        else {
+                            continue;
+                        };
+                        let Some(key) = this.cached_keys.get(*key_index) else {
+                            continue;
+                        };
+                        let key_scope_key = item_scope_key(&key.vault_id, &key.key.id);
+                        let selected =
+                            this.secure.selected_key_id.as_deref() == Some(key_scope_key.as_str());
+                        let algo_label = match key.key.algorithm {
+                            PrivateKeyAlgorithm::Ed25519 => "ed25519",
+                            PrivateKeyAlgorithm::Rsa { .. } => "rsa",
+                        };
+                        rows.push(
+                            this.render_list_row(
+                                &key.key.label,
+                                &format!("{}  [{}]", algo_label, key.vault_name),
+                                selected,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.secure.selected_key_id = Some(key_scope_key.clone());
+                                    this.focus_secure_input_target(SecureInputTarget::KeySearch);
+                                    cx.notify();
+                                }),
+                            ),
+                        );
+                    }
+                    rows
+                }),
+            )
+            .size_full()
+            .track_scroll(self.secure_key_list_scroll_handle.clone()),
+        )
     }
 
     pub(crate) fn render_keys_detail(&self, cx: &mut Context<Self>) -> Div {
@@ -158,6 +171,8 @@ impl SeanceWorkspace {
                 } else {
                     let mut list = div().flex().flex_col().gap(px(4.0));
                     for href in &host_refs {
+                        let host_scope_key = item_scope_key(&href.vault_id, &href.host_id);
+                        let host_scope_key_for_chip = host_scope_key.clone();
                         list = list.child(
                             div()
                                 .flex()
@@ -168,8 +183,22 @@ impl SeanceWorkspace {
                                     div()
                                         .text_sm()
                                         .text_color(t.text_secondary)
-                                        .child(href.label.clone()),
-                                ),
+                                        .cursor_pointer()
+                                        .hover(|s| s.text_color(t.text_primary))
+                                        .child(format!("{} [{}]", href.host_label, href.vault_name))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.begin_edit_host(&host_scope_key, cx);
+                                            }),
+                                        ),
+                                )
+                                .child(settings_action_chip("edit host", &t).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.begin_edit_host(&host_scope_key_for_chip, cx);
+                                    }),
+                                )),
                         );
                     }
                     list
@@ -178,13 +207,45 @@ impl SeanceWorkspace {
 
         // Footer
         let key_scope = item_scope_key(vault_id, key_id);
+        let vault_id = vault_id.to_string();
+        let key_id = key_id.to_string();
+        let vault_id_copy = vault_id.clone();
+        let key_id_copy = key_id.clone();
+        let key_encrypted = key.encrypted_at_rest;
         let footer = div()
             .flex()
-            .justify_end()
+            .justify_between()
             .items_center()
             .pt_3()
             .border_t_1()
             .border_color(t.glass_border)
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .child(settings_action_chip("attach to host", &t).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.attach_key_to_host(&vault_id, &key_id, key_encrypted, cx);
+                        }),
+                    ))
+                    .child(settings_action_chip("copy public key", &t).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            match this.backend.load_public_key(&vault_id_copy, &key_id_copy) {
+                                Ok(Some(public_key)) => {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        public_key,
+                                    ));
+                                    this.show_toast("Public key copied.");
+                                }
+                                Ok(None) => this.show_toast("Key no longer exists."),
+                                Err(err) => this.show_toast(err.to_string()),
+                            }
+                            cx.notify();
+                        }),
+                    )),
+            )
             .child(danger_button("delete key", &t).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {

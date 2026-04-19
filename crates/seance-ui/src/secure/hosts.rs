@@ -1,11 +1,11 @@
 // Host list + detail rendering for the secure workspace.
 
-use gpui::{Context, Div, FontWeight, MouseButton, div, prelude::*, px};
+use gpui::{Context, Div, FontWeight, MouseButton, div, prelude::*, px, uniform_list};
 use seance_vault::{HostAuthRef, PrivateKeyAlgorithm};
 
 use crate::{
     SeanceWorkspace,
-    forms::{HostDraftField, PendingAction, SecureInputTarget},
+    forms::{HostDraftField, KeyImportTab, PendingAction, SecureInputTarget},
     ui_components::{editor_field_card, primary_button, settings_action_chip, status_badge},
     workspace::item_scope_key,
 };
@@ -13,14 +13,7 @@ use crate::{
 impl SeanceWorkspace {
     pub(crate) fn render_host_list_content(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme();
-        let mut rows = div().flex().flex_col().gap(px(6.0));
-        let hosts: Vec<_> = self
-            .saved_hosts
-            .iter()
-            .filter(|host| self.host_matches_query(host))
-            .collect();
-
-        if hosts.is_empty() {
+        if self.secure_filtered_host_indices.is_empty() {
             return crate::ui_components::empty_state(
                 "⌂",
                 "No hosts yet",
@@ -29,30 +22,52 @@ impl SeanceWorkspace {
             );
         }
 
-        for host in hosts {
-            let host_scope_key = item_scope_key(&host.vault_id, &host.host.id);
-            let selected = self.secure.host_draft.as_ref().is_some_and(|draft| {
-                draft.host_id.as_deref() == Some(host.host.id.as_str())
-                    && draft.vault_id.as_deref() == Some(host.vault_id.as_str())
-            });
-            rows = rows.child(
-                self.render_list_row(
-                    &host.host.label,
-                    &format!(
-                        "{}@{}:{}  [{}]",
-                        host.host.username, host.host.hostname, host.host.port, host.vault_name
-                    ),
-                    selected,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.begin_edit_host(&host_scope_key, cx);
-                    }),
-                ),
-            );
-        }
-        rows
+        div().relative().size_full().child(
+            uniform_list(
+                "secure-host-list",
+                self.secure_filtered_host_indices.len(),
+                cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                    let mut rows: Vec<Div> =
+                        Vec::with_capacity(range.end.saturating_sub(range.start));
+                    for visible_index in range {
+                        let Some(host_index) = this.secure_filtered_host_indices.get(visible_index)
+                        else {
+                            continue;
+                        };
+                        let Some(host) = this.saved_hosts.get(*host_index) else {
+                            continue;
+                        };
+                        let host_scope_key = item_scope_key(&host.vault_id, &host.host.id);
+                        let selected = this.secure.host_draft.as_ref().is_some_and(|draft| {
+                            draft.host_id.as_deref() == Some(host.host.id.as_str())
+                                && draft.vault_id.as_deref() == Some(host.vault_id.as_str())
+                        });
+                        rows.push(
+                            this.render_list_row(
+                                &host.host.label,
+                                &format!(
+                                    "{}@{}:{}  [{}]",
+                                    host.host.username,
+                                    host.host.hostname,
+                                    host.host.port,
+                                    host.vault_name
+                                ),
+                                selected,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.begin_edit_host(&host_scope_key, cx);
+                                }),
+                            ),
+                        );
+                    }
+                    rows
+                }),
+            )
+            .size_full()
+            .track_scroll(self.secure_host_list_scroll_handle.clone()),
+        )
     }
 
     pub(crate) fn render_hosts_detail(&self, cx: &mut Context<Self>) -> Div {
@@ -110,6 +125,9 @@ impl SeanceWorkspace {
 
         if let Some(error) = draft.error.as_ref() {
             content = content.child(self.render_banner(error, true));
+        }
+        if self.secure.host_wizard.open {
+            content = content.child(self.render_host_wizard_stepper(cx));
         }
 
         let make_field = |field: HostDraftField, value: String, cx: &mut Context<Self>| {
@@ -461,45 +479,113 @@ impl SeanceWorkspace {
                 cx.listener(|this, _, _, cx| {
                     this.generate_rsa_key_for_secure(cx);
                 }),
+            ))
+            .child(settings_action_chip("+ import key", &t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.open_key_import_modal(KeyImportTab::Files, cx);
+                }),
+            ))
+            .child(settings_action_chip("+ discover ~/.ssh", &t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.open_key_import_modal(KeyImportTab::Discover, cx);
+                }),
             ));
 
         // Available methods
-        let mut available = div().flex().flex_col().gap(px(6.0));
-        for credential in &available_credentials {
-            let credential_id = credential.credential.id.clone();
-            available = available.child(
-                self.render_list_row(
-                    &credential.credential.label,
-                    credential
-                        .credential
-                        .username_hint
-                        .as_deref()
-                        .unwrap_or("password"),
-                    false,
+        let available_count = available_credentials.len() + available_keys.len();
+        let available = if available_count == 0 {
+            div()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(t.glass_border)
+                .bg(t.glass_tint)
+                .text_sm()
+                .text_color(t.text_ghost)
+                .child("No credentials or keys in this vault yet.")
+        } else {
+            div()
+                .min_h(px(160.0))
+                .max_h(px(260.0))
+                .overflow_hidden()
+                .child(
+                    uniform_list(
+                        "secure-auth-available-list",
+                        available_count,
+                        cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                            let mut rows: Vec<Div> =
+                                Vec::with_capacity(range.end.saturating_sub(range.start));
+                            let draft_vault_id = this
+                                .secure
+                                .host_draft
+                                .as_ref()
+                                .and_then(|draft| draft.vault_id.as_deref());
+                            let available_credentials = this
+                                .cached_credentials
+                                .iter()
+                                .filter(|item| Some(item.vault_id.as_str()) == draft_vault_id)
+                                .collect::<Vec<_>>();
+                            let available_keys = this
+                                .cached_keys
+                                .iter()
+                                .filter(|item| Some(item.vault_id.as_str()) == draft_vault_id)
+                                .collect::<Vec<_>>();
+
+                            for visible_index in range {
+                                if visible_index < available_credentials.len() {
+                                    let credential = available_credentials[visible_index];
+                                    let credential_id = credential.credential.id.clone();
+                                    rows.push(
+                                        this.render_list_row(
+                                            &credential.credential.label,
+                                            credential
+                                                .credential
+                                                .username_hint
+                                                .as_deref()
+                                                .unwrap_or("password"),
+                                            false,
+                                        )
+                                        .child(
+                                            settings_action_chip("add ⊙", &this.theme())
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.add_auth_password(&credential_id, cx);
+                                                    }),
+                                                ),
+                                        ),
+                                    );
+                                    continue;
+                                }
+
+                                let key_index =
+                                    visible_index.saturating_sub(available_credentials.len());
+                                let Some(key) = available_keys.get(key_index) else {
+                                    continue;
+                                };
+                                let key_id = key.key.id.clone();
+                                let algo = match key.key.algorithm {
+                                    PrivateKeyAlgorithm::Ed25519 => "ed25519",
+                                    PrivateKeyAlgorithm::Rsa { .. } => "rsa",
+                                };
+                                rows.push(this.render_list_row(&key.key.label, algo, false).child(
+                                    settings_action_chip("add ⚿", &this.theme()).on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.add_auth_key(&key_id, cx);
+                                        }),
+                                    ),
+                                ));
+                            }
+                            rows
+                        }),
+                    )
+                    .size_full()
+                    .track_scroll(self.secure_auth_available_scroll_handle.clone()),
                 )
-                .child(settings_action_chip("add ⊙", &t).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.add_auth_password(&credential_id, cx);
-                    }),
-                )),
-            );
-        }
-        for key in &available_keys {
-            let key_id = key.key.id.clone();
-            let algo = match key.key.algorithm {
-                PrivateKeyAlgorithm::Ed25519 => "ed25519",
-                PrivateKeyAlgorithm::Rsa { .. } => "rsa",
-            };
-            available = available.child(self.render_list_row(&key.key.label, algo, false).child(
-                settings_action_chip("add ⚿", &t).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.add_auth_key(&key_id, cx);
-                    }),
-                ),
-            ));
-        }
+        };
 
         div()
             .flex()

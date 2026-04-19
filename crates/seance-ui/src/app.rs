@@ -589,6 +589,16 @@ fn open_workspace_window(
                     palette_query: String::new(),
                     palette_selected: 0,
                     palette_scroll_handle: gpui::ScrollHandle::new(),
+                    secure_host_list_scroll_handle: gpui::UniformListScrollHandle::new(),
+                    secure_credential_list_scroll_handle: gpui::UniformListScrollHandle::new(),
+                    secure_key_list_scroll_handle: gpui::UniformListScrollHandle::new(),
+                    secure_auth_available_scroll_handle: gpui::UniformListScrollHandle::new(),
+                    secure_filtered_host_indices: Vec::new(),
+                    secure_filtered_credential_indices: Vec::new(),
+                    secure_filtered_key_indices: Vec::new(),
+                    secure_host_search_blobs: Vec::new(),
+                    secure_credential_search_blobs: Vec::new(),
+                    secure_key_search_blobs: Vec::new(),
                     palette_text_input: crate::TextEditState::default(),
                     secure_text_input: crate::TextEditState::default(),
                     secure_text_target: None,
@@ -610,9 +620,10 @@ fn open_workspace_window(
                     terminal_selection: None,
                     terminal_drag_anchor: None,
                     terminal_hovered_link: None,
-                    terminal_scroll_remainder_rows: 0.0,
+                    terminal_scroll: crate::model::ScrollFrameAccumulator::default(),
                     terminal_scrollbar_hovered: false,
                     terminal_scrollbar_drag: None,
+                    frame_pacer: crate::FramePacer::default(),
                     toast: None,
                 };
                 cx.observe_window_bounds(window, |this: &mut SeanceWorkspace, window, cx| {
@@ -620,6 +631,7 @@ fn open_workspace_window(
                 })
                 .detach();
                 ws.apply_active_terminal_geometry(window);
+                ws.rebuild_secure_search_cache();
                 install_workspace_watchers(window, cx, &entity, &mut ws, &backend);
                 if let Some(initial_action) = initial_action.as_ref() {
                     ws.apply_initial_action(initial_action.clone(), window, cx);
@@ -696,8 +708,8 @@ mod tests {
 
     use anyhow::Result;
     use gpui::{
-        App, AppContext as GpuiAppContext, Entity, TestAppContext, VisualTestContext, Window,
-        point, px, size,
+        App, AppContext as GpuiAppContext, Entity, KeyDownEvent, Keystroke, Modifiers,
+        TestAppContext, VisualTestContext, Window, point, px, size,
     };
     use seance_config::PerfHudDefault;
     use seance_core::{AppContext, AppPaths, SessionOrigin};
@@ -1041,6 +1053,17 @@ mod tests {
                     .set_offset(point(px(0.0), px(96.0)));
             },
         );
+    }
+
+    fn key_event(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers,
+                key: key.into(),
+                key_char: key_char.map(ToOwned::to_owned),
+            },
+            is_held: false,
+        }
     }
 
     fn expected_geometry(
@@ -1460,6 +1483,98 @@ mod tests {
                 assert!(!this.palette_open);
                 assert!(this.vault_modal.is_visible());
                 assert!(this.secure.host_draft.is_none());
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn vault_modal_handle_key_down_mutates_create_name_field(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.open_vault_modal(
+                    crate::forms::UnlockMode::Create,
+                    crate::forms::VaultModalOrigin::UserAction,
+                    "Create a named encrypted vault.".into(),
+                    cx,
+                );
+                this.vault_modal.vault_name.clear();
+                this.sync_vault_modal_text_input();
+
+                let key = key_event("a", Some("a"), Modifiers::default());
+                this.handle_key_down(&key, window, cx);
+
+                assert_eq!(this.vault_modal.vault_name.as_str(), "a");
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn vault_modal_tab_cycles_fields_in_create_mode(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.open_vault_modal(
+                    crate::forms::UnlockMode::Create,
+                    crate::forms::VaultModalOrigin::UserAction,
+                    "Create a named encrypted vault.".into(),
+                    cx,
+                );
+                assert_eq!(this.vault_modal.selected_field, 0);
+
+                let tab = key_event("tab", None, Modifiers::default());
+                this.handle_key_down(&tab, window, cx);
+                assert_eq!(this.vault_modal.selected_field, 1);
+                this.handle_key_down(&tab, window, cx);
+                assert_eq!(this.vault_modal.selected_field, 2);
+                this.handle_key_down(&tab, window, cx);
+                assert_eq!(this.vault_modal.selected_field, 0);
+            },
+        );
+
+        close_window(&mut visual);
+    }
+
+    #[gpui::test]
+    fn confirm_dialog_handle_key_down_processes_enter_and_escape(cx: &mut TestAppContext) {
+        let controller = make_test_controller();
+        let (workspace, mut visual) = open_workspace_with_controller(cx, controller);
+
+        workspace.update_in(
+            &mut visual,
+            |this: &mut SeanceWorkspace, window: &mut Window, cx| {
+                this.surface = WorkspaceSurface::Secure;
+                this.secure.section = crate::forms::SecureSection::Hosts;
+                this.confirm_dialog = Some(crate::forms::ConfirmDialogState::discard_changes(
+                    crate::forms::PendingAction::SwitchSecureSection(
+                        crate::forms::SecureSection::Keys,
+                    ),
+                ));
+
+                let enter = key_event("enter", None, Modifiers::default());
+                this.handle_key_down(&enter, window, cx);
+                assert!(this.confirm_dialog.is_none());
+                assert_eq!(this.secure.section, crate::forms::SecureSection::Keys);
+
+                this.confirm_dialog = Some(crate::forms::ConfirmDialogState::discard_changes(
+                    crate::forms::PendingAction::SwitchSecureSection(
+                        crate::forms::SecureSection::Tunnels,
+                    ),
+                ));
+                let escape = key_event("escape", None, Modifiers::default());
+                this.handle_key_down(&escape, window, cx);
+                assert!(this.confirm_dialog.is_none());
+                assert_eq!(this.secure.section, crate::forms::SecureSection::Keys);
             },
         );
 
