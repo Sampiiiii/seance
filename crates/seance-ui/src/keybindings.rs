@@ -6,18 +6,18 @@ use gpui::{Action, App, KeyBinding, KeyContext, Window};
 use seance_config::{
     AppConfig, COMMAND_APP_HIDE, COMMAND_APP_OPEN_COMMAND_PALETTE, COMMAND_APP_OPEN_PREFERENCES,
     COMMAND_APP_QUIT, COMMAND_DEBUG_TOGGLE_PERF_HUD, COMMAND_SESSION_CLOSE_ACTIVE,
-    COMMAND_SESSION_NEW_LOCAL, COMMAND_SESSION_SELECT_NEXT, COMMAND_SESSION_SELECT_PREVIOUS,
-    COMMAND_SESSION_SELECT_SLOT_1, COMMAND_SESSION_SELECT_SLOT_2, COMMAND_SESSION_SELECT_SLOT_3,
-    COMMAND_SESSION_SELECT_SLOT_4, COMMAND_SESSION_SELECT_SLOT_5, COMMAND_SESSION_SELECT_SLOT_6,
-    COMMAND_SESSION_SELECT_SLOT_7, COMMAND_SESSION_SELECT_SLOT_8, COMMAND_SESSION_SELECT_SLOT_9,
-    COMMAND_SESSION_SELECT_SLOT_10, COMMAND_WINDOW_NEW, KeybindingContext,
-    normalize_chord_for_platform,
+    COMMAND_SESSION_COPY_PREVIOUS_TURN, COMMAND_SESSION_NEW_LOCAL, COMMAND_SESSION_SELECT_NEXT,
+    COMMAND_SESSION_SELECT_PREVIOUS, COMMAND_SESSION_SELECT_SLOT_1, COMMAND_SESSION_SELECT_SLOT_2,
+    COMMAND_SESSION_SELECT_SLOT_3, COMMAND_SESSION_SELECT_SLOT_4, COMMAND_SESSION_SELECT_SLOT_5,
+    COMMAND_SESSION_SELECT_SLOT_6, COMMAND_SESSION_SELECT_SLOT_7, COMMAND_SESSION_SELECT_SLOT_8,
+    COMMAND_SESSION_SELECT_SLOT_9, COMMAND_SESSION_SELECT_SLOT_10, COMMAND_WINDOW_NEW,
+    KeybindingContext, normalize_chord_for_platform,
 };
 
 use crate::{
-    CloseActiveSession, HideSeance, NewTerminal, OpenCommandPalette, OpenNewWindow,
-    OpenPreferences, QuitSeance, SelectNextSession, SelectPreviousSession, SelectSessionSlot,
-    TogglePerfHud,
+    CloseActiveSession, CopyPreviousTurn, HideSeance, NewTerminal, OpenCommandPalette,
+    OpenNewWindow, OpenPreferences, QuitSeance, SelectNextSession, SelectPreviousSession,
+    SelectSessionSlot, TogglePerfHud,
 };
 
 const CONTEXT_WORKSPACE_TERMINAL: &str = "WorkspaceTerminal";
@@ -94,6 +94,17 @@ const BUILTIN_KEYBINDINGS: &[BuiltinKeybinding] = &[
         command: COMMAND_SESSION_CLOSE_ACTIVE,
         context: KeybindingContext::AppGlobal,
         default_chord: "primary-w",
+    },
+    BuiltinKeybinding {
+        id: COMMAND_SESSION_COPY_PREVIOUS_TURN,
+        label: "Copy Previous Turn",
+        command: COMMAND_SESSION_COPY_PREVIOUS_TURN,
+        context: KeybindingContext::WorkspaceTerminal,
+        default_chord: if cfg!(target_os = "macos") {
+            "cmd-shift-c"
+        } else {
+            "ctrl-shift-alt-c"
+        },
     },
     BuiltinKeybinding {
         id: COMMAND_DEBUG_TOGGLE_PERF_HUD,
@@ -419,6 +430,9 @@ fn build_binding_for_command(
             CloseActiveSession,
             context_name,
         )),
+        COMMAND_SESSION_COPY_PREVIOUS_TURN => {
+            Some(KeyBinding::new(&normalized, CopyPreviousTurn, context_name))
+        }
         COMMAND_DEBUG_TOGGLE_PERF_HUD => {
             Some(KeyBinding::new(&normalized, TogglePerfHud, context_name))
         }
@@ -495,6 +509,7 @@ fn action_for_command(command: &str) -> Option<Box<dyn Action>> {
         COMMAND_APP_OPEN_COMMAND_PALETTE => Some(Box::new(OpenCommandPalette)),
         COMMAND_SESSION_NEW_LOCAL => Some(Box::new(NewTerminal)),
         COMMAND_SESSION_CLOSE_ACTIVE => Some(Box::new(CloseActiveSession)),
+        COMMAND_SESSION_COPY_PREVIOUS_TURN => Some(Box::new(CopyPreviousTurn)),
         COMMAND_DEBUG_TOGGLE_PERF_HUD => Some(Box::new(TogglePerfHud)),
         COMMAND_WINDOW_NEW => Some(Box::new(OpenNewWindow)),
         COMMAND_APP_QUIT => Some(Box::new(QuitSeance)),

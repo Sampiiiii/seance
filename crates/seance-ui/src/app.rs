@@ -15,10 +15,10 @@ use seance_terminal::TerminalGeometry;
 use tracing::trace;
 
 use crate::{
-    CheckForUpdates, CloseActiveSession, ConnectHost, ConnectHostInNewWindow, HideOtherApps,
-    HideSeance, NewTerminal, OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance,
-    SeanceWorkspace, SelectNextSession, SelectPreviousSession, SelectSession, SelectSessionSlot,
-    SettingsSection, ShowAllApps, SwitchTheme, TogglePerfHud,
+    CheckForUpdates, CloseActiveSession, ConnectHost, ConnectHostInNewWindow, CopyPreviousTurn,
+    HideOtherApps, HideSeance, NewTerminal, OpenCommandPalette, OpenNewWindow, OpenPreferences,
+    QuitSeance, SeanceWorkspace, SelectNextSession, SelectPreviousSession, SelectPreviousTurn,
+    SelectSession, SelectSessionSlot, SettingsSection, ShowAllApps, SwitchTheme, TogglePerfHud,
     backend::UiBackend,
     connect::ConnectAttemptTracker,
     forms::{SecureWorkspaceState, SettingsPanelState, VaultModalState, WorkspaceSurface},
@@ -356,6 +356,23 @@ fn register_app_actions(cx: &mut App, backend: UiBackend) {
         }
     });
 
+    cx.on_action(move |_: &CopyPreviousTurn, cx| {
+        let handled = with_registered_workspace(cx, |this, _window, cx| {
+            this.copy_previous_turn_to_clipboard(cx)
+        });
+        if handled {
+            refresh_app_menus(cx);
+        }
+    });
+
+    cx.on_action(move |_: &SelectPreviousTurn, cx| {
+        let handled =
+            with_registered_workspace(cx, |this, _window, cx| this.select_previous_turn(cx));
+        if handled {
+            refresh_app_menus(cx);
+        }
+    });
+
     cx.on_action(move |_: &SelectPreviousSession, cx| {
         let handled = with_registered_workspace(cx, |this, window, cx| {
             this.select_previous_session(window, cx)
@@ -618,7 +635,10 @@ fn open_workspace_window(
                     sidebar_width: crate::model::DEFAULT_SIDEBAR_WIDTH,
                     sidebar_resizing: false,
                     terminal_selection: None,
+                    terminal_turn_selection: None,
                     terminal_drag_anchor: None,
+                    terminal_drag_auto_scroll: None,
+                    terminal_drag_auto_scroll_epoch: 0,
                     terminal_hovered_link: None,
                     terminal_scroll: crate::model::ScrollFrameAccumulator::default(),
                     terminal_scrollbar_hovered: false,

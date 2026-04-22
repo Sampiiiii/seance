@@ -1,6 +1,6 @@
 use std::{collections::HashMap, ops::Range, sync::Arc, time::Instant};
 
-use gpui::{FocusHandle, ScrollHandle, UniformListScrollHandle};
+use gpui::{FocusHandle, Pixels, Point, ScrollHandle, UniformListScrollHandle};
 use seance_config::AppConfig;
 use seance_core::{
     ManagedVaultSummary, SessionKind, UpdateState, VaultScopedCredentialSummary,
@@ -82,7 +82,10 @@ pub(crate) struct SeanceWorkspace {
     pub(crate) sidebar_width: f32,
     pub(crate) sidebar_resizing: bool,
     pub(crate) terminal_selection: Option<TerminalSelection>,
+    pub(crate) terminal_turn_selection: Option<TerminalTurnSelection>,
     pub(crate) terminal_drag_anchor: Option<TerminalSelectionPoint>,
+    pub(crate) terminal_drag_auto_scroll: Option<TerminalDragAutoScrollState>,
+    pub(crate) terminal_drag_auto_scroll_epoch: u64,
     pub(crate) terminal_hovered_link: Option<TerminalHoveredLink>,
     pub(crate) terminal_scroll: ScrollFrameAccumulator,
     pub(crate) terminal_scrollbar_hovered: bool,
@@ -124,7 +127,7 @@ pub(crate) struct ToastState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalSelectionPoint {
-    pub(crate) row: usize,
+    pub(crate) row: u64,
     pub(crate) col: usize,
 }
 
@@ -135,8 +138,31 @@ pub(crate) struct TerminalSelection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalTurnSelection {
+    pub(crate) turn_id: u64,
+    pub(crate) text: String,
+    pub(crate) start_row: u64,
+    pub(crate) end_row: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalDragAutoScrollDirection {
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TerminalDragAutoScrollState {
+    pub(crate) direction: TerminalDragAutoScrollDirection,
+    pub(crate) rows_per_tick: isize,
+    pub(crate) pointer: Point<Pixels>,
+    pub(crate) epoch: u64,
+    pub(crate) frame_scheduled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalHoveredLink {
-    pub(crate) row: usize,
+    pub(crate) row: u64,
     pub(crate) row_revision: u64,
     pub(crate) col_range: Range<usize>,
     pub(crate) url: String,

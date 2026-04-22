@@ -455,12 +455,9 @@ pub(crate) fn shape_terminal_fragment(
         None,
     );
 
-    shape_cache.entries.put(
-        key,
-        CachedShapeLine {
-            line: line.clone(),
-        },
-    );
+    shape_cache
+        .entries
+        .put(key, CachedShapeLine { line: line.clone() });
     let _ = theme_id;
     shaped_fragment_with_metrics(line, plan, metrics, renderer_metrics)
 }
@@ -631,10 +628,30 @@ pub(crate) fn paint_terminal_surface(
         let row_origin = point(bounds.origin.x, bounds.origin.y + row.y);
         let row_index = ((f32::from(row.y) / surface.metrics.line_height_px).round() as usize)
             .min(surface.rows.len().saturating_sub(1));
+        let row_absolute = surface
+            .viewport_scroll_offset_rows
+            .saturating_add(row_index as u64);
+
+        if surface
+            .turn_selection
+            .as_ref()
+            .is_some_and(|turn| row_absolute >= turn.start_row && row_absolute <= turn.end_row)
+        {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(row_origin.x, row_origin.y),
+                    size(
+                        px(visible_cols as f32 * surface.metrics.cell_width_px),
+                        line_height,
+                    ),
+                ),
+                surface.turn_selection_background,
+            ));
+        }
 
         if let Some(selection) = surface.selection
             && let Some((start_col, end_col)) =
-                selection_span_for_row(selection, row_index, visible_cols)
+                selection_span_for_row(selection, row_absolute, visible_cols)
         {
             let start_x = row_origin.x + px(start_col as f32 * surface.metrics.cell_width_px);
             let width =
@@ -664,7 +681,7 @@ pub(crate) fn paint_terminal_surface(
         if let Some(hovered_link) = surface
             .hovered_link
             .as_ref()
-            .filter(|hovered_link| hovered_link.row == row_index)
+            .filter(|hovered_link| hovered_link.row == row_absolute)
             .filter(|hovered_link| {
                 row.link_ranges
                     .iter()
@@ -884,19 +901,19 @@ fn terminal_link_horizontal_bounds(x: Pixels, width: Pixels) -> (Pixels, Pixels)
 
 fn selection_span_for_row(
     selection: TerminalSelection,
-    row_index: usize,
+    row_absolute: u64,
     visible_cols: usize,
 ) -> Option<(usize, usize)> {
     let (start, end) = ordered_selection_points(selection);
-    if start == end || row_index < start.row || row_index > end.row {
+    if start == end || row_absolute < start.row || row_absolute > end.row {
         return None;
     }
 
     Some(if start.row == end.row {
         (start.col.min(visible_cols), end.col.min(visible_cols))
-    } else if row_index == start.row {
+    } else if row_absolute == start.row {
         (start.col.min(visible_cols), visible_cols)
-    } else if row_index == end.row {
+    } else if row_absolute == end.row {
         (0, end.col.min(visible_cols))
     } else {
         (0, visible_cols)

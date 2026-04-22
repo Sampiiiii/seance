@@ -420,8 +420,7 @@ impl SeanceWorkspace {
             }
         }
 
-        self.terminal_surface.rows =
-            Arc::from(self.terminal_surface.rows_scratch.as_slice());
+        self.terminal_surface.rows = Arc::from(self.terminal_surface.rows_scratch.as_slice());
         self.terminal_surface.metrics = metrics_report;
         self.terminal_surface.metrics_fingerprint = metrics_fingerprint;
         self.terminal_surface.active_session_id = session.id();

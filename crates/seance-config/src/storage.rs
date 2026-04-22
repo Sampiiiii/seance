@@ -85,7 +85,8 @@ mod tests {
 
     use crate::{
         AppConfig, COMMAND_APP_OPEN_COMMAND_PALETTE, ConfigStore, CustomKeybinding,
-        DEFAULT_THEME_KEY, KeybindingContext, KeybindingOverride, PerfHudDefault,
+        DEFAULT_THEME_KEY, KeybindingContext, KeybindingOverride, MouseTrackingScrollPolicy,
+        MouseTrackingSelectionPolicy, PerfHudDefault, TerminalRightClickPolicy,
     };
 
     #[test]
@@ -109,9 +110,20 @@ mod tests {
             .update(|config| {
                 config.appearance.theme = "bone".into();
                 config.terminal.font_family = "JetBrains Mono".into();
+                config.terminal.interaction.mouse_tracking_scroll =
+                    MouseTrackingScrollPolicy::AlwaysLocal;
+                config.terminal.interaction.mouse_tracking_selection =
+                    MouseTrackingSelectionPolicy::AlwaysLocal;
+                config.terminal.interaction.right_click = TerminalRightClickPolicy::PasteClipboard;
                 config.debug.perf_hud_default = PerfHudDefault::Expanded;
             })
             .unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("[terminal.interaction]"));
+        assert!(contents.contains("mouse_tracking_scroll = \"always-local\""));
+        assert!(contents.contains("mouse_tracking_selection = \"always-local\""));
+        assert!(contents.contains("right_click = \"paste-clipboard\""));
 
         let reloaded = ConfigStore::load_or_default(&path).unwrap();
         assert_eq!(reloaded.snapshot(), saved);
@@ -216,6 +228,22 @@ action = "seance_ui_app::OpenCommandPalette"
                 command: COMMAND_APP_OPEN_COMMAND_PALETTE.into(),
                 context: KeybindingContext::AppGlobal,
             }]
+        );
+        assert_eq!(
+            store.snapshot().terminal.interaction.mouse_tracking_scroll,
+            MouseTrackingScrollPolicy::HybridShiftWheelLocal
+        );
+        assert_eq!(
+            store
+                .snapshot()
+                .terminal
+                .interaction
+                .mouse_tracking_selection,
+            MouseTrackingSelectionPolicy::ShiftDragLocal
+        );
+        assert_eq!(
+            store.snapshot().terminal.interaction.right_click,
+            TerminalRightClickPolicy::CopySelectionOrPaste
         );
     }
 }

@@ -16,6 +16,8 @@ An open-source, cross-platform SSH terminal client built with Rust, [GPUI](https
 - Theming (dark/light)
 - Terminal resize (local and remote)
 - Performance HUD for debugging
+- Terminal interaction policies: Shift+Wheel local scrollback override in mouse-tracking TUIs, Shift+Drag local selection override, configurable right-click copy/paste behavior
+- Terminal output copy flows: when no selection exists, `Cmd+C` (macOS) / `Ctrl+Shift+C` (Linux) copies active-screen output (scrollback + viewport), and command palette includes "Copy Terminal Output"
 
 ## Architecture
 

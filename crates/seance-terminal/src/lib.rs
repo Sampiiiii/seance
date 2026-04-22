@@ -8,6 +8,7 @@ mod model;
 pub mod publish_budget;
 mod render;
 mod state;
+mod turns;
 mod viewport;
 
 pub use history::{
@@ -21,8 +22,9 @@ pub use input::{
 pub use local::{LocalSessionFactory, LocalSessionHandle};
 pub use model::{
     SessionSummary, TerminalCell, TerminalCellStyle, TerminalColor, TerminalCursor,
-    TerminalCursorState, TerminalCursorVisualStyle, TerminalGeometry, TerminalPixelSize,
-    TerminalRow, TerminalScreenKind, TerminalScrollCommand, TerminalScrollbarState, TerminalSize,
+    TerminalCursorState, TerminalCursorVisualStyle, TerminalGeometry, TerminalGridPoint,
+    TerminalGridSelection, TerminalPixelSize, TerminalRow, TerminalScreenKind,
+    TerminalScrollCommand, TerminalScrollbarState, TerminalSize, TerminalTurnSnapshot,
     TerminalViewportSnapshot,
 };
 pub use render::TerminalEmulator;

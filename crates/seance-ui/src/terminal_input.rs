@@ -11,6 +11,12 @@ use seance_terminal::{
 
 use crate::{SeanceWorkspace, model::TerminalImeState, perf::RedrawReason};
 
+enum TerminalCopyShortcutPayload {
+    Selection(String),
+    TurnSelection(String),
+    ActiveScreen,
+}
+
 pub(crate) fn terminal_text_event(event: &KeyDownEvent) -> Option<TerminalTextEvent> {
     let modifiers = event.keystroke.modifiers;
     let text = event.keystroke.key_char.as_ref()?;
@@ -106,10 +112,23 @@ impl SeanceWorkspace {
         let summary = session.summary();
 
         if is_terminal_copy_shortcut(event) {
-            if let Some(selection) = self.terminal_selected_text() {
-                cx.write_to_clipboard(ClipboardItem::new_string(selection));
-                self.perf_overlay.mark_input(RedrawReason::Input);
-                cx.notify();
+            match terminal_copy_shortcut_payload(
+                self.terminal_selected_text(),
+                self.terminal_selected_turn_text(),
+            ) {
+                TerminalCopyShortcutPayload::Selection(selection) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(selection));
+                    self.perf_overlay.mark_input(RedrawReason::Input);
+                    cx.notify();
+                }
+                TerminalCopyShortcutPayload::TurnSelection(text) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.perf_overlay.mark_input(RedrawReason::Input);
+                    cx.notify();
+                }
+                TerminalCopyShortcutPayload::ActiveScreen => {
+                    self.copy_active_terminal_output_to_clipboard(cx);
+                }
             }
             cx.stop_propagation();
             return true;
@@ -148,6 +167,39 @@ impl SeanceWorkspace {
         }
 
         false
+    }
+
+    pub(crate) fn copy_active_terminal_output_to_clipboard(&mut self, cx: &mut Context<Self>) {
+        match terminal_copy_shortcut_payload(
+            self.terminal_selected_text(),
+            self.terminal_selected_turn_text(),
+        ) {
+            TerminalCopyShortcutPayload::Selection(selection) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(selection));
+            }
+            TerminalCopyShortcutPayload::TurnSelection(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            TerminalCopyShortcutPayload::ActiveScreen => {
+                let Some(session) = self.active_session() else {
+                    return;
+                };
+                match session.copy_active_screen_text() {
+                    Ok(text) => {
+                        if active_screen_copy_is_empty(&text) {
+                            self.show_toast("No terminal output available to copy.");
+                        } else {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                    }
+                    Err(error) => {
+                        self.show_toast(format!("Failed to copy terminal output: {error}"));
+                    }
+                }
+            }
+        }
+        self.perf_overlay.mark_input(RedrawReason::Input);
+        cx.notify();
     }
 
     pub(crate) fn send_terminal_text_event(
@@ -354,6 +406,23 @@ fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
+fn active_screen_copy_is_empty(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+fn terminal_copy_shortcut_payload(
+    selection: Option<String>,
+    turn_selection: Option<String>,
+) -> TerminalCopyShortcutPayload {
+    match selection {
+        Some(selection) => TerminalCopyShortcutPayload::Selection(selection),
+        None => match turn_selection {
+            Some(text) => TerminalCopyShortcutPayload::TurnSelection(text),
+            None => TerminalCopyShortcutPayload::ActiveScreen,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +485,46 @@ mod tests {
     fn ime_replacement_updates_marked_text_ranges() {
         assert_eq!(apply_ime_replacement("caf", Some(1..2), "a"), "caf");
         assert_eq!(apply_ime_replacement("caf", Some(1..3), "fé"), "cfé");
+    }
+
+    #[test]
+    fn active_screen_copy_empty_detection_trims_whitespace() {
+        assert!(active_screen_copy_is_empty(""));
+        assert!(active_screen_copy_is_empty(" \n\t  "));
+        assert!(!active_screen_copy_is_empty("kubectl get pods"));
+    }
+
+    #[test]
+    fn terminal_copy_shortcut_prefers_selection_when_present() {
+        match terminal_copy_shortcut_payload(Some("alpha".into()), Some("turn".into())) {
+            TerminalCopyShortcutPayload::Selection(selection) => assert_eq!(selection, "alpha"),
+            TerminalCopyShortcutPayload::TurnSelection(_) => {
+                panic!("expected selection copy payload")
+            }
+            TerminalCopyShortcutPayload::ActiveScreen => {
+                panic!("expected selection copy payload")
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_copy_shortcut_uses_turn_selection_when_segment_selection_missing() {
+        match terminal_copy_shortcut_payload(None, Some("turn".into())) {
+            TerminalCopyShortcutPayload::TurnSelection(selection) => assert_eq!(selection, "turn"),
+            TerminalCopyShortcutPayload::Selection(_) => {
+                panic!("expected turn copy payload")
+            }
+            TerminalCopyShortcutPayload::ActiveScreen => {
+                panic!("expected turn copy payload")
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_copy_shortcut_falls_back_to_active_screen_without_selection() {
+        assert!(matches!(
+            terminal_copy_shortcut_payload(None, None),
+            TerminalCopyShortcutPayload::ActiveScreen
+        ));
     }
 }

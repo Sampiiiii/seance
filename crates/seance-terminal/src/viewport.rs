@@ -105,6 +105,10 @@ impl ViewportCache {
             row_revisions: Arc::from(self.row_revisions.clone()),
             cursor: self.cursor,
             scrollbar: self.scrollbar,
+            scroll_offset_rows: self
+                .scrollbar
+                .map(|scrollbar| scrollbar.offset_rows)
+                .unwrap_or(0),
             revision: self.viewport_revision,
             cols: self.geometry.size.cols,
             rows_visible: self.geometry.size.rows,

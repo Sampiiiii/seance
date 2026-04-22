@@ -182,6 +182,7 @@ async fn apply_session_command(
 ) -> bool {
     match command {
         SessionCommand::Input(bytes) => {
+            emulator.track_input_bytes(&bytes);
             if let Err(error) = write_input_bytes(writer, transcript_sink, &bytes).await {
                 state.set_error(
                     &anyhow!("failed to write to SSH channel: {error}"),
@@ -192,14 +193,15 @@ async fn apply_session_command(
         }
         SessionCommand::Text(event) => {
             let bytes = emulator.encode_text_event(&event);
-            if !bytes.is_empty()
-                && let Err(error) = write_input_bytes(writer, transcript_sink, &bytes).await
-            {
-                state.set_error(
-                    &anyhow!("failed to write to SSH channel: {error}"),
-                    geometry,
-                );
-                return false;
+            if !bytes.is_empty() {
+                emulator.track_input_bytes(&bytes);
+                if let Err(error) = write_input_bytes(writer, transcript_sink, &bytes).await {
+                    state.set_error(
+                        &anyhow!("failed to write to SSH channel: {error}"),
+                        geometry,
+                    );
+                    return false;
+                }
             }
         }
         SessionCommand::Key(event) => {
@@ -210,14 +212,15 @@ async fn apply_session_command(
                     return false;
                 }
             };
-            if !bytes.is_empty()
-                && let Err(error) = write_input_bytes(writer, transcript_sink, &bytes).await
-            {
-                state.set_error(
-                    &anyhow!("failed to write to SSH channel: {error}"),
-                    geometry,
-                );
-                return false;
+            if !bytes.is_empty() {
+                emulator.track_input_bytes(&bytes);
+                if let Err(error) = write_input_bytes(writer, transcript_sink, &bytes).await {
+                    state.set_error(
+                        &anyhow!("failed to write to SSH channel: {error}"),
+                        geometry,
+                    );
+                    return false;
+                }
             }
         }
         SessionCommand::Mouse(event) => {
@@ -240,14 +243,15 @@ async fn apply_session_command(
         }
         SessionCommand::Paste(paste) => {
             let bytes = emulator.encode_paste(&paste);
-            if !bytes.is_empty()
-                && let Err(error) = write_input_bytes(writer, transcript_sink, &bytes).await
-            {
-                state.set_error(
-                    &anyhow!("failed to write to SSH channel: {error}"),
-                    geometry,
-                );
-                return false;
+            if !bytes.is_empty() {
+                emulator.track_input_bytes(&bytes);
+                if let Err(error) = write_input_bytes(writer, transcript_sink, &bytes).await {
+                    state.set_error(
+                        &anyhow!("failed to write to SSH channel: {error}"),
+                        geometry,
+                    );
+                    return false;
+                }
             }
         }
         SessionCommand::Resize(geometry) => {
@@ -298,6 +302,18 @@ async fn apply_session_command(
             if disconnected {
                 return false;
             }
+        }
+        SessionCommand::CopyActiveScreen { reply_tx } => {
+            let _ = reply_tx.send(emulator.copy_active_screen_plain_text_readable());
+        }
+        SessionCommand::CopySelectionText {
+            selection,
+            reply_tx,
+        } => {
+            let _ = reply_tx.send(emulator.copy_selection_text(selection));
+        }
+        SessionCommand::PreviousTurn { reply_tx } => {
+            let _ = reply_tx.send(Ok(emulator.previous_turn()));
         }
     }
 

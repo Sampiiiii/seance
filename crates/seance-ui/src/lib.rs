@@ -44,10 +44,10 @@ use gpui::{Context, MouseButton, Render, Window, deferred, div, prelude::*, px};
 use seance_observability::{RenderDomain, RenderPath, RenderPhase, RenderTraceScope};
 
 pub use actions::{
-    CheckForUpdates, CloseActiveSession, ConnectHost, ConnectHostInNewWindow, HideOtherApps,
-    HideSeance, NewTerminal, OpenCommandPalette, OpenNewWindow, OpenPreferences, QuitSeance,
-    SelectNextSession, SelectPreviousSession, SelectSession, SelectSessionSlot, ShowAllApps,
-    SwitchTheme, TogglePerfHud,
+    CheckForUpdates, CloseActiveSession, ConnectHost, ConnectHostInNewWindow, CopyPreviousTurn,
+    HideOtherApps, HideSeance, NewTerminal, OpenCommandPalette, OpenNewWindow, OpenPreferences,
+    QuitSeance, SelectNextSession, SelectPreviousSession, SelectPreviousTurn, SelectSession,
+    SelectSessionSlot, ShowAllApps, SwitchTheme, TogglePerfHud,
 };
 pub(crate) use app::refresh_app_menus;
 pub use app::{UiCommand, UiIntegration, UiRuntime, run};
@@ -175,6 +175,12 @@ impl Render for SeanceWorkspace {
                 if this.active_session_id != 0 {
                     this.close_session(this.active_session_id, window, cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &CopyPreviousTurn, _window, cx| {
+                this.copy_previous_turn_to_clipboard(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectPreviousTurn, _window, cx| {
+                this.select_previous_turn(cx);
             }))
             .on_action(cx.listener(|this, _: &SelectPreviousSession, window, cx| {
                 this.select_previous_session(window, cx);

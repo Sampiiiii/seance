@@ -171,6 +171,28 @@ pub enum TerminalScrollCommand {
     PageDown,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalGridPoint {
+    pub row: u64,
+    pub col: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalGridSelection {
+    pub anchor: TerminalGridPoint,
+    pub focus: TerminalGridPoint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalTurnSnapshot {
+    pub turn_id: u64,
+    pub command_text: String,
+    pub output_text: String,
+    pub combined_text: String,
+    pub start_row: u64,
+    pub end_row: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SessionSummary {
     pub exit_status: Option<String>,
@@ -188,6 +210,7 @@ pub struct TerminalViewportSnapshot {
     pub row_revisions: Arc<[u64]>,
     pub cursor: Option<TerminalCursorState>,
     pub scrollbar: Option<TerminalScrollbarState>,
+    pub scroll_offset_rows: u64,
     pub revision: u64,
     pub cols: u16,
     pub rows_visible: u16,

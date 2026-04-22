@@ -8,7 +8,7 @@ use seance_terminal::{
 
 use crate::{
     TerminalMetrics, TerminalRendererMetrics,
-    model::{TerminalHoveredLink, TerminalSelection},
+    model::{TerminalHoveredLink, TerminalSelection, TerminalTurnSelection},
     theme::ThemeId,
 };
 
@@ -215,8 +215,7 @@ impl Default for RowPaintCache {
 impl Clone for RowPaintCache {
     fn clone(&self) -> Self {
         let mut cloned = LruCache::new(
-            NonZeroUsize::new(self.entries.cap().get())
-                .unwrap_or_else(row_template_cache_capacity),
+            NonZeroUsize::new(self.entries.cap().get()).unwrap_or_else(row_template_cache_capacity),
         );
         for (key, entry) in self.entries.iter().rev() {
             cloned.put(key.clone(), entry.clone());
@@ -280,12 +279,15 @@ pub(crate) struct PreparedTerminalSurface {
     pub(crate) rows: Arc<[TerminalPaintRow]>,
     pub(crate) metrics: TerminalMetrics,
     pub(crate) cursor: Option<TerminalCursorState>,
+    pub(crate) viewport_scroll_offset_rows: u64,
     pub(crate) selection: Option<TerminalSelection>,
+    pub(crate) turn_selection: Option<TerminalTurnSelection>,
     pub(crate) hovered_link: Option<TerminalHoveredLink>,
     pub(crate) terminal_focused: bool,
     pub(crate) cursor_fallback: gpui::Hsla,
     pub(crate) cursor_dim: gpui::Hsla,
     pub(crate) selection_background: gpui::Hsla,
+    pub(crate) turn_selection_background: gpui::Hsla,
     pub(crate) link_hover_background: gpui::Hsla,
     pub(crate) link_hover_underline: gpui::Hsla,
     pub(crate) link_modifier_background: gpui::Hsla,

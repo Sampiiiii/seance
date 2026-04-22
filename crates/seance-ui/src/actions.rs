@@ -12,6 +12,8 @@ actions!(
         OpenCommandPalette,
         OpenPreferences,
         CloseActiveSession,
+        CopyPreviousTurn,
+        SelectPreviousTurn,
         SelectPreviousSession,
         SelectNextSession,
         OpenNewWindow,

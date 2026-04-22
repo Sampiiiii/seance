@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::defaults::{
     default_logging_max_bytes_per_session, default_logging_retention_days,
+    default_mouse_tracking_scroll_policy, default_mouse_tracking_selection_policy,
     default_terminal_font_family, default_terminal_font_size_px, default_terminal_line_height_px,
-    default_theme, default_true,
+    default_terminal_right_click_policy, default_theme, default_true,
 };
 use crate::keybindings::KeybindingsConfig;
 
@@ -70,6 +71,8 @@ pub struct TerminalConfig {
     pub font_size_px: f32,
     #[serde(default = "default_terminal_line_height_px")]
     pub line_height_px: f32,
+    #[serde(default)]
+    pub interaction: TerminalInteractionConfig,
 }
 
 impl Default for TerminalConfig {
@@ -79,6 +82,69 @@ impl Default for TerminalConfig {
             font_family: default_terminal_font_family(),
             font_size_px: default_terminal_font_size_px(),
             line_height_px: default_terminal_line_height_px(),
+            interaction: TerminalInteractionConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MouseTrackingScrollPolicy {
+    AlwaysAppFirst,
+    HybridShiftWheelLocal,
+    AlwaysLocal,
+}
+
+impl Default for MouseTrackingScrollPolicy {
+    fn default() -> Self {
+        default_mouse_tracking_scroll_policy()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MouseTrackingSelectionPolicy {
+    Disabled,
+    ShiftDragLocal,
+    AlwaysLocal,
+}
+
+impl Default for MouseTrackingSelectionPolicy {
+    fn default() -> Self {
+        default_mouse_tracking_selection_policy()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TerminalRightClickPolicy {
+    CopySelectionOrPaste,
+    PasteClipboard,
+    Disabled,
+}
+
+impl Default for TerminalRightClickPolicy {
+    fn default() -> Self {
+        default_terminal_right_click_policy()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalInteractionConfig {
+    #[serde(default = "default_mouse_tracking_scroll_policy")]
+    pub mouse_tracking_scroll: MouseTrackingScrollPolicy,
+    #[serde(default = "default_mouse_tracking_selection_policy")]
+    pub mouse_tracking_selection: MouseTrackingSelectionPolicy,
+    #[serde(default = "default_terminal_right_click_policy")]
+    pub right_click: TerminalRightClickPolicy,
+}
+
+impl Default for TerminalInteractionConfig {
+    fn default() -> Self {
+        Self {
+            mouse_tracking_scroll: default_mouse_tracking_scroll_policy(),
+            mouse_tracking_selection: default_mouse_tracking_selection_policy(),
+            right_click: default_terminal_right_click_policy(),
         }
     }
 }

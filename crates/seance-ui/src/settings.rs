@@ -1,7 +1,10 @@
 // Owns the settings panel UI plus settings-specific persistence and updater actions.
 
 use gpui::{App, Context, Div, FontWeight, MouseButton, Window, div, prelude::*, px};
-use seance_config::{PerfHudDefault, TerminalConfig, WindowConfig};
+use seance_config::{
+    MouseTrackingScrollPolicy, MouseTrackingSelectionPolicy, PerfHudDefault, TerminalConfig,
+    TerminalRightClickPolicy, WindowConfig,
+};
 use seance_core::UpdateState;
 
 use crate::{
@@ -633,6 +636,30 @@ context = "app-global""#;
                     ("/bin/sh", Some("/bin/sh")),
                 ];
                 let font_choices = ["Menlo", "JetBrains Mono", "SF Mono", "Monaco"];
+                let scroll_policy_choices = [
+                    ("app first", MouseTrackingScrollPolicy::AlwaysAppFirst),
+                    (
+                        "hybrid (shift+wheel local)",
+                        MouseTrackingScrollPolicy::HybridShiftWheelLocal,
+                    ),
+                    ("always local", MouseTrackingScrollPolicy::AlwaysLocal),
+                ];
+                let selection_policy_choices = [
+                    ("disabled", MouseTrackingSelectionPolicy::Disabled),
+                    (
+                        "shift+drag local",
+                        MouseTrackingSelectionPolicy::ShiftDragLocal,
+                    ),
+                    ("always local", MouseTrackingSelectionPolicy::AlwaysLocal),
+                ];
+                let right_click_policy_choices = [
+                    (
+                        "copy selection or paste",
+                        TerminalRightClickPolicy::CopySelectionOrPaste,
+                    ),
+                    ("paste clipboard", TerminalRightClickPolicy::PasteClipboard),
+                    ("disabled", TerminalRightClickPolicy::Disabled),
+                ];
 
                 let mut shell_row = div().flex().flex_wrap().gap(px(8.0));
                 for (label, shell) in shell_choices {
@@ -657,6 +684,51 @@ context = "app-global""#;
                             cx.listener(move |this, _, _, cx| {
                                 let mut next = this.config.terminal.clone();
                                 next.font_family = font_family.to_string();
+                                this.persist_terminal_settings(next, cx);
+                            }),
+                        ),
+                    );
+                }
+
+                let mut scroll_policy_row = div().flex().flex_wrap().gap(px(8.0));
+                for (label, policy) in scroll_policy_choices {
+                    let is_active = terminal.interaction.mouse_tracking_scroll == policy;
+                    scroll_policy_row = scroll_policy_row.child(
+                        settings_choice_chip(label, is_active, &t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let mut next = this.config.terminal.clone();
+                                next.interaction.mouse_tracking_scroll = policy;
+                                this.persist_terminal_settings(next, cx);
+                            }),
+                        ),
+                    );
+                }
+
+                let mut selection_policy_row = div().flex().flex_wrap().gap(px(8.0));
+                for (label, policy) in selection_policy_choices {
+                    let is_active = terminal.interaction.mouse_tracking_selection == policy;
+                    selection_policy_row = selection_policy_row.child(
+                        settings_choice_chip(label, is_active, &t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let mut next = this.config.terminal.clone();
+                                next.interaction.mouse_tracking_selection = policy;
+                                this.persist_terminal_settings(next, cx);
+                            }),
+                        ),
+                    );
+                }
+
+                let mut right_click_policy_row = div().flex().flex_wrap().gap(px(8.0));
+                for (label, policy) in right_click_policy_choices {
+                    let is_active = terminal.interaction.right_click == policy;
+                    right_click_policy_row = right_click_policy_row.child(
+                        settings_choice_chip(label, is_active, &t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let mut next = this.config.terminal.clone();
+                                next.interaction.right_click = policy;
                                 this.persist_terminal_settings(next, cx);
                             }),
                         ),
@@ -812,6 +884,56 @@ context = "app-global""#;
                                         }),
                                     )),
                             ),
+                    )
+                    .child(settings_section_group("Interaction", &t))
+                    .child(
+                        settings_info_card(
+                            "Mouse tracking scroll",
+                            match terminal.interaction.mouse_tracking_scroll {
+                                MouseTrackingScrollPolicy::AlwaysAppFirst => "app first".to_string(),
+                                MouseTrackingScrollPolicy::HybridShiftWheelLocal => {
+                                    "hybrid (shift+wheel local)".to_string()
+                                }
+                                MouseTrackingScrollPolicy::AlwaysLocal => "always local".to_string(),
+                            },
+                            "When TUIs enable mouse tracking, choose whether wheel input stays remote or can scroll local history.",
+                            &t,
+                        )
+                        .child(scroll_policy_row),
+                    )
+                    .child(
+                        settings_info_card(
+                            "Mouse tracking selection",
+                            match terminal.interaction.mouse_tracking_selection {
+                                MouseTrackingSelectionPolicy::Disabled => "disabled".to_string(),
+                                MouseTrackingSelectionPolicy::ShiftDragLocal => {
+                                    "shift+drag local".to_string()
+                                }
+                                MouseTrackingSelectionPolicy::AlwaysLocal => {
+                                    "always local".to_string()
+                                }
+                            },
+                            "Controls when local text selection can override TUI mouse capture.",
+                            &t,
+                        )
+                        .child(selection_policy_row),
+                    )
+                    .child(
+                        settings_info_card(
+                            "Right click behavior",
+                            match terminal.interaction.right_click {
+                                TerminalRightClickPolicy::CopySelectionOrPaste => {
+                                    "copy selection or paste".to_string()
+                                }
+                                TerminalRightClickPolicy::PasteClipboard => {
+                                    "paste clipboard".to_string()
+                                }
+                                TerminalRightClickPolicy::Disabled => "disabled".to_string(),
+                            },
+                            "Terminal right-click action in local interaction mode.",
+                            &t,
+                        )
+                        .child(right_click_policy_row),
                     )
             }
             SettingsSection::Debug => {

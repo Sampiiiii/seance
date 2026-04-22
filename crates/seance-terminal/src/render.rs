@@ -1,24 +1,40 @@
 use std::{sync::Arc, time::Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use libghostty_vt::{
-    RenderState, Terminal, TerminalOptions, key, mouse,
+    RenderState, Terminal, TerminalOptions,
+    fmt::{Format as FormatterFormat, Formatter, FormatterOptions},
+    key, mouse,
     render::{CellIterator, Dirty, RowIterator},
     screen::CellWide,
     style::{RgbColor, Style, Underline},
     terminal::{Mode, ScrollViewport},
 };
 use tracing::{trace, warn};
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     SessionSummary, SharedSessionState, TerminalCell, TerminalCellStyle, TerminalColor,
     TerminalCursor, TerminalCursorState, TerminalCursorVisualStyle, TerminalGeometry,
-    TerminalKeyEvent, TerminalMouseEvent, TerminalPaste, TerminalRow, TerminalScreenKind,
-    TerminalScrollCommand, TerminalScrollbarState, TerminalTextEvent, input,
-    state::PublishedViewport, viewport::ViewportCache,
+    TerminalGridPoint, TerminalGridSelection, TerminalKeyEvent, TerminalMouseEvent, TerminalPaste,
+    TerminalRow, TerminalScreenKind, TerminalScrollCommand, TerminalScrollbarState,
+    TerminalTextEvent, TerminalTurnSnapshot, input, state::PublishedViewport, turns::TurnTracker,
+    viewport::ViewportCache,
 };
 
 const MAX_SCROLLBACK_LINES: usize = 10_000;
+const MAX_ACTIVE_SCREEN_EXPORT_BYTES: usize = 16 * 1024 * 1024;
+
+fn ensure_active_screen_export_size(required: usize) -> Result<()> {
+    if required > MAX_ACTIVE_SCREEN_EXPORT_BYTES {
+        bail!(
+            "active-screen export is too large to copy ({} bytes > {} bytes limit)",
+            required,
+            MAX_ACTIVE_SCREEN_EXPORT_BYTES
+        );
+    }
+    Ok(())
+}
 
 pub struct TerminalEmulator {
     terminal: Terminal<'static, 'static>,
@@ -30,6 +46,7 @@ pub struct TerminalEmulator {
     mouse_any_button_pressed: bool,
     pending_vt_bytes: usize,
     viewport_cache: ViewportCache,
+    turn_tracker: TurnTracker,
 }
 
 impl TerminalEmulator {
@@ -61,12 +78,14 @@ impl TerminalEmulator {
                     }],
                 },
             ),
+            turn_tracker: TurnTracker::default(),
         })
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
         self.pending_vt_bytes += bytes.len();
         self.terminal.vt_write(bytes);
+        self.turn_tracker.track_output_bytes(bytes);
     }
 
     pub fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
@@ -151,6 +170,70 @@ impl TerminalEmulator {
 
     pub fn encode_paste(&mut self, paste: &TerminalPaste) -> Vec<u8> {
         input::encode_bracketed_paste(&paste.text, input::bracketed_paste_enabled(&self.terminal))
+    }
+
+    pub fn track_input_bytes(&mut self, bytes: &[u8]) {
+        self.turn_tracker.track_input_bytes(bytes);
+    }
+
+    pub fn previous_turn(&self) -> Option<TerminalTurnSnapshot> {
+        self.turn_tracker.previous_turn_snapshot()
+    }
+
+    pub fn copy_active_screen_plain_text_readable(&mut self) -> Result<String> {
+        let mut formatter = Formatter::new(
+            &self.terminal,
+            FormatterOptions {
+                format: FormatterFormat::Plain,
+                trim: true,
+                unwrap: true,
+            },
+        )
+        .context("failed to initialize Ghostty active-screen formatter")?;
+        let required = formatter
+            .format_len()
+            .context("failed to compute active-screen export length")?;
+        ensure_active_screen_export_size(required)?;
+
+        let mut buffer = vec![0_u8; required];
+        let written = formatter
+            .format_buf(&mut buffer)
+            .context("failed to format active-screen text export")?;
+        buffer.truncate(written);
+        String::from_utf8(buffer).context("active-screen export contained invalid UTF-8")
+    }
+
+    pub fn copy_selection_text(&mut self, selection: TerminalGridSelection) -> Result<String> {
+        let rows = self.export_active_screen_rows(false, false)?;
+        Ok(selection_text_from_rows(&rows, selection))
+    }
+
+    fn export_active_screen_rows(&mut self, trim: bool, unwrap: bool) -> Result<Vec<String>> {
+        let mut formatter = Formatter::new(
+            &self.terminal,
+            FormatterOptions {
+                format: FormatterFormat::Plain,
+                trim,
+                unwrap,
+            },
+        )
+        .context("failed to initialize Ghostty active-screen formatter")?;
+        let required = formatter
+            .format_len()
+            .context("failed to compute active-screen export length")?;
+        ensure_active_screen_export_size(required)?;
+
+        let mut buffer = vec![0_u8; required];
+        let written = formatter
+            .format_buf(&mut buffer)
+            .context("failed to format active-screen text export")?;
+        buffer.truncate(written);
+        let text =
+            String::from_utf8(buffer).context("active-screen export contained invalid UTF-8")?;
+        Ok(text
+            .split('\n')
+            .map(|line| line.trim_end_matches('\r').to_string())
+            .collect())
     }
 
     pub fn scroll_viewport(&mut self, command: TerminalScrollCommand) {
@@ -264,6 +347,11 @@ impl TerminalEmulator {
         let scrollbar = scrollbar_state(terminal)?;
         let cursor_changed = self.viewport_cache.set_cursor(cursor);
         let scrollbar_changed = self.viewport_cache.set_scrollbar(scrollbar);
+        let active_screen = active_screen_kind(&self.terminal);
+        self.turn_tracker
+            .set_primary_screen(matches!(active_screen, TerminalScreenKind::Primary));
+        self.turn_tracker
+            .update_cursor_abs_row(cursor_absolute_row(cursor, scrollbar));
 
         let mut rows = self
             .row_iterator
@@ -328,14 +416,6 @@ impl TerminalEmulator {
         }
 
         if matches!(dirty, Dirty::Clean) && row_index == 0 {
-            let active_screen = if self.terminal.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false)
-                || self.terminal.mode(Mode::ALT_SCREEN).unwrap_or(false)
-                || self.terminal.mode(Mode::ALT_SCREEN_LEGACY).unwrap_or(false)
-            {
-                TerminalScreenKind::Alternate
-            } else {
-                TerminalScreenKind::Primary
-            };
             if matches!(active_screen, TerminalScreenKind::Primary) && self.viewport_cache.at_bottom
             {
                 self.viewport_cache.refresh_stable_preview();
@@ -363,14 +443,6 @@ impl TerminalEmulator {
             .set_dirty(Dirty::Clean)
             .context("failed to clear Ghostty frame dirty state")?;
 
-        let active_screen = if self.terminal.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false)
-            || self.terminal.mode(Mode::ALT_SCREEN).unwrap_or(false)
-            || self.terminal.mode(Mode::ALT_SCREEN_LEGACY).unwrap_or(false)
-        {
-            TerminalScreenKind::Alternate
-        } else {
-            TerminalScreenKind::Primary
-        };
         if matches!(active_screen, TerminalScreenKind::Primary) && self.viewport_cache.at_bottom {
             self.viewport_cache.refresh_stable_preview();
         }
@@ -392,6 +464,101 @@ impl TerminalEmulator {
             rendered_cell_count,
         })
     }
+}
+
+fn active_screen_kind(terminal: &Terminal<'_, '_>) -> TerminalScreenKind {
+    if terminal.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false)
+        || terminal.mode(Mode::ALT_SCREEN).unwrap_or(false)
+        || terminal.mode(Mode::ALT_SCREEN_LEGACY).unwrap_or(false)
+    {
+        TerminalScreenKind::Alternate
+    } else {
+        TerminalScreenKind::Primary
+    }
+}
+
+fn cursor_absolute_row(
+    cursor: Option<TerminalCursorState>,
+    scrollbar: Option<TerminalScrollbarState>,
+) -> u64 {
+    let local_row = cursor
+        .map(|cursor| u64::from(cursor.position.y))
+        .unwrap_or(0);
+    scrollbar
+        .map(|scrollbar| scrollbar.offset_rows)
+        .unwrap_or(0)
+        .saturating_add(local_row)
+}
+
+fn selection_text_from_rows(rows: &[String], selection: TerminalGridSelection) -> String {
+    let (start, end) = ordered_grid_selection(selection);
+    if start == end || rows.is_empty() {
+        return String::new();
+    }
+    let Ok(start_row) = usize::try_from(start.row) else {
+        return String::new();
+    };
+    if start_row >= rows.len() {
+        return String::new();
+    }
+    let mut end_row = match usize::try_from(end.row) {
+        Ok(row) => row,
+        Err(_) => rows.len().saturating_sub(1),
+    };
+    end_row = end_row.min(rows.len().saturating_sub(1));
+
+    let mut lines = Vec::new();
+    for row_index in start_row..=end_row {
+        let line = if row_index == start_row && row_index == end_row {
+            slice_row_display_columns(&rows[row_index], start.col, end.col)
+        } else if row_index == start_row {
+            slice_row_display_columns(&rows[row_index], start.col, usize::MAX)
+        } else if row_index == end_row {
+            slice_row_display_columns(&rows[row_index], 0, end.col)
+        } else {
+            rows[row_index].clone()
+        };
+        lines.push(line.trim_end_matches(' ').to_string());
+    }
+    lines.join("\n")
+}
+
+fn ordered_grid_selection(
+    selection: TerminalGridSelection,
+) -> (TerminalGridPoint, TerminalGridPoint) {
+    if (selection.anchor.row, selection.anchor.col) <= (selection.focus.row, selection.focus.col) {
+        (selection.anchor, selection.focus)
+    } else {
+        (selection.focus, selection.anchor)
+    }
+}
+
+fn slice_row_display_columns(text: &str, start_col: usize, end_col: usize) -> String {
+    if end_col <= start_col {
+        return String::new();
+    }
+
+    let mut result = String::new();
+    let mut current_col = 0usize;
+    for ch in text.chars() {
+        if matches!(ch, '\n' | '\r') {
+            continue;
+        }
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+        let char_start = current_col;
+        let char_end = current_col.saturating_add(width);
+        current_col = char_end;
+
+        if char_end <= start_col {
+            continue;
+        }
+        if char_start >= end_col {
+            break;
+        }
+        result.push(ch);
+    }
+
+    result
 }
 
 fn cursor_state(
@@ -545,7 +712,7 @@ mod tests {
     use std::{fmt::Write as _, sync::Arc};
 
     use super::*;
-    use crate::TerminalViewportSnapshot;
+    use crate::{TerminalGridPoint, TerminalGridSelection, TerminalViewportSnapshot};
 
     fn new_test_emulator() -> (TerminalEmulator, SharedSessionState, TerminalGeometry) {
         let geometry = TerminalGeometry::default();
@@ -587,6 +754,23 @@ mod tests {
             let _ = writeln!(&mut vt, "line-{index:03}\r");
         }
         emulator.write(vt.as_bytes());
+        emulator.refresh(&state, None, true, 0);
+        (emulator, state)
+    }
+
+    fn copy_fixture(cols: u16, rows: u16, vt: &[u8]) -> (TerminalEmulator, SharedSessionState) {
+        let geometry = TerminalGeometry::new(
+            cols,
+            rows,
+            cols.saturating_mul(8),
+            rows.saturating_mul(19),
+            8,
+            19,
+        )
+        .expect("terminal geometry");
+        let (state, _notify_rx) = SharedSessionState::new("init", geometry);
+        let mut emulator = TerminalEmulator::new(geometry, "init").expect("terminal emulator");
+        emulator.write(vt);
         emulator.refresh(&state, None, true, 0);
         (emulator, state)
     }
@@ -827,6 +1011,127 @@ mod tests {
         assert!(viewport.row_count() >= 2);
         assert_eq!(summary.preview_line.trim_end(), "beta");
         assert!(summary.at_bottom);
+    }
+
+    #[test]
+    fn active_screen_copy_includes_scrollback_rows() {
+        let (mut emulator, _state) = scrollback_fixture(80, 10);
+
+        let copied = emulator
+            .copy_active_screen_plain_text_readable()
+            .expect("copy active screen");
+
+        assert!(copied.contains("line-000"));
+        assert!(copied.contains("line-079"));
+    }
+
+    #[test]
+    fn active_screen_copy_uses_readable_unwrap_and_trim() {
+        let (mut emulator, _state) = copy_fixture(6, 4, b"abcde12345\r\ntail   \r\n");
+
+        let copied = emulator
+            .copy_active_screen_plain_text_readable()
+            .expect("copy active screen");
+
+        assert!(copied.contains("abcde12345"));
+        assert!(!copied.contains("abcde\n12345"));
+        assert!(copied.contains("tail"));
+        assert!(!copied.contains("tail   "));
+    }
+
+    #[test]
+    fn active_screen_copy_rejects_exports_over_size_limit() {
+        let error = ensure_active_screen_export_size(MAX_ACTIVE_SCREEN_EXPORT_BYTES + 1)
+            .expect_err("expected export size limit error");
+
+        assert!(error.to_string().contains("too large to copy"));
+    }
+
+    #[test]
+    fn selection_copy_extracts_multiline_text_from_scrollback_rows() {
+        let (mut emulator, _state) = scrollback_fixture(30, 6);
+        let rows = emulator
+            .export_active_screen_rows(false, false)
+            .expect("export rows");
+        let start_row = rows
+            .iter()
+            .position(|row| row.contains("line-005"))
+            .expect("start row present") as u64;
+        let end_row = rows
+            .iter()
+            .position(|row| row.contains("line-007"))
+            .expect("end row present") as u64;
+
+        let copied = emulator
+            .copy_selection_text(TerminalGridSelection {
+                anchor: TerminalGridPoint {
+                    row: start_row,
+                    col: 0,
+                },
+                focus: TerminalGridPoint {
+                    row: end_row,
+                    col: "line-007".len(),
+                },
+            })
+            .expect("copy selection");
+
+        assert!(copied.contains("line-005"));
+        assert!(copied.contains("line-006"));
+        assert!(copied.contains("line-007"));
+    }
+
+    #[test]
+    fn selection_copy_respects_wide_character_boundaries() {
+        let (mut emulator, _state) = copy_fixture(10, 4, "A界B\r\n".as_bytes());
+        let rows = emulator
+            .export_active_screen_rows(false, false)
+            .expect("export rows");
+        let row_index = rows
+            .iter()
+            .position(|row| row.contains("A界B"))
+            .expect("row with wide char present") as u64;
+
+        let copied = emulator
+            .copy_selection_text(TerminalGridSelection {
+                anchor: TerminalGridPoint {
+                    row: row_index,
+                    col: 1,
+                },
+                focus: TerminalGridPoint {
+                    row: row_index,
+                    col: 2,
+                },
+            })
+            .expect("copy selection");
+
+        assert_eq!(copied, "界");
+    }
+
+    #[test]
+    fn selection_copy_trims_trailing_spaces_per_line() {
+        let (mut emulator, _state) = copy_fixture(16, 4, b"tail   \r\nnext   \r\n");
+        let rows = emulator
+            .export_active_screen_rows(false, false)
+            .expect("export rows");
+        let start_row = rows
+            .iter()
+            .position(|row| row.contains("tail"))
+            .expect("tail row present") as u64;
+
+        let copied = emulator
+            .copy_selection_text(TerminalGridSelection {
+                anchor: TerminalGridPoint {
+                    row: start_row,
+                    col: 0,
+                },
+                focus: TerminalGridPoint {
+                    row: start_row + 1,
+                    col: usize::MAX,
+                },
+            })
+            .expect("copy selection");
+
+        assert_eq!(copied, "tail\nnext");
     }
 
     #[test]

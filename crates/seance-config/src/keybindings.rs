@@ -10,6 +10,7 @@ pub const COMMAND_APP_QUIT: &str = "app.quit";
 pub const COMMAND_APP_HIDE: &str = "app.hide";
 pub const COMMAND_SESSION_SELECT_PREVIOUS: &str = "session.select_previous";
 pub const COMMAND_SESSION_SELECT_NEXT: &str = "session.select_next";
+pub const COMMAND_SESSION_COPY_PREVIOUS_TURN: &str = "session.copy_previous_turn";
 pub const COMMAND_SESSION_SELECT_SLOT_1: &str = "session.select_slot_1";
 pub const COMMAND_SESSION_SELECT_SLOT_2: &str = "session.select_slot_2";
 pub const COMMAND_SESSION_SELECT_SLOT_3: &str = "session.select_slot_3";
@@ -32,6 +33,7 @@ pub const BUILTIN_KEYBINDING_IDS: &[&str] = &[
     COMMAND_APP_HIDE,
     COMMAND_SESSION_SELECT_PREVIOUS,
     COMMAND_SESSION_SELECT_NEXT,
+    COMMAND_SESSION_COPY_PREVIOUS_TURN,
     COMMAND_SESSION_SELECT_SLOT_1,
     COMMAND_SESSION_SELECT_SLOT_2,
     COMMAND_SESSION_SELECT_SLOT_3,
@@ -176,6 +178,7 @@ pub fn command_default_context(command: &str) -> KeybindingContext {
     match command {
         COMMAND_SESSION_SELECT_PREVIOUS
         | COMMAND_SESSION_SELECT_NEXT
+        | COMMAND_SESSION_COPY_PREVIOUS_TURN
         | COMMAND_SESSION_SELECT_SLOT_1
         | COMMAND_SESSION_SELECT_SLOT_2
         | COMMAND_SESSION_SELECT_SLOT_3

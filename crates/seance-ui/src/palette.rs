@@ -1,6 +1,7 @@
 use crate::{connect::PendingConnectSummary, theme::ThemeId};
 use seance_config::{
-    COMMAND_APP_OPEN_PREFERENCES, COMMAND_SESSION_CLOSE_ACTIVE, COMMAND_SESSION_NEW_LOCAL,
+    COMMAND_APP_OPEN_PREFERENCES, COMMAND_SESSION_CLOSE_ACTIVE, COMMAND_SESSION_COPY_PREVIOUS_TURN,
+    COMMAND_SESSION_NEW_LOCAL,
 };
 use std::{collections::HashMap, sync::Arc};
 
@@ -42,6 +43,9 @@ pub(crate) enum PaletteAction {
     InstallAvailableUpdate,
     SwitchSession(u64),
     CloseActiveSession,
+    CopyPreviousTurn,
+    SelectPreviousTurn,
+    CopyTerminalOutput,
     SwitchTheme(ThemeId),
     UnlockVault,
     LockVault,
@@ -260,6 +264,35 @@ pub(crate) fn build_items(
             shortcut_command: Some(COMMAND_SESSION_CLOSE_ACTIVE),
             match_indices: Vec::new(),
         });
+        if sessions.iter().any(|session| session.id() == active_id) {
+            items.push(PaletteItem {
+                glyph: "⤺",
+                label: "Select Previous Turn".into(),
+                hint: "Highlight the latest submitted command turn".into(),
+                action: PaletteAction::SelectPreviousTurn,
+                group: PaletteGroup::Sessions,
+                shortcut_command: None,
+                match_indices: Vec::new(),
+            });
+            items.push(PaletteItem {
+                glyph: "⧉",
+                label: "Copy Previous Turn".into(),
+                hint: "Copy latest submitted command + output".into(),
+                action: PaletteAction::CopyPreviousTurn,
+                group: PaletteGroup::Sessions,
+                shortcut_command: Some(COMMAND_SESSION_COPY_PREVIOUS_TURN),
+                match_indices: Vec::new(),
+            });
+            items.push(PaletteItem {
+                glyph: "⧉",
+                label: "Copy Terminal Output".into(),
+                hint: "Copy active screen output to clipboard".into(),
+                action: PaletteAction::CopyTerminalOutput,
+                group: PaletteGroup::Sessions,
+                shortcut_command: None,
+                match_indices: Vec::new(),
+            });
+        }
     }
 
     for session in sessions {
@@ -888,6 +921,47 @@ mod tests {
 
         assert_eq!(switch_item.label, "Switch to local-1");
         assert_eq!(switch_item.hint, "session #18");
+    }
+
+    #[test]
+    fn build_items_adds_previous_turn_actions_for_active_session() {
+        let sessions: Vec<Arc<dyn TerminalSession>> = vec![Arc::new(StubSession {
+            id: 18,
+            title: "local-18".into(),
+        })];
+
+        let items = build_items(
+            &sessions,
+            &HashMap::new(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            18,
+            ThemeId::ObsidianSmoke,
+            "",
+            false,
+            &[],
+            &seance_core::UpdateState::Idle,
+        );
+
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item.action, PaletteAction::CopyTerminalOutput))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item.action, PaletteAction::CopyPreviousTurn))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item.action, PaletteAction::SelectPreviousTurn))
+        );
     }
 
     #[test]

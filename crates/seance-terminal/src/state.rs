@@ -12,8 +12,9 @@ use anyhow::Result;
 use tracing::trace;
 
 use crate::{
-    SessionSummary, TerminalGeometry, TerminalKeyEvent, TerminalMouseEvent, TerminalPaste,
-    TerminalRow, TerminalScrollCommand, TerminalTextEvent, TerminalViewportSnapshot,
+    SessionSummary, TerminalGeometry, TerminalGridSelection, TerminalKeyEvent, TerminalMouseEvent,
+    TerminalPaste, TerminalRow, TerminalScrollCommand, TerminalTextEvent, TerminalTurnSnapshot,
+    TerminalViewportSnapshot,
 };
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -81,6 +82,21 @@ pub trait TerminalSession: Send + Sync {
     fn resize(&self, geometry: TerminalGeometry) -> Result<()>;
     fn scroll_viewport(&self, command: TerminalScrollCommand) -> Result<()>;
     fn scroll_to_bottom(&self) -> Result<()>;
+    fn copy_selection_text(&self, _selection: TerminalGridSelection) -> Result<String> {
+        Err(anyhow::anyhow!(
+            "copy selection text is not supported for this session"
+        ))
+    }
+    fn previous_turn(&self) -> Result<Option<TerminalTurnSnapshot>> {
+        Err(anyhow::anyhow!(
+            "previous turn lookup is not supported for this session"
+        ))
+    }
+    fn copy_active_screen_text(&self) -> Result<String> {
+        Err(anyhow::anyhow!(
+            "copy active screen text is not supported for this session"
+        ))
+    }
     fn perf_snapshot(&self) -> SessionPerfSnapshot;
     fn take_notify_rx(&self) -> Option<mpsc::Receiver<()>>;
 }
@@ -141,6 +157,7 @@ impl SharedSessionState {
                 row_revisions: Arc::from(vec![1_u64]),
                 cursor: None,
                 scrollbar: None,
+                scroll_offset_rows: 0,
                 revision: 1,
                 cols: geometry.size.cols,
                 rows_visible: geometry.size.rows,
@@ -287,6 +304,7 @@ impl SharedSessionState {
             row_revisions: Arc::from(vec![1_u64]),
             cursor: None,
             scrollbar: None,
+            scroll_offset_rows: 0,
             revision: 1,
             cols: geometry.size.cols,
             rows_visible: geometry.size.rows,

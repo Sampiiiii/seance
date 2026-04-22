@@ -287,8 +287,7 @@ impl SeanceWorkspace {
         self.frame_pacer.record_display_tick(now);
 
         if self.frame_pacer.should_defer(now) {
-            self.frame_pacer.pending_defers =
-                self.frame_pacer.pending_defers.saturating_add(1);
+            self.frame_pacer.pending_defers = self.frame_pacer.pending_defers.saturating_add(1);
             self.frame_pacer.note_defer(now);
             cx.on_next_frame(window, move |this, window, cx| {
                 this.flush_frame_pacer(window, cx);
@@ -324,9 +323,7 @@ impl SeanceWorkspace {
     fn mark_perf_refresh(&mut self, reason: RedrawReason, now: Instant) {
         match reason {
             RedrawReason::TerminalUpdate => {
-                let snapshot = self
-                    .active_session()
-                    .map(|session| session.perf_snapshot());
+                let snapshot = self.active_session().map(|session| session.perf_snapshot());
                 self.perf_overlay
                     .mark_terminal_refresh_request(now, reason, snapshot);
             }

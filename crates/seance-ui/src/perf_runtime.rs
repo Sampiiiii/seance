@@ -4,10 +4,7 @@ use std::time::Instant;
 
 use gpui::{Context, Window};
 
-use crate::{
-    RepaintReasonSet, SeanceWorkspace,
-    perf::UiPerfMode,
-};
+use crate::{RepaintReasonSet, SeanceWorkspace, perf::UiPerfMode};
 
 impl SeanceWorkspace {
     pub(crate) fn apply_perf_mode(

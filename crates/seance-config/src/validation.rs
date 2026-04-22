@@ -284,7 +284,8 @@ fn validate_override(binding: &KeybindingOverride) -> Result<(), ConfigError> {
 mod tests {
     use crate::{
         AppConfig, COMMAND_APP_OPEN_COMMAND_PALETTE, COMMAND_APP_OPEN_PREFERENCES, ConfigError,
-        CustomKeybinding, KeybindingContext, KeybindingOverride, UpdateInstallMode,
+        CustomKeybinding, KeybindingContext, KeybindingOverride, MouseTrackingScrollPolicy,
+        MouseTrackingSelectionPolicy, TerminalRightClickPolicy, UpdateInstallMode,
         UpdateReleaseChannel, VaultRegistryEntry,
     };
 
@@ -430,6 +431,24 @@ mod tests {
         assert!(config.updates.auto_check);
         assert_eq!(config.updates.install_mode, UpdateInstallMode::Prompted);
         assert_eq!(config.updates.channel, UpdateReleaseChannel::Stable);
+    }
+
+    #[test]
+    fn terminal_interaction_defaults_are_valid() {
+        let config = AppConfig::default();
+        assert_eq!(
+            config.terminal.interaction.mouse_tracking_scroll,
+            MouseTrackingScrollPolicy::HybridShiftWheelLocal
+        );
+        assert_eq!(
+            config.terminal.interaction.mouse_tracking_selection,
+            MouseTrackingSelectionPolicy::ShiftDragLocal
+        );
+        assert_eq!(
+            config.terminal.interaction.right_click,
+            TerminalRightClickPolicy::CopySelectionOrPaste
+        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]

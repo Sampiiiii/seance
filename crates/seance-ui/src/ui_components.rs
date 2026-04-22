@@ -317,10 +317,7 @@ pub(crate) fn expanded_perf_strings(
             "pacer defer/s",
             format!("{:.0}", pacer.defers_per_second_window()),
         ),
-        (
-            "pacer coalesced",
-            pacer.coalesced_total.to_string(),
-        ),
+        ("pacer coalesced", pacer.coalesced_total.to_string()),
         (
             "pacer target",
             format!("{:.1} ms", pacer.target_interval.as_secs_f32() * 1_000.0),

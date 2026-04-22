@@ -12,10 +12,12 @@ use gpui::{
 use seance_config::AppConfig;
 use seance_core::{UpdateState, VaultUiSnapshot};
 use seance_terminal::{
-    TerminalInputModifiers, TerminalMouseButton, TerminalMouseEvent, TerminalMouseEventKind,
-    TerminalScreenKind, TerminalScrollCommand, TerminalViewportSnapshot,
+    TerminalGridPoint, TerminalGridSelection, TerminalInputModifiers, TerminalMouseButton,
+    TerminalMouseEvent, TerminalMouseEventKind, TerminalScreenKind, TerminalScrollCommand,
+    TerminalViewportSnapshot,
 };
 use seance_vault::{SecretString, UnlockMethod};
+use tracing::trace;
 
 use crate::{
     TERMINAL_SCROLLBAR_GUTTER_WIDTH_PX, TerminalScrollbarDragState, TerminalScrollbarLayout,
@@ -182,11 +184,15 @@ impl SeanceWorkspace {
             return;
         }
 
-        let Some(row) = viewport.rows.get(hovered_link.row) else {
+        let Some(local_row) = viewport_local_row_for_absolute(viewport, hovered_link.row) else {
             self.terminal_hovered_link = None;
             return;
         };
-        let Some(row_revision) = viewport.row_revisions.get(hovered_link.row).copied() else {
+        let Some(row) = viewport.rows.get(local_row) else {
+            self.terminal_hovered_link = None;
+            return;
+        };
+        let Some(row_revision) = viewport.row_revisions.get(local_row).copied() else {
             self.terminal_hovered_link = None;
             return;
         };
@@ -639,11 +645,7 @@ impl SeanceWorkspace {
                     let _ = cx.update(move |window, cx| {
                         entity.update(cx, |this, cx| {
                             this.apply_config_snapshot(next_config, window, cx);
-                            this.request_repaint(
-                                crate::RepaintReasonSet::UI_STATE,
-                                window,
-                                cx,
-                            );
+                            this.request_repaint(crate::RepaintReasonSet::UI_STATE, window, cx);
                         });
                     });
                 }
@@ -677,11 +679,7 @@ impl SeanceWorkspace {
                     let _ = cx.update(move |window, cx| {
                         entity.update(cx, |this, cx| {
                             this.apply_vault_snapshot(next_snapshot, cx);
-                            this.request_repaint(
-                                crate::RepaintReasonSet::UI_STATE,
-                                window,
-                                cx,
-                            );
+                            this.request_repaint(crate::RepaintReasonSet::UI_STATE, window, cx);
                         });
                     });
                 }
@@ -715,11 +713,7 @@ impl SeanceWorkspace {
                     let _ = cx.update(move |window, cx| {
                         entity.update(cx, |this, cx| {
                             this.apply_update_state_snapshot(next_state, cx);
-                            this.request_repaint(
-                                crate::RepaintReasonSet::UI_STATE,
-                                window,
-                                cx,
-                            );
+                            this.request_repaint(crate::RepaintReasonSet::UI_STATE, window, cx);
                         });
                     });
                 }
@@ -1112,6 +1106,15 @@ impl SeanceWorkspace {
             PaletteAction::CloseActiveSession => {
                 let id = self.active_session_id;
                 self.close_session(id, window, cx);
+            }
+            PaletteAction::CopyPreviousTurn => {
+                self.copy_previous_turn_to_clipboard(cx);
+            }
+            PaletteAction::SelectPreviousTurn => {
+                self.select_previous_turn(cx);
+            }
+            PaletteAction::CopyTerminalOutput => {
+                self.copy_active_terminal_output_to_clipboard(cx);
             }
             PaletteAction::SwitchTheme(tid) => {
                 self.persist_theme(tid, window, cx);
@@ -1904,6 +1907,10 @@ impl SeanceWorkspace {
         self.terminal_drag_anchor = None;
     }
 
+    pub(crate) fn clear_terminal_turn_selection(&mut self) {
+        self.terminal_turn_selection = None;
+    }
+
     pub(crate) fn terminal_scrollbar_layout(&self) -> Option<TerminalScrollbarLayout> {
         let geometry = self.terminal_surface.geometry?;
         let scrollbar = self.terminal_surface.scrollbar?;
@@ -1945,12 +1952,32 @@ impl SeanceWorkspace {
         position: gpui::Point<gpui::Pixels>,
     ) -> Option<crate::model::TerminalSelectionPoint> {
         let geometry = self.terminal_surface.geometry?;
+        let viewport = self.active_session()?.viewport_snapshot();
         terminal_selection_point_at(
             position,
             self.sidebar_occupied_width_px(),
             TERMINAL_PANE_PADDING_PX,
             geometry,
             self.terminal_line_height_px(),
+            viewport.scroll_offset_rows,
+            false,
+        )
+    }
+
+    pub(crate) fn terminal_selection_point_clamped(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+    ) -> Option<crate::model::TerminalSelectionPoint> {
+        let geometry = self.terminal_surface.geometry?;
+        let viewport = self.active_session()?.viewport_snapshot();
+        terminal_selection_point_at(
+            position,
+            self.sidebar_occupied_width_px(),
+            TERMINAL_PANE_PADDING_PX,
+            geometry,
+            self.terminal_line_height_px(),
+            viewport.scroll_offset_rows,
+            true,
         )
     }
 
@@ -2055,22 +2082,55 @@ fn terminal_local_point(
     Some((local_x, local_y))
 }
 
+fn terminal_local_point_clamped(
+    position: gpui::Point<gpui::Pixels>,
+    sidebar_occupied_width_px: f32,
+    terminal_padding_px: f32,
+    geometry: seance_terminal::TerminalGeometry,
+) -> (f32, f32) {
+    let raw_x = f32::from(position.x) - sidebar_occupied_width_px - terminal_padding_px;
+    let raw_y = f32::from(position.y) - terminal_padding_px;
+    let max_x = f32::from(geometry.pixel_size.width_px);
+    let max_y = f32::from(geometry.pixel_size.height_px);
+    (raw_x.clamp(0.0, max_x), raw_y.clamp(0.0, max_y))
+}
+
 fn terminal_selection_point_at(
     position: gpui::Point<gpui::Pixels>,
     sidebar_occupied_width_px: f32,
     terminal_padding_px: f32,
     geometry: seance_terminal::TerminalGeometry,
     line_height_px: f32,
+    scroll_offset_rows: u64,
+    clamp_to_bounds: bool,
 ) -> Option<TerminalSelectionPoint> {
-    let (local_x, local_y) = terminal_local_point(
-        position,
-        sidebar_occupied_width_px,
-        terminal_padding_px,
-        geometry,
-    )?;
-    let row = (local_y / line_height_px).floor().max(0.0) as usize;
-    let col = (local_x / geometry.cell_width_px as f32).floor().max(0.0) as usize;
-    Some(TerminalSelectionPoint { row, col })
+    let (local_x, local_y) = if clamp_to_bounds {
+        terminal_local_point_clamped(
+            position,
+            sidebar_occupied_width_px,
+            terminal_padding_px,
+            geometry,
+        )
+    } else {
+        terminal_local_point(
+            position,
+            sidebar_occupied_width_px,
+            terminal_padding_px,
+            geometry,
+        )?
+    };
+    let local_row = (local_y / line_height_px)
+        .floor()
+        .max(0.0)
+        .min(f32::from(geometry.size.rows.saturating_sub(1))) as u64;
+    let col = (local_x / geometry.cell_width_px as f32)
+        .floor()
+        .max(0.0)
+        .min(f32::from(geometry.size.cols)) as usize;
+    Some(TerminalSelectionPoint {
+        row: scroll_offset_rows.saturating_add(local_row),
+        col,
+    })
 }
 
 impl Focusable for SeanceWorkspace {
@@ -2141,11 +2201,123 @@ impl SeanceWorkspace {
 
     pub(crate) fn terminal_selected_text(&self) -> Option<String> {
         let selection = self.terminal_selection?;
+        let session = self.active_session()?;
+        let selection = TerminalGridSelection {
+            anchor: TerminalGridPoint {
+                row: selection.anchor.row,
+                col: selection.anchor.col,
+            },
+            focus: TerminalGridPoint {
+                row: selection.focus.row,
+                col: selection.focus.col,
+            },
+        };
+        session
+            .copy_selection_text(selection)
+            .ok()
+            .and_then(|text| {
+                let trimmed = text.trim_end_matches('\n').to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            })
+    }
+
+    pub(crate) fn terminal_selected_turn_text(&self) -> Option<String> {
+        self.terminal_turn_selection
+            .as_ref()
+            .map(|turn| turn.text.clone())
+    }
+
+    pub(crate) fn select_previous_turn(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.active_session() else {
+            return;
+        };
+
+        match session.previous_turn() {
+            Ok(Some(turn)) => {
+                let text = turn.combined_text.trim_end_matches('\n').to_string();
+                if text.is_empty() {
+                    self.terminal_turn_selection = None;
+                    self.show_toast("No previous turn content available.");
+                } else {
+                    self.clear_terminal_selection();
+                    self.terminal_turn_selection = Some(crate::model::TerminalTurnSelection {
+                        turn_id: turn.turn_id,
+                        text,
+                        start_row: turn.start_row,
+                        end_row: turn.end_row,
+                    });
+                }
+            }
+            Ok(None) => {
+                self.terminal_turn_selection = None;
+                self.show_toast("No previous turn found.");
+            }
+            Err(error) => {
+                self.terminal_turn_selection = None;
+                self.show_toast(format!("Failed to select previous turn: {error}"));
+            }
+        }
+        self.perf_overlay.mark_input(RedrawReason::Input);
+        cx.notify();
+    }
+
+    pub(crate) fn copy_previous_turn_to_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.active_session() else {
+            return;
+        };
+
+        match session.previous_turn() {
+            Ok(Some(turn)) => {
+                let text = turn.combined_text.trim_end_matches('\n').to_string();
+                if text.is_empty() {
+                    self.show_toast("No previous turn content available.");
+                    trace!(
+                        session_id = session.id(),
+                        "copy previous turn skipped: empty"
+                    );
+                } else {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    self.terminal_turn_selection = Some(crate::model::TerminalTurnSelection {
+                        turn_id: turn.turn_id,
+                        text,
+                        start_row: turn.start_row,
+                        end_row: turn.end_row,
+                    });
+                    trace!(
+                        session_id = session.id(),
+                        turn_id = turn.turn_id,
+                        "copied previous turn"
+                    );
+                }
+            }
+            Ok(None) => {
+                self.show_toast("No previous turn found.");
+                trace!(
+                    session_id = session.id(),
+                    "copy previous turn failed: missing turn"
+                );
+            }
+            Err(error) => {
+                self.show_toast(format!("Failed to copy previous turn: {error}"));
+                trace!(session_id = session.id(), error = %error, "copy previous turn failed");
+            }
+        }
+
+        self.perf_overlay.mark_input(RedrawReason::Input);
+        cx.notify();
+    }
+
+    pub(crate) fn terminal_click_selection(
+        &self,
+        point: TerminalSelectionPoint,
+        click_count: usize,
+    ) -> Option<crate::model::TerminalSelection> {
         let viewport = self.active_session()?.viewport_snapshot();
-        selected_terminal_text(&viewport, selection)
+        terminal_click_selection(&viewport, point, click_count)
     }
 }
 
+#[cfg(test)]
 fn ordered_selection_points(
     selection: crate::model::TerminalSelection,
 ) -> (
@@ -2159,6 +2331,17 @@ fn ordered_selection_points(
     }
 }
 
+fn viewport_local_row_for_absolute(
+    viewport: &TerminalViewportSnapshot,
+    absolute_row: u64,
+) -> Option<usize> {
+    let local_row = absolute_row.checked_sub(viewport.scroll_offset_rows)?;
+    usize::try_from(local_row)
+        .ok()
+        .filter(|row| *row < viewport.rows.len())
+}
+
+#[cfg(test)]
 fn terminal_row_text_slice(
     row: &seance_terminal::TerminalRow,
     start_col: usize,
@@ -2388,7 +2571,8 @@ fn terminal_link_open_request(
         return None;
     }
 
-    let row = viewport.rows.get(point.row)?;
+    let local_row = viewport_local_row_for_absolute(viewport, point.row)?;
+    let row = viewport.rows.get(local_row)?;
     terminal_link_at_column(row, point.col)
 }
 
@@ -2414,10 +2598,11 @@ fn terminal_hovered_link_at_position(
         return None;
     }
 
-    let row = viewport.rows.get(point.row)?;
+    let local_row = viewport_local_row_for_absolute(viewport, point.row)?;
+    let row = viewport.rows.get(local_row)?;
     let row_revision = viewport
         .row_revisions
-        .get(point.row)
+        .get(local_row)
         .copied()
         .unwrap_or_default();
     let visible_cols = viewport.cols as usize;
@@ -2434,26 +2619,29 @@ fn terminal_hovered_link_at_position(
     })
 }
 
+#[cfg(test)]
 fn selected_terminal_text(
     viewport: &seance_terminal::TerminalViewportSnapshot,
     selection: crate::model::TerminalSelection,
 ) -> Option<String> {
     let (start, end) = ordered_selection_points(selection);
-    if start == end || start.row >= viewport.rows.len() {
+    if start == end {
         return None;
     }
 
-    let end_row = end.row.min(viewport.rows.len().saturating_sub(1));
     let mut lines = Vec::new();
-    for row_index in start.row..=end_row {
-        let Some(row) = viewport.rows.get(row_index) else {
-            break;
+    for absolute_row in start.row..=end.row {
+        let Some(local_row) = viewport_local_row_for_absolute(viewport, absolute_row) else {
+            continue;
         };
-        let line = if row_index == start.row && row_index == end_row {
+        let Some(row) = viewport.rows.get(local_row) else {
+            continue;
+        };
+        let line = if absolute_row == start.row && absolute_row == end.row {
             terminal_row_text_slice(row, start.col, end.col)
-        } else if row_index == start.row {
+        } else if absolute_row == start.row {
             terminal_row_text_slice(row, start.col, usize::MAX)
-        } else if row_index == end_row {
+        } else if absolute_row == end.row {
             terminal_row_text_slice(row, 0, end.col)
         } else {
             row.plain_text()
@@ -2462,6 +2650,89 @@ fn selected_terminal_text(
     }
 
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn terminal_click_selection(
+    viewport: &TerminalViewportSnapshot,
+    point: TerminalSelectionPoint,
+    click_count: usize,
+) -> Option<crate::model::TerminalSelection> {
+    let visible_cols = viewport.cols as usize;
+    if visible_cols == 0 {
+        return None;
+    }
+
+    if click_count >= 3 {
+        return Some(crate::model::TerminalSelection {
+            anchor: TerminalSelectionPoint {
+                row: point.row,
+                col: 0,
+            },
+            focus: TerminalSelectionPoint {
+                row: point.row,
+                col: visible_cols,
+            },
+        });
+    }
+
+    if click_count != 2 {
+        return None;
+    }
+
+    let local_row = viewport_local_row_for_absolute(viewport, point.row)?;
+    let row = viewport.rows.get(local_row)?;
+    let (start_col, end_col) = terminal_token_col_span(row, point.col, visible_cols)?;
+    Some(crate::model::TerminalSelection {
+        anchor: TerminalSelectionPoint {
+            row: point.row,
+            col: start_col,
+        },
+        focus: TerminalSelectionPoint {
+            row: point.row,
+            col: end_col,
+        },
+    })
+}
+
+fn terminal_token_col_span(
+    row: &seance_terminal::TerminalRow,
+    col: usize,
+    visible_cols: usize,
+) -> Option<(usize, usize)> {
+    if visible_cols == 0 {
+        return None;
+    }
+
+    let mut whitespace_by_col = vec![true; visible_cols];
+    let mut current_col = 0usize;
+    for cell in &row.cells {
+        if current_col >= visible_cols {
+            break;
+        }
+
+        let width = usize::from(cell.width.max(1));
+        let is_whitespace = cell.text.is_empty() || cell.text.chars().all(char::is_whitespace);
+        let end_col = current_col.saturating_add(width).min(visible_cols);
+        for column in &mut whitespace_by_col[current_col..end_col] {
+            *column = is_whitespace;
+        }
+        current_col = current_col.saturating_add(width);
+    }
+
+    let target_col = col.min(visible_cols.saturating_sub(1));
+    let target_whitespace = whitespace_by_col[target_col];
+
+    let mut start = target_col;
+    while start > 0 && whitespace_by_col[start - 1] == target_whitespace {
+        start -= 1;
+    }
+
+    let mut end = target_col + 1;
+    while end < visible_cols && whitespace_by_col[end] == target_whitespace {
+        end += 1;
+    }
+
+    Some((start, end))
 }
 
 #[cfg(test)]
@@ -2482,10 +2753,10 @@ mod tests {
     };
 
     use super::{
-        selected_terminal_text, terminal_hovered_link_at_position, terminal_link_open_modifier,
-        terminal_link_open_request, terminal_local_point, terminal_scrollbar_drag_command,
-        terminal_scrollbar_is_interactive, terminal_scrollbar_mouse_down_outcome,
-        terminal_selection_point_at,
+        selected_terminal_text, terminal_click_selection, terminal_hovered_link_at_position,
+        terminal_link_open_modifier, terminal_link_open_request, terminal_local_point,
+        terminal_scrollbar_drag_command, terminal_scrollbar_is_interactive,
+        terminal_scrollbar_mouse_down_outcome, terminal_selection_point_at,
     };
 
     #[derive(Default)]
@@ -2584,6 +2855,7 @@ mod tests {
             row_revisions: Arc::from(vec![0; rows.len()]),
             cursor: None,
             scrollbar: None,
+            scroll_offset_rows: 0,
             revision: 0,
             cols: 80,
             rows_visible: rows.len() as u16,
@@ -2615,6 +2887,45 @@ mod tests {
         assert_eq!(
             selected_terminal_text(&viewport, selection).as_deref(),
             Some("pha\nbe")
+        );
+    }
+
+    #[test]
+    fn double_click_selection_picks_non_whitespace_token() {
+        let viewport = snapshot(&["kubectl get pods"]);
+        let selection =
+            terminal_click_selection(&viewport, TerminalSelectionPoint { row: 0, col: 9 }, 2)
+                .expect("double-click selection");
+
+        assert_eq!(selection.anchor, TerminalSelectionPoint { row: 0, col: 8 });
+        assert_eq!(selection.focus, TerminalSelectionPoint { row: 0, col: 11 });
+    }
+
+    #[test]
+    fn double_click_selection_picks_whitespace_run() {
+        let viewport = snapshot(&["alpha  beta"]);
+        let selection =
+            terminal_click_selection(&viewport, TerminalSelectionPoint { row: 0, col: 6 }, 2)
+                .expect("double-click selection");
+
+        assert_eq!(selection.anchor, TerminalSelectionPoint { row: 0, col: 5 });
+        assert_eq!(selection.focus, TerminalSelectionPoint { row: 0, col: 7 });
+    }
+
+    #[test]
+    fn triple_click_selection_selects_full_row() {
+        let viewport = snapshot(&["alpha beta"]);
+        let selection =
+            terminal_click_selection(&viewport, TerminalSelectionPoint { row: 0, col: 2 }, 3)
+                .expect("triple-click selection");
+
+        assert_eq!(selection.anchor, TerminalSelectionPoint { row: 0, col: 0 });
+        assert_eq!(
+            selection.focus,
+            TerminalSelectionPoint {
+                row: 0,
+                col: viewport.cols as usize,
+            }
         );
     }
 
@@ -2676,7 +2987,9 @@ mod tests {
                 occupied_width,
                 16.0,
                 geometry(),
-                19.0
+                19.0,
+                0,
+                false,
             ),
             Some(TerminalSelectionPoint { row: 0, col: 0 })
         );
@@ -2686,9 +2999,66 @@ mod tests {
                 occupied_width,
                 16.0,
                 geometry(),
-                19.0
+                19.0,
+                0,
+                false,
             ),
             Some(TerminalSelectionPoint { row: 1, col: 1 })
+        );
+    }
+
+    #[test]
+    fn terminal_selection_point_applies_viewport_scroll_offset() {
+        let occupied_width = sidebar_occupied_width_px(260.0);
+
+        assert_eq!(
+            terminal_selection_point_at(
+                point(px(occupied_width + 16.0 + 8.0), px(16.0 + 19.0 * 2.0)),
+                occupied_width,
+                16.0,
+                geometry(),
+                19.0,
+                40,
+                false,
+            ),
+            Some(TerminalSelectionPoint { row: 42, col: 1 })
+        );
+    }
+
+    #[test]
+    fn terminal_selection_point_clamps_drag_points_outside_viewport() {
+        let occupied_width = sidebar_occupied_width_px(260.0);
+        let geom = geometry();
+
+        assert_eq!(
+            terminal_selection_point_at(
+                point(px(occupied_width - 100.0), px(-100.0)),
+                occupied_width,
+                16.0,
+                geom,
+                19.0,
+                10,
+                true,
+            ),
+            Some(TerminalSelectionPoint { row: 10, col: 0 })
+        );
+        assert_eq!(
+            terminal_selection_point_at(
+                point(
+                    px(occupied_width + 16.0 + 8000.0),
+                    px(16.0 + f32::from(geom.pixel_size.height_px) + 500.0),
+                ),
+                occupied_width,
+                16.0,
+                geom,
+                19.0,
+                10,
+                true,
+            ),
+            Some(TerminalSelectionPoint {
+                row: 10 + u64::from(geom.size.rows.saturating_sub(1)),
+                col: usize::from(geom.size.cols),
+            })
         );
     }
 

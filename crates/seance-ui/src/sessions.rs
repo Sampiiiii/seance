@@ -27,6 +27,10 @@ impl SeanceWorkspace {
             self.terminal_scroll.pending_flush_epoch.wrapping_add(1);
         self.terminal_scroll.last_scroll_dispatch_at = None;
         self.terminal_scroll.idle_epoch = self.terminal_scroll.idle_epoch.wrapping_add(1);
+        self.clear_terminal_selection();
+        self.clear_terminal_turn_selection();
+        self.terminal_drag_auto_scroll = None;
+        self.terminal_drag_auto_scroll_epoch = self.terminal_drag_auto_scroll_epoch.wrapping_add(1);
         self.take_terminal_refresh_request();
         self.invalidate_terminal_surface();
         self.request_repaint(crate::RepaintReasonSet::TERMINAL_UPDATE, window, cx);

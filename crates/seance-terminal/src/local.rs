@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -12,9 +12,10 @@ use tracing::{debug, trace};
 
 use crate::{
     SessionPerfSnapshot, SessionSummary, SharedSessionState, TerminalEmulator, TerminalGeometry,
-    TerminalKeyEvent, TerminalMouseEvent, TerminalPaste, TerminalScrollCommand, TerminalSession,
-    TerminalTextEvent, TerminalTranscriptSink, TerminalViewportSnapshot, TranscriptEvent,
-    TranscriptStream, next_session_id, publish_budget::DEFAULT_PUBLISH_BUDGET,
+    TerminalGridSelection, TerminalKeyEvent, TerminalMouseEvent, TerminalPaste,
+    TerminalScrollCommand, TerminalSession, TerminalTextEvent, TerminalTranscriptSink,
+    TerminalTurnSnapshot, TerminalViewportSnapshot, TranscriptEvent, TranscriptStream,
+    next_session_id, publish_budget::DEFAULT_PUBLISH_BUDGET,
 };
 
 pub struct LocalSessionHandle {
@@ -24,6 +25,8 @@ pub struct LocalSessionHandle {
     command_tx: mpsc::Sender<SessionCommand>,
     notify_rx: Mutex<Option<mpsc::Receiver<()>>>,
 }
+
+const ACTIVE_SCREEN_COPY_TIMEOUT: Duration = Duration::from_secs(1);
 
 impl LocalSessionHandle {
     pub(crate) fn new(
@@ -109,6 +112,57 @@ impl TerminalSession for LocalSessionHandle {
             .context("failed to forward viewport bottom command to local shell")
     }
 
+    fn copy_selection_text(&self, selection: TerminalGridSelection) -> Result<String> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(SessionCommand::CopySelectionText {
+                selection,
+                reply_tx,
+            })
+            .context("failed to request selection copy from local shell")?;
+        match reply_rx.recv_timeout(ACTIVE_SCREEN_COPY_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                "timed out waiting for local selection copy"
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "local session worker stopped before selection copy completed"
+            )),
+        }
+    }
+
+    fn previous_turn(&self) -> Result<Option<TerminalTurnSnapshot>> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(SessionCommand::PreviousTurn { reply_tx })
+            .context("failed to request previous turn from local shell")?;
+        match reply_rx.recv_timeout(ACTIVE_SCREEN_COPY_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                "timed out waiting for local previous-turn lookup"
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "local session worker stopped before previous-turn lookup completed"
+            )),
+        }
+    }
+
+    fn copy_active_screen_text(&self) -> Result<String> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(SessionCommand::CopyActiveScreen { reply_tx })
+            .context("failed to request active-screen copy from local shell")?;
+        match reply_rx.recv_timeout(ACTIVE_SCREEN_COPY_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(anyhow::anyhow!("timed out waiting for local copy export"))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "local session worker stopped before copy export completed"
+            )),
+        }
+    }
+
     fn perf_snapshot(&self) -> SessionPerfSnapshot {
         self.state.perf_snapshot()
     }
@@ -148,6 +202,16 @@ pub(crate) enum SessionCommand {
     Resize(TerminalGeometry),
     ScrollViewport(TerminalScrollCommand),
     ScrollToBottom,
+    CopySelectionText {
+        selection: TerminalGridSelection,
+        reply_tx: mpsc::SyncSender<Result<String>>,
+    },
+    PreviousTurn {
+        reply_tx: mpsc::SyncSender<Result<Option<TerminalTurnSnapshot>>>,
+    },
+    CopyActiveScreen {
+        reply_tx: mpsc::SyncSender<Result<String>>,
+    },
 }
 
 fn spawn_local_session(
@@ -268,17 +332,20 @@ fn run_local_session(
 
         match next_command {
             Ok(SessionCommand::Input(bytes)) => {
+                terminal.track_input_bytes(&bytes);
                 write_input_bytes(&mut writer, &transcript_sink, &bytes)?;
             }
             Ok(SessionCommand::Text(event)) => {
                 let bytes = terminal.encode_text_event(&event);
                 if !bytes.is_empty() {
+                    terminal.track_input_bytes(&bytes);
                     write_input_bytes(&mut writer, &transcript_sink, &bytes)?;
                 }
             }
             Ok(SessionCommand::Key(event)) => {
                 let bytes = terminal.encode_key_event(&event)?;
                 if !bytes.is_empty() {
+                    terminal.track_input_bytes(&bytes);
                     write_input_bytes(&mut writer, &transcript_sink, &bytes)?;
                 }
             }
@@ -291,6 +358,7 @@ fn run_local_session(
             Ok(SessionCommand::Paste(paste)) => {
                 let bytes = terminal.encode_paste(&paste);
                 if !bytes.is_empty() {
+                    terminal.track_input_bytes(&bytes);
                     write_input_bytes(&mut writer, &transcript_sink, &bytes)?;
                 }
             }
@@ -333,6 +401,18 @@ fn run_local_session(
                 if disconnected {
                     break;
                 }
+            }
+            Ok(SessionCommand::CopyActiveScreen { reply_tx }) => {
+                let _ = reply_tx.send(terminal.copy_active_screen_plain_text_readable());
+            }
+            Ok(SessionCommand::CopySelectionText {
+                selection,
+                reply_tx,
+            }) => {
+                let _ = reply_tx.send(terminal.copy_selection_text(selection));
+            }
+            Ok(SessionCommand::PreviousTurn { reply_tx }) => {
+                let _ = reply_tx.send(Ok(terminal.previous_turn()));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -688,6 +768,79 @@ mod tests {
             deferred,
             Some(SessionCommand::Input(bytes)) if bytes == vec![0x2a]
         ));
+    }
+
+    #[test]
+    fn copy_selection_text_routes_request_through_worker_command() {
+        let geometry = TerminalGeometry::default();
+        let (state, notify_rx) = SharedSessionState::new("ready", geometry);
+        let (command_tx, command_rx) = mpsc::channel();
+        let handle = LocalSessionHandle::new(
+            31,
+            Arc::<str>::from("local-31"),
+            state,
+            command_tx,
+            notify_rx,
+        );
+        let worker = thread::spawn(move || {
+            let command = command_rx.recv().expect("receive command");
+            match command {
+                SessionCommand::CopySelectionText {
+                    selection,
+                    reply_tx,
+                } => {
+                    assert_eq!(selection.anchor.row, 4);
+                    assert_eq!(selection.focus.col, 9);
+                    let _ = reply_tx.send(Ok("selection".into()));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        });
+
+        let copied = handle
+            .copy_selection_text(crate::TerminalGridSelection {
+                anchor: crate::TerminalGridPoint { row: 4, col: 2 },
+                focus: crate::TerminalGridPoint { row: 6, col: 9 },
+            })
+            .expect("copy selection");
+        assert_eq!(copied, "selection");
+        worker.join().expect("worker join");
+    }
+
+    #[test]
+    fn previous_turn_routes_request_through_worker_command() {
+        let geometry = TerminalGeometry::default();
+        let (state, notify_rx) = SharedSessionState::new("ready", geometry);
+        let (command_tx, command_rx) = mpsc::channel();
+        let handle = LocalSessionHandle::new(
+            33,
+            Arc::<str>::from("local-33"),
+            state,
+            command_tx,
+            notify_rx,
+        );
+        let worker = thread::spawn(move || {
+            let command = command_rx.recv().expect("receive command");
+            match command {
+                SessionCommand::PreviousTurn { reply_tx } => {
+                    let _ = reply_tx.send(Ok(Some(crate::TerminalTurnSnapshot {
+                        turn_id: 9,
+                        command_text: "echo status".into(),
+                        output_text: "status".into(),
+                        combined_text: "echo status\nstatus".into(),
+                        start_row: 22,
+                        end_row: 24,
+                    })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        });
+
+        let previous = handle.previous_turn().expect("previous turn");
+        let previous = previous.expect("turn expected");
+        assert_eq!(previous.turn_id, 9);
+        assert_eq!(previous.command_text, "echo status");
+        worker.join().expect("worker join");
     }
 
     #[cfg(unix)]

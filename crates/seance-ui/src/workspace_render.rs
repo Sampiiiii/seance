@@ -505,16 +505,23 @@ impl SeanceWorkspace {
         if !terminal_focused && self.terminal_ime_visible() {
             self.clear_terminal_ime();
         }
+        let viewport_scroll_offset_rows = self
+            .active_session()
+            .map(|session| session.viewport_snapshot().scroll_offset_rows)
+            .unwrap_or(0);
         let prepared = PreparedTerminalSurface {
             rows: self.terminal_surface.rows.clone(),
             metrics,
             cursor: self.terminal_surface.cursor,
+            viewport_scroll_offset_rows,
             selection: self.terminal_surface.selection,
+            turn_selection: self.terminal_turn_selection.clone(),
             hovered_link: self.terminal_hovered_link.clone(),
             terminal_focused,
             cursor_fallback: t.accent,
             cursor_dim: t.text_ghost.alpha(0.65),
             selection_background: t.accent.alpha(0.22),
+            turn_selection_background: t.accent.alpha(0.14),
             link_hover_background: t.terminal_link_hover_bg,
             link_hover_underline: t.terminal_link_hover_underline,
             link_modifier_background: t.terminal_link_modifier_bg,
@@ -1429,8 +1436,11 @@ impl SeanceWorkspace {
         let terminal = session_perf.map(|snapshot| &snapshot.terminal);
         let mode_label = perf_mode_label(self.perf_overlay.mode);
         let compact_rows = compact_perf_strings(&self.perf_overlay);
-        let expanded_rows =
-            expanded_perf_strings(&self.perf_overlay, self.terminal_surface.metrics, &self.frame_pacer);
+        let expanded_rows = expanded_perf_strings(
+            &self.perf_overlay,
+            self.terminal_surface.metrics,
+            &self.frame_pacer,
+        );
 
         let mut panel = div()
             .absolute()

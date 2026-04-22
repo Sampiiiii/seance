@@ -6349,6 +6349,7 @@ dependencies = [
  "libghostty-vt",
  "portable-pty",
  "tracing",
+ "unicode-width",
 ]
 
 [[package]]

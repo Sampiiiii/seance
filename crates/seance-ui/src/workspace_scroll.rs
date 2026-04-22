@@ -3,17 +3,23 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Context, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollDelta,
-    ScrollWheelEvent, Window,
+    ClipboardItem, Context, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ScrollDelta, ScrollWheelEvent, Window,
+};
+use seance_config::{
+    MouseTrackingScrollPolicy, MouseTrackingSelectionPolicy, TerminalRightClickPolicy,
 };
 use seance_terminal::{
-    TerminalMouseButton, TerminalMouseEventKind, TerminalScreenKind, TerminalScrollCommand,
+    TerminalMouseButton, TerminalMouseEventKind, TerminalPaste, TerminalScreenKind,
+    TerminalScrollCommand, TerminalSession,
 };
 use tracing::trace;
 
 use crate::{
     LinkPaintMode, RepaintReasonSet, SeanceWorkspace, TerminalScrollbarDragState,
     TerminalScrollbarHit, TerminalScrollbarLayout,
+    model::{TerminalDragAutoScrollDirection, TerminalDragAutoScrollState},
+    ui_components::TERMINAL_PANE_PADDING_PX,
     workspace::TerminalScrollbarMouseDownOutcome,
 };
 
@@ -26,6 +32,7 @@ pub(crate) fn handle_terminal_scroll_wheel(
     cx: &mut Context<SeanceWorkspace>,
 ) {
     let Some(session) = this.active_session() else {
+        stop_drag_auto_scroll(this, "mouse-down-no-session");
         return;
     };
     let summary = session.summary();
@@ -42,7 +49,13 @@ pub(crate) fn handle_terminal_scroll_wheel(
         return;
     }
 
-    if summary.mouse_tracking {
+    let local_wheel_override = summary.mouse_tracking
+        && mouse_tracking_wheel_routes_locally(
+            summary.active_screen,
+            this.config.terminal.interaction.mouse_tracking_scroll,
+            event.modifiers,
+        );
+    if summary.mouse_tracking && !local_wheel_override {
         accumulate_scroll_delta(
             &mut this.terminal_scroll.accumulated_row_delta,
             delta_rows_f,
@@ -80,6 +93,11 @@ pub(crate) fn handle_terminal_scroll_wheel(
         &mut this.terminal_scroll.accumulated_row_delta,
         delta_rows_f,
     );
+    if let Some(anchor) = this.terminal_drag_anchor
+        && let Some(focus) = this.terminal_selection_point_clamped(event.position)
+    {
+        this.terminal_selection = Some(crate::model::TerminalSelection { anchor, focus });
+    }
     schedule_scroll_flush(this, window, cx);
 }
 
@@ -95,14 +113,22 @@ pub(crate) fn handle_terminal_mouse_down(
         return;
     };
     let summary = session.summary();
-    let scrollbar_interactive =
-        terminal_scrollbar_is_interactive(summary.active_screen, summary.mouse_tracking);
+    let local_mouse_override = summary.mouse_tracking
+        && mouse_tracking_selection_allows_local_override(
+            this.config.terminal.interaction.mouse_tracking_selection,
+            event.modifiers,
+        );
+    let scrollbar_interactive = terminal_scrollbar_is_interactive(
+        summary.active_screen,
+        summary.mouse_tracking && !local_mouse_override,
+    );
     if event.button == MouseButton::Left
         && scrollbar_interactive
         && let Some((layout, local_x, local_y)) =
             this.terminal_scrollbar_local_position(event.position)
         && let Some(outcome) = terminal_scrollbar_mouse_down_outcome(layout, local_x, local_y)
     {
+        stop_drag_auto_scroll(this, "scrollbar-mouse-down");
         this.terminal_scrollbar_hovered = true;
         this.terminal_scrollbar_drag = Some(outcome.drag_state);
         let reason = if let Some(command) = outcome.command {
@@ -115,7 +141,19 @@ pub(crate) fn handle_terminal_mouse_down(
         return;
     }
 
-    if summary.mouse_tracking {
+    if event.button == MouseButton::Right && (!summary.mouse_tracking || local_mouse_override) {
+        apply_terminal_right_click_policy(
+            this,
+            session.as_ref(),
+            this.config.terminal.interaction.right_click,
+            cx,
+        );
+        this.request_repaint(RepaintReasonSet::INPUT, window, cx);
+        return;
+    }
+
+    if summary.mouse_tracking && !local_mouse_override {
+        stop_drag_auto_scroll(this, "mouse-tracking-remote");
         this.clear_terminal_hovered_link();
         this.terminal_scrollbar_hovered = false;
         this.terminal_scrollbar_drag = None;
@@ -128,7 +166,8 @@ pub(crate) fn handle_terminal_mouse_down(
             let _ = session.send_mouse(mouse_event);
         }
         this.clear_terminal_selection();
-    } else if this.try_open_terminal_link(event, summary.active_screen) {
+    } else if event.click_count < 2 && this.try_open_terminal_link(event, summary.active_screen) {
+        stop_drag_auto_scroll(this, "opened-link");
         this.terminal_drag_anchor = None;
         this.clear_terminal_hovered_link();
         this.request_repaint(RepaintReasonSet::INPUT, window, cx);
@@ -136,12 +175,19 @@ pub(crate) fn handle_terminal_mouse_down(
     } else if event.button == MouseButton::Left
         && let Some(point) = this.terminal_selection_point(event.position)
     {
+        stop_drag_auto_scroll(this, "manual-selection-start");
+        this.clear_terminal_turn_selection();
         this.clear_terminal_hovered_link();
-        this.terminal_selection = Some(crate::model::TerminalSelection {
-            anchor: point,
-            focus: point,
-        });
-        this.terminal_drag_anchor = Some(point);
+        if let Some(selection) = this.terminal_click_selection(point, event.click_count) {
+            this.terminal_selection = Some(selection);
+            this.terminal_drag_anchor = None;
+        } else {
+            this.terminal_selection = Some(crate::model::TerminalSelection {
+                anchor: point,
+                focus: point,
+            });
+            this.terminal_drag_anchor = Some(point);
+        }
     }
 
     this.request_repaint(RepaintReasonSet::INPUT, window, cx);
@@ -154,15 +200,24 @@ pub(crate) fn handle_terminal_mouse_move(
     cx: &mut Context<SeanceWorkspace>,
 ) {
     let Some(session) = this.active_session() else {
+        stop_drag_auto_scroll(this, "mouse-move-no-session");
         if this.clear_terminal_hovered_link() {
             this.request_repaint(RepaintReasonSet::INPUT, window, cx);
         }
         return;
     };
     let summary = session.summary();
-    let scrollbar_interactive =
-        terminal_scrollbar_is_interactive(summary.active_screen, summary.mouse_tracking);
+    let local_mouse_override = summary.mouse_tracking
+        && mouse_tracking_selection_allows_local_override(
+            this.config.terminal.interaction.mouse_tracking_selection,
+            event.modifiers,
+        );
+    let scrollbar_interactive = terminal_scrollbar_is_interactive(
+        summary.active_screen,
+        summary.mouse_tracking && !local_mouse_override,
+    );
     if let Some(drag_state) = this.terminal_scrollbar_drag {
+        stop_drag_auto_scroll(this, "scrollbar-drag-active");
         let mut state_changed = this.clear_terminal_hovered_link();
         if scrollbar_interactive && let Some(local_y) = this.terminal_local_y(event.position) {
             let command = terminal_scrollbar_drag_command(drag_state, local_y);
@@ -182,7 +237,8 @@ pub(crate) fn handle_terminal_mouse_move(
         return;
     }
 
-    if summary.mouse_tracking {
+    if summary.mouse_tracking && !local_mouse_override {
+        stop_drag_auto_scroll(this, "mouse-tracking-remote");
         let mut state_changed = this.clear_terminal_hovered_link();
         if this.terminal_scrollbar_hovered {
             this.terminal_scrollbar_hovered = false;
@@ -223,16 +279,20 @@ pub(crate) fn handle_terminal_mouse_move(
     }
 
     if !event.dragging() {
+        stop_drag_auto_scroll(this, "drag-ended");
         return;
     }
 
     let Some(anchor) = this.terminal_drag_anchor else {
+        stop_drag_auto_scroll(this, "missing-drag-anchor");
         return;
     };
-    let Some(focus) = this.terminal_selection_point(event.position) else {
+    let Some(focus) = this.terminal_selection_point_clamped(event.position) else {
+        stop_drag_auto_scroll(this, "no-clamped-focus");
         return;
     };
     this.terminal_selection = Some(crate::model::TerminalSelection { anchor, focus });
+    maybe_update_drag_auto_scroll(this, event.position, window, cx);
     this.request_repaint(RepaintReasonSet::INPUT, window, cx);
 }
 
@@ -244,6 +304,7 @@ pub(crate) fn handle_terminal_mouse_up(
 ) {
     let Some(session) = this.active_session() else {
         this.terminal_drag_anchor = None;
+        stop_drag_auto_scroll(this, "mouse-up-no-session");
         this.terminal_hovered_link = None;
         this.terminal_scrollbar_hovered = false;
         this.terminal_scrollbar_drag = None;
@@ -251,10 +312,18 @@ pub(crate) fn handle_terminal_mouse_up(
     };
 
     let summary = session.summary();
-    let scrollbar_interactive =
-        terminal_scrollbar_is_interactive(summary.active_screen, summary.mouse_tracking);
+    let local_mouse_override = summary.mouse_tracking
+        && mouse_tracking_selection_allows_local_override(
+            this.config.terminal.interaction.mouse_tracking_selection,
+            event.modifiers,
+        );
+    let scrollbar_interactive = terminal_scrollbar_is_interactive(
+        summary.active_screen,
+        summary.mouse_tracking && !local_mouse_override,
+    );
     if this.terminal_scrollbar_drag.take().is_some() {
         this.terminal_drag_anchor = None;
+        stop_drag_auto_scroll(this, "scrollbar-drag-end");
         this.terminal_scrollbar_hovered = scrollbar_interactive
             && this
                 .terminal_scrollbar_local_position(event.position)
@@ -265,7 +334,7 @@ pub(crate) fn handle_terminal_mouse_up(
         return;
     }
 
-    if summary.mouse_tracking {
+    if summary.mouse_tracking && !local_mouse_override {
         if let Some(mouse_event) = this.terminal_mouse_event(
             event.position,
             TerminalMouseEventKind::Release,
@@ -277,6 +346,7 @@ pub(crate) fn handle_terminal_mouse_up(
     }
 
     this.terminal_drag_anchor = None;
+    stop_drag_auto_scroll(this, "mouse-up");
     this.request_repaint(RepaintReasonSet::INPUT, window, cx);
 }
 
@@ -362,6 +432,198 @@ fn terminal_mouse_button(button: MouseButton) -> Option<TerminalMouseButton> {
         MouseButton::Right => Some(TerminalMouseButton::Right),
         MouseButton::Middle => Some(TerminalMouseButton::Middle),
         _ => None,
+    }
+}
+
+fn mouse_tracking_wheel_routes_locally(
+    active_screen: TerminalScreenKind,
+    policy: MouseTrackingScrollPolicy,
+    modifiers: Modifiers,
+) -> bool {
+    if !matches!(active_screen, TerminalScreenKind::Primary) {
+        return false;
+    }
+
+    match policy {
+        MouseTrackingScrollPolicy::AlwaysAppFirst => false,
+        MouseTrackingScrollPolicy::HybridShiftWheelLocal => modifiers.shift,
+        MouseTrackingScrollPolicy::AlwaysLocal => true,
+    }
+}
+
+fn mouse_tracking_selection_allows_local_override(
+    policy: MouseTrackingSelectionPolicy,
+    modifiers: Modifiers,
+) -> bool {
+    match policy {
+        MouseTrackingSelectionPolicy::Disabled => false,
+        MouseTrackingSelectionPolicy::ShiftDragLocal => modifiers.shift,
+        MouseTrackingSelectionPolicy::AlwaysLocal => true,
+    }
+}
+
+fn apply_terminal_right_click_policy(
+    this: &mut SeanceWorkspace,
+    session: &dyn TerminalSession,
+    policy: TerminalRightClickPolicy,
+    cx: &mut Context<SeanceWorkspace>,
+) {
+    match policy {
+        TerminalRightClickPolicy::Disabled => {}
+        TerminalRightClickPolicy::PasteClipboard => {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let _ = session.paste(TerminalPaste { text });
+            }
+        }
+        TerminalRightClickPolicy::CopySelectionOrPaste => {
+            if let Some(selection) = this.terminal_selected_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(selection));
+                return;
+            }
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let _ = session.paste(TerminalPaste { text });
+            }
+        }
+    }
+}
+
+fn maybe_update_drag_auto_scroll(
+    this: &mut SeanceWorkspace,
+    pointer: gpui::Point<gpui::Pixels>,
+    window: &mut Window,
+    cx: &mut Context<SeanceWorkspace>,
+) {
+    let Some((direction, rows_per_tick)) = terminal_drag_auto_scroll_params(this, pointer) else {
+        stop_drag_auto_scroll(this, "pointer-inside-viewport");
+        return;
+    };
+
+    let needs_new_loop = this
+        .terminal_drag_auto_scroll
+        .as_ref()
+        .map_or(true, |state| {
+            state.direction != direction || state.rows_per_tick != rows_per_tick
+        });
+    if needs_new_loop {
+        this.terminal_drag_auto_scroll_epoch = this.terminal_drag_auto_scroll_epoch.wrapping_add(1);
+        let epoch = this.terminal_drag_auto_scroll_epoch;
+        this.terminal_drag_auto_scroll = Some(TerminalDragAutoScrollState {
+            direction,
+            rows_per_tick,
+            pointer,
+            epoch,
+            frame_scheduled: false,
+        });
+        schedule_drag_auto_scroll_tick(this, window, cx);
+        return;
+    }
+
+    if let Some(state) = this.terminal_drag_auto_scroll.as_mut() {
+        state.pointer = pointer;
+    }
+}
+
+fn terminal_drag_auto_scroll_params(
+    this: &SeanceWorkspace,
+    pointer: gpui::Point<gpui::Pixels>,
+) -> Option<(TerminalDragAutoScrollDirection, isize)> {
+    let geometry = this.terminal_surface.geometry?;
+    let local_y = f32::from(pointer.y) - TERMINAL_PANE_PADDING_PX;
+    let max_y = f32::from(geometry.pixel_size.height_px);
+    if local_y < 0.0 {
+        let rows_per_tick =
+            terminal_drag_auto_scroll_speed(-local_y, this.terminal_line_height_px());
+        return Some((TerminalDragAutoScrollDirection::Up, rows_per_tick));
+    }
+    if local_y > max_y {
+        let rows_per_tick =
+            terminal_drag_auto_scroll_speed(local_y - max_y, this.terminal_line_height_px());
+        return Some((TerminalDragAutoScrollDirection::Down, rows_per_tick));
+    }
+    None
+}
+
+fn terminal_drag_auto_scroll_speed(overshoot_px: f32, line_height_px: f32) -> isize {
+    let normalized = overshoot_px / line_height_px.max(1.0);
+    (1 + normalized.floor() as isize).clamp(1, 6)
+}
+
+fn schedule_drag_auto_scroll_tick(
+    this: &mut SeanceWorkspace,
+    window: &mut Window,
+    cx: &mut Context<SeanceWorkspace>,
+) {
+    let Some(state) = this.terminal_drag_auto_scroll.as_mut() else {
+        return;
+    };
+    if state.frame_scheduled {
+        return;
+    }
+
+    state.frame_scheduled = true;
+    let epoch = state.epoch;
+    cx.on_next_frame(window, move |this, window, cx| {
+        run_drag_auto_scroll_tick(this, epoch, window, cx);
+    });
+}
+
+fn run_drag_auto_scroll_tick(
+    this: &mut SeanceWorkspace,
+    epoch: u64,
+    window: &mut Window,
+    cx: &mut Context<SeanceWorkspace>,
+) {
+    let (direction, rows_per_tick, pointer) = {
+        let Some(state) = this.terminal_drag_auto_scroll.as_mut() else {
+            return;
+        };
+        if state.epoch != epoch {
+            return;
+        }
+        state.frame_scheduled = false;
+        (state.direction, state.rows_per_tick, state.pointer)
+    };
+
+    let Some(anchor) = this.terminal_drag_anchor else {
+        stop_drag_auto_scroll(this, "drag-anchor-cleared");
+        return;
+    };
+    let active_primary = this
+        .active_session()
+        .map(|session| matches!(session.summary().active_screen, TerminalScreenKind::Primary))
+        .unwrap_or(false);
+    if !active_primary {
+        stop_drag_auto_scroll(this, "non-primary-screen");
+        return;
+    }
+
+    let delta_rows = match direction {
+        TerminalDragAutoScrollDirection::Up => -rows_per_tick.abs(),
+        TerminalDragAutoScrollDirection::Down => rows_per_tick.abs(),
+    };
+    queue_scroll_command(
+        this,
+        TerminalScrollCommand::DeltaRows(delta_rows),
+        window,
+        cx,
+    );
+    if let Some(focus) = this.terminal_selection_point_clamped(pointer) {
+        this.terminal_selection = Some(crate::model::TerminalSelection { anchor, focus });
+    }
+    trace!(
+        epoch,
+        direction = ?direction,
+        rows_per_tick,
+        "terminal drag auto-scroll tick dispatched"
+    );
+    this.request_repaint(RepaintReasonSet::TERMINAL_UPDATE, window, cx);
+    schedule_drag_auto_scroll_tick(this, window, cx);
+}
+
+fn stop_drag_auto_scroll(this: &mut SeanceWorkspace, reason: &'static str) {
+    if this.terminal_drag_auto_scroll.take().is_some() {
+        this.terminal_drag_auto_scroll_epoch = this.terminal_drag_auto_scroll_epoch.wrapping_add(1);
+        trace!(reason, "terminal drag auto-scroll stopped");
     }
 }
 
@@ -538,6 +800,8 @@ fn take_scroll_dispatch_commands(
 
 #[cfg(test)]
 mod tests {
+    use gpui::Modifiers;
+
     use super::*;
 
     #[test]
@@ -572,5 +836,49 @@ mod tests {
 
         assert_eq!(commands, vec![TerminalScrollCommand::DeltaRows(2)]);
         assert!((accumulator.accumulated_row_delta - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn mouse_tracking_wheel_routes_to_remote_by_default() {
+        assert!(!mouse_tracking_wheel_routes_locally(
+            TerminalScreenKind::Primary,
+            MouseTrackingScrollPolicy::AlwaysAppFirst,
+            Modifiers::default(),
+        ));
+    }
+
+    #[test]
+    fn mouse_tracking_shift_wheel_can_route_to_local_scrollback() {
+        assert!(mouse_tracking_wheel_routes_locally(
+            TerminalScreenKind::Primary,
+            MouseTrackingScrollPolicy::HybridShiftWheelLocal,
+            Modifiers::shift(),
+        ));
+        assert!(!mouse_tracking_wheel_routes_locally(
+            TerminalScreenKind::Primary,
+            MouseTrackingScrollPolicy::HybridShiftWheelLocal,
+            Modifiers::default(),
+        ));
+    }
+
+    #[test]
+    fn mouse_tracking_wheel_local_override_is_disabled_on_alternate_screen() {
+        assert!(!mouse_tracking_wheel_routes_locally(
+            TerminalScreenKind::Alternate,
+            MouseTrackingScrollPolicy::HybridShiftWheelLocal,
+            Modifiers::shift(),
+        ));
+    }
+
+    #[test]
+    fn mouse_tracking_selection_shift_drag_policy_requires_shift() {
+        assert!(mouse_tracking_selection_allows_local_override(
+            MouseTrackingSelectionPolicy::ShiftDragLocal,
+            Modifiers::shift(),
+        ));
+        assert!(!mouse_tracking_selection_allows_local_override(
+            MouseTrackingSelectionPolicy::ShiftDragLocal,
+            Modifiers::default(),
+        ));
     }
 }
