@@ -7,7 +7,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow = "1.0"
-russh = { version = "0.60.0", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh = { version = "0.60.1", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "2.1.1"
 seance-terminal = { path = "../seance-terminal" }
 ssh-key = { version = "0.7.0-rc.9", features = ["ed25519", "rsa", "std", "encryption"] }
